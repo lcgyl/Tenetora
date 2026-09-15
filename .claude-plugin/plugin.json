@@ -1,0 +1,12 @@
+{
+  "name": "tenetora",
+  "description": "Tenetora lifecycle governance for shared engineering-agent context with decision alignment, bounded collaboration, and Claude Code runtime hooks.",
+  "version": "0.3.40",
+  "author": {
+    "name": "LCGYL"
+  },
+  "homepage": "https://github.com/lcgyl/Tenetora",
+  "repository": "https://github.com/lcgyl/Tenetora",
+  "hooks": "./hooks/hooks-claude.json",
+  "license": "MIT"
+}

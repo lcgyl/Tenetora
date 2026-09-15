@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "items": [
+    {
+      "target": ".tenetora/rules/agent-control.md",
+      "source": "rules/agent-control.md"
+    },
+    {
+      "target": ".tenetora/rules/context-freshness.md",
+      "source": "rules/context-freshness.md"
+    },
+    {
+      "target": ".tenetora/rules/dependency-change.md",
+      "source": "rules/dependency-change.md"
+    },
+    {
+      "target": ".tenetora/rules/git-safety.md",
+      "source": "rules/git-safety.md"
+    },
+    {
+      "target": ".tenetora/rules/harness-governance.md",
+      "source": "rules/harness-governance.md"
+    },
+    {
+      "target": ".tenetora/rules/prompt-injection.md",
+      "source": "rules/prompt-injection.md"
+    },
+    {
+      "target": ".tenetora/rules/rule-capture.md",
+      "source": "rules/rule-capture.md"
+    },
+    {
+      "target": ".tenetora/rules/security-boundary.md",
+      "source": "rules/security-boundary.md"
+    },
+    {
+      "target": ".tenetora/rules/subagent-dispatch.md",
+      "source": "rules/subagent-dispatch.md"
+    },
+    {
+      "target": ".tenetora/rules/verification-claims.md",
+      "source": "rules/verification-claims.md"
+    },
+    {
+      "target": ".tenetora/skills/harness-repair.md",
+      "source": "skills/harness-repair.md"
+    },
+    {
+      "target": ".tenetora/skills/prompt-guard.md",
+      "source": "skills/prompt-guard.md"
+    },
+    {
+      "target": ".tenetora/workflows/harness-maintenance.md",
+      "source": "workflows/harness-maintenance.md"
+    },
+    {
+      "target": ".tenetora/workflows/untrusted-input.md",
+      "source": "workflows/untrusted-input.md"
+    },
+    {
+      "target": ".tenetora/workflows/decision-alignment.md",
+      "source": "workflows/decision-alignment.md"
+    },
+    {
+      "target": ".tenetora/workflows/change-impact-preflight.md",
+      "source": "workflows/change-impact-preflight.md"
+    },
+    {
+      "target": ".tenetora/workflows/end-to-end-skeleton-first.md",
+      "source": "workflows/end-to-end-skeleton-first.md"
+    },
+    {
+      "target": ".tenetora/skills/decision-interview.md",
+      "source": "skills/decision-interview.md"
+    },
+    {
+      "target": ".tenetora/templates/alignment-handoff.md",
+      "source": "templates/alignment-handoff.md"
+    },
+    {
+      "target": ".tenetora/templates/implementation-plan.md",
+      "source": "templates/implementation-plan.md"
+    },
+    {
+      "target": ".tenetora/templates/subagents/code-reviewer.spec.md",
+      "source": "templates/subagents/code-reviewer.spec.md"
+    },
+    {
+      "target": ".tenetora/templates/subagents/security-auditor.spec.md",
+      "source": "templates/subagents/security-auditor.spec.md"
+    },
+    {
+      "target": ".tenetora/templates/subagents/codebase-scout.spec.md",
+      "source": "templates/subagents/codebase-scout.spec.md"
+    },
+    {
+      "target": ".tenetora/templates/subagents/implementer.spec.md",
+      "source": "templates/subagents/implementer.spec.md"
+    }
+  ]
+}

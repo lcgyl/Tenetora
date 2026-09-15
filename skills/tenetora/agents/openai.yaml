@@ -1,0 +1,6 @@
+interface:
+  display_name: "Tenetora"
+  short_description: "Bootstrap shared AI repo harnesses"
+  default_prompt: "Use $tenetora to initialize, update, audit, continue bounded work, or guard untrusted external content for this repository's shared .tenetora AI-agent context layer."
+policy:
+  allow_implicit_invocation: true

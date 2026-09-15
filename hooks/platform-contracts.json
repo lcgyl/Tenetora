@@ -1,0 +1,270 @@
+{
+  "schema_version": 1,
+  "platforms": {
+    "agents": {
+      "adapter_id": "generic-agents",
+      "maximum_capability": "SKILLS_ONLY",
+      "default_scope": "global",
+      "both_runtime_preference": "global",
+      "installer": "skills",
+      "runtime_kind": "none",
+      "path_assumption": "host-dependent",
+      "locator_environment": ["AGENT_SKILLS_HOME"],
+      "discovery_order": ["global-skill", "project-skill"],
+      "trust_mechanism": "none",
+      "version_sources": ["skill/VERSION"],
+      "observation": false,
+      "delegation": {
+        "platform_support": "unknown",
+        "support_basis": "host-dependent",
+        "dispatch_label": "host-dependent",
+        "modes": [],
+        "builtin_agents": [],
+        "builtin_role_candidates": {},
+        "isolation_contract": "host-dependent"
+      },
+      "events": {},
+      "execution_identity": {
+        "session": ["session_id", "sessionId"],
+        "conversation": ["conversation_id", "conversationId"],
+        "continuity": ["conversation_continuity_id", "conversationContinuityId", "conversation_id", "conversationId"],
+        "owner": ["owner_id", "ownerId", "conversation_id", "conversationId"],
+        "provider": ["provider", "model_provider", "modelProvider"],
+        "model": ["model", "model_name", "modelName"],
+        "attempt": ["execution_attempt_id", "executionAttemptId", "attempt_id", "attemptId"]
+      }
+    },
+    "codex": {
+      "adapter_id": "codex",
+      "maximum_capability": "ACTIVE",
+      "default_scope": "global",
+      "both_runtime_preference": "global",
+      "installer": "native-marketplace",
+      "runtime_kind": "command",
+      "path_assumption": "restricted",
+      "locator_environment": ["PLUGIN_ROOT", "CODEX_HOME", "TENETORA_HOME"],
+      "discovery_order": ["global-skill", "project-skill", "native-plugin-skill"],
+      "trust_mechanism": "hooks-list",
+      "version_sources": ["registered-plugin", "plugin-cache", "skill/VERSION"],
+      "observation": true,
+      "delegation": {
+        "platform_support": "supported",
+        "support_basis": "official-contract",
+        "dispatch_label": "native-or-custom-agents",
+        "modes": ["builtin-role-injection", "custom-agent"],
+        "builtin_agents": ["default", "worker", "explorer"],
+        "builtin_role_candidates": {"code-reviewer": "default", "codebase-scout": "explorer", "implementer": "worker"},
+        "isolation_contract": "inherits-parent-runtime"
+      },
+      "events": {
+        "SessionStart": ["hookSpecificOutput"],
+        "UserPromptSubmit": ["hookSpecificOutput"],
+        "PreToolUse": ["hookSpecificOutput"],
+        "SubagentStart": ["hookSpecificOutput"],
+        "SubagentStop": ["hookSpecificOutput"],
+        "Stop": ["decision", "reason", "stopReason", "continue", "suppressOutput", "systemMessage"]
+      },
+      "execution_identity": {
+        "session": ["session_id", "sessionId"],
+        "conversation": ["conversation_id", "conversationId"],
+        "continuity": ["conversation_continuity_id", "conversationContinuityId", "conversation_id", "conversationId"],
+        "owner": ["owner_id", "ownerId", "conversation_id", "conversationId"],
+        "provider": ["provider", "model_provider", "modelProvider"],
+        "model": ["model", "model_name", "modelName"],
+        "attempt": ["execution_attempt_id", "executionAttemptId", "attempt_id", "attemptId"]
+      }
+    },
+    "claude": {
+      "adapter_id": "claude-code",
+      "maximum_capability": "ACTIVE",
+      "default_scope": "global",
+      "both_runtime_preference": "global",
+      "installer": "native-marketplace",
+      "runtime_kind": "command",
+      "path_assumption": "standard",
+      "locator_environment": ["CLAUDE_PLUGIN_ROOT", "CLAUDE_CONFIG_DIR", "CLAUDE_HOME", "TENETORA_HOME"],
+      "discovery_order": ["global-skill", "project-skill", "native-plugin-skill"],
+      "trust_mechanism": "plugin-registry",
+      "version_sources": ["registered-plugin", "plugin-cache", "skill/VERSION"],
+      "observation": true,
+      "delegation": {
+        "platform_support": "supported",
+        "support_basis": "official-contract",
+        "dispatch_label": "native-or-custom-agents",
+        "modes": ["builtin-role-injection", "custom-agent"],
+        "builtin_agents": ["general-purpose", "Explore", "Plan"],
+        "builtin_role_candidates": {"code-reviewer": "general-purpose", "codebase-scout": "Explore", "implementer": "general-purpose"},
+        "isolation_contract": "mixed-explore-read-only-general-purpose-full-tools"
+      },
+      "events": {
+        "SessionStart": ["hookSpecificOutput"],
+        "UserPromptSubmit": ["hookSpecificOutput"],
+        "PreToolUse": ["hookSpecificOutput"],
+        "PostToolUse": ["hookSpecificOutput"],
+        "SubagentStart": ["hookSpecificOutput"],
+        "SubagentStop": ["hookSpecificOutput"],
+        "Stop": ["decision", "reason", "stopReason", "continue", "suppressOutput", "systemMessage"]
+      },
+      "execution_identity": {
+        "session": ["session_id", "sessionId"],
+        "conversation": ["conversation_id", "conversationId"],
+        "continuity": ["conversation_continuity_id", "conversationContinuityId", "conversation_id", "conversationId"],
+        "owner": ["owner_id", "ownerId", "conversation_id", "conversationId"],
+        "provider": ["provider", "model_provider", "modelProvider"],
+        "model": ["model", "model_name", "modelName"],
+        "attempt": ["execution_attempt_id", "executionAttemptId", "attempt_id", "attemptId"]
+      }
+    },
+    "cursor": {
+      "adapter_id": "cursor",
+      "maximum_capability": "ACTIVE",
+      "default_scope": "global",
+      "both_runtime_preference": "project",
+      "installer": "runtime-adapter",
+      "runtime_kind": "hooks-json",
+      "path_assumption": "restricted",
+      "locator_environment": ["CURSOR_HOME", "TENETORA_PLUGIN_ROOT", "TENETORA_HOME"],
+      "discovery_order": ["global-skill", "project-skill", "project-adapter", "global-adapter"],
+      "trust_mechanism": "workspace-trust",
+      "version_sources": ["adapter-source", "skill/VERSION"],
+      "observation": true,
+      "delegation": {
+        "platform_support": "limited",
+        "support_basis": "recommendation-only",
+        "dispatch_label": "recommendation-only",
+        "modes": [],
+        "builtin_agents": [],
+        "builtin_role_candidates": {},
+        "isolation_contract": "unverified"
+      },
+      "events": {
+        "SessionStart": ["additional_context"],
+        "PreToolUse": ["continue", "permission", "user_message", "agent_message"],
+        "Stop": ["followup_message"]
+      },
+      "execution_identity": {
+        "session": ["session_id", "sessionId"],
+        "conversation": ["conversation_id", "conversationId"],
+        "continuity": ["conversation_continuity_id", "conversationContinuityId", "conversation_id", "conversationId"],
+        "owner": ["owner_id", "ownerId", "conversation_id", "conversationId"],
+        "provider": ["provider", "model_provider", "modelProvider"],
+        "model": ["model", "model_name", "modelName"],
+        "attempt": ["execution_attempt_id", "executionAttemptId", "attempt_id", "attemptId"]
+      }
+    },
+    "opencode": {
+      "adapter_id": "opencode",
+      "maximum_capability": "ACTIVE_PARTIAL",
+      "default_scope": "global",
+      "both_runtime_preference": "project",
+      "installer": "runtime-adapter",
+      "runtime_kind": "javascript-plugin",
+      "path_assumption": "standard",
+      "locator_environment": ["OPENCODE_HOME", "XDG_CONFIG_HOME", "TENETORA_HOME"],
+      "discovery_order": ["global-skill", "project-skill", "project-adapter", "global-adapter"],
+      "trust_mechanism": "auto-load-plugin-directory",
+      "version_sources": ["adapter-source", "skill/VERSION"],
+      "observation": true,
+      "delegation": {
+        "platform_support": "unknown",
+        "support_basis": "host-dependent",
+        "dispatch_label": "host-dependent",
+        "modes": [],
+        "builtin_agents": [],
+        "builtin_role_candidates": {},
+        "isolation_contract": "host-dependent"
+      },
+      "events": {
+        "SessionStart": ["hookSpecificOutput"],
+        "PreToolUse": ["hookSpecificOutput"]
+      },
+      "execution_identity": {
+        "session": ["session_id", "sessionId"],
+        "conversation": ["conversation_id", "conversationId"],
+        "continuity": ["conversation_continuity_id", "conversationContinuityId", "conversation_id", "conversationId"],
+        "owner": ["owner_id", "ownerId", "conversation_id", "conversationId"],
+        "provider": ["provider", "model_provider", "modelProvider"],
+        "model": ["model", "model_name", "modelName"],
+        "attempt": ["execution_attempt_id", "executionAttemptId", "attempt_id", "attemptId"]
+      }
+    },
+    "pi": {
+      "adapter_id": "pi",
+      "maximum_capability": "ACTIVE_PARTIAL",
+      "default_scope": "global",
+      "both_runtime_preference": "global",
+      "installer": "runtime-adapter",
+      "runtime_kind": "typescript-extension",
+      "path_assumption": "standard",
+      "locator_environment": ["HOME"],
+      "discovery_order": ["global-pi-skill", "global-agents-skill", "project-pi-skill", "project-agents-skill", "project-adapter", "global-adapter"],
+      "trust_mechanism": "global-auto-load;project-trust-gated",
+      "version_sources": ["adapter-source", "skill/VERSION"],
+      "observation": true,
+      "delegation": {
+        "platform_support": "unknown",
+        "support_basis": "host-dependent",
+        "dispatch_label": "host-dependent",
+        "modes": [],
+        "builtin_agents": [],
+        "builtin_role_candidates": {},
+        "isolation_contract": "host-dependent"
+      },
+      "events": {
+        "SessionStart": ["hookSpecificOutput"],
+        "UserPromptSubmit": ["hookSpecificOutput"],
+        "PreToolUse": ["hookSpecificOutput"]
+      },
+      "execution_identity": {
+        "session": ["session_id", "sessionId"],
+        "conversation": ["conversation_id", "conversationId"],
+        "continuity": ["conversation_continuity_id", "conversationContinuityId", "conversation_id", "conversationId"],
+        "owner": ["owner_id", "ownerId", "conversation_id", "conversationId"],
+        "provider": ["provider", "model_provider", "modelProvider"],
+        "model": ["model", "model_name", "modelName"],
+        "attempt": ["execution_attempt_id", "executionAttemptId", "attempt_id", "attemptId"]
+      }
+    },
+    "zcode": {
+      "adapter_id": "zcode",
+      "maximum_capability": "ACTIVE",
+      "default_scope": "global",
+      "both_runtime_preference": "global",
+      "installer": "zcode-native",
+      "runtime_kind": "process",
+      "path_assumption": "standard",
+      "locator_environment": ["ZCODE_PLUGIN_ROOT", "ZCODE_HOME", "TENETORA_HOME"],
+      "discovery_order": ["global-zcode-skill", "global-agents-skill", "project-zcode-skill", "project-agents-skill", "native-plugin-skill"],
+      "trust_mechanism": "enabledPlugins",
+      "version_sources": ["installed_plugins.json", "plugin-cache", "skill/VERSION"],
+      "observation": true,
+      "delegation": {
+        "platform_support": "supported",
+        "support_basis": "observed-real-pilot",
+        "dispatch_label": "host-agents",
+        "modes": ["builtin-role-injection", "custom-agent"],
+        "builtin_agents": ["general-purpose", "Explore"],
+        "builtin_role_candidates": {"code-reviewer": "general-purpose", "codebase-scout": "Explore", "implementer": "general-purpose"},
+        "isolation_contract": "host-declared"
+      },
+      "events": {
+        "SessionStart": ["hookSpecificOutput"],
+        "UserPromptSubmit": ["hookSpecificOutput"],
+        "PreToolUse": ["hookSpecificOutput"],
+        "PostToolUse": ["hookSpecificOutput"],
+        "SubagentStart": ["hookSpecificOutput"],
+        "SubagentStop": ["hookSpecificOutput"],
+        "Stop": ["decision", "reason", "stopReason", "continue", "suppressOutput", "systemMessage"]
+      },
+      "execution_identity": {
+        "session": ["session_id", "sessionId"],
+        "conversation": ["conversation_id", "conversationId"],
+        "continuity": ["conversation_continuity_id", "conversationContinuityId", "conversation_id", "conversationId"],
+        "owner": ["owner_id", "ownerId", "conversation_id", "conversationId"],
+        "provider": ["provider", "model_provider", "modelProvider"],
+        "model": ["model", "model_name", "modelName"],
+        "attempt": ["execution_attempt_id", "executionAttemptId", "attempt_id", "attemptId"]
+      }
+    }
+  }
+}

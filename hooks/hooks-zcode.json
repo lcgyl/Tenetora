@@ -1,0 +1,151 @@
+{
+  "description": "Tenetora runtime governance hooks for ZCode",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "process",
+            "command": "python3",
+            "args": [
+              "${ZCODE_PLUGIN_ROOT}/hooks/tenetora_hook.py",
+              "session-start",
+              "--platform",
+              "zcode"
+            ],
+            "timeoutMs": 10000,
+            "statusMessage": "Tenetora context"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "process",
+            "command": "python3",
+            "args": [
+              "${ZCODE_PLUGIN_ROOT}/hooks/tenetora_hook.py",
+              "user-prompt-submit",
+              "--platform",
+              "zcode"
+            ],
+            "timeoutMs": 20000,
+            "statusMessage": "Tenetora routing"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "process",
+            "command": "python3",
+            "args": [
+              "${ZCODE_PLUGIN_ROOT}/hooks/tenetora_hook.py",
+              "pre-tool-commit",
+              "--platform",
+              "zcode"
+            ],
+            "timeoutMs": 30000,
+            "statusMessage": "Tenetora commit guard"
+          }
+        ]
+      },
+      {
+        "matcher": "WebFetch|WebSearch",
+        "hooks": [
+          {
+            "type": "process",
+            "command": "python3",
+            "args": [
+              "${ZCODE_PLUGIN_ROOT}/hooks/tenetora_hook.py",
+              "pre-tool-external-input",
+              "--platform",
+              "zcode"
+            ],
+            "timeoutMs": 10000,
+            "statusMessage": "Tenetora external input"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "WebFetch|WebSearch",
+        "hooks": [
+          {
+            "type": "process",
+            "command": "python3",
+            "args": [
+              "${ZCODE_PLUGIN_ROOT}/hooks/tenetora_hook.py",
+              "post-tool-external-input",
+              "--platform",
+              "zcode"
+            ],
+            "timeoutMs": 20000,
+            "statusMessage": "Tenetora external scan"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "process",
+            "command": "python3",
+            "args": [
+              "${ZCODE_PLUGIN_ROOT}/hooks/tenetora_hook.py",
+              "subagent-start",
+              "--platform",
+              "zcode"
+            ],
+            "timeoutMs": 10000,
+            "statusMessage": "Tenetora subagent"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "process",
+            "command": "python3",
+            "args": [
+              "${ZCODE_PLUGIN_ROOT}/hooks/tenetora_hook.py",
+              "subagent-stop",
+              "--platform",
+              "zcode"
+            ],
+            "timeoutMs": 10000,
+            "statusMessage": "Tenetora subagent result"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "process",
+            "command": "python3",
+            "args": [
+              "${ZCODE_PLUGIN_ROOT}/hooks/tenetora_hook.py",
+              "stop",
+              "--platform",
+              "zcode"
+            ],
+            "timeoutMs": 10000,
+            "statusMessage": "Tenetora session"
+          }
+        ]
+      }
+    ]
+  }
+}

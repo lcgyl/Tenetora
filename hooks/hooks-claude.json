@@ -1,0 +1,212 @@
+{
+  "description": "Tenetora runtime governance hooks for Claude Code",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook\" session-start --platform claude",
+            "async": false,
+            "timeout": 10,
+            "statusMessage": "Tenetora context"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook\" user-prompt-submit --platform claude",
+            "async": false,
+            "timeout": 20,
+            "statusMessage": "Tenetora routing"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(rm *)",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook\" pre-tool-commit --platform claude",
+            "async": false,
+            "timeout": 30,
+            "statusMessage": "Tenetora local environment guard"
+          },
+          {
+            "type": "command",
+            "if": "Bash(mv *)",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook\" pre-tool-commit --platform claude",
+            "async": false,
+            "timeout": 30,
+            "statusMessage": "Tenetora local environment guard"
+          },
+          {
+            "type": "command",
+            "if": "Bash(unlink *)",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook\" pre-tool-commit --platform claude",
+            "async": false,
+            "timeout": 30,
+            "statusMessage": "Tenetora local environment guard"
+          },
+          {
+            "type": "command",
+            "if": "Bash(rename *)",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook\" pre-tool-commit --platform claude",
+            "async": false,
+            "timeout": 30,
+            "statusMessage": "Tenetora local environment guard"
+          },
+          {
+            "type": "command",
+            "if": "Bash(shred *)",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook\" pre-tool-commit --platform claude",
+            "async": false,
+            "timeout": 30,
+            "statusMessage": "Tenetora local environment guard"
+          },
+          {
+            "type": "command",
+            "if": "Bash(truncate *)",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook\" pre-tool-commit --platform claude",
+            "async": false,
+            "timeout": 30,
+            "statusMessage": "Tenetora local environment guard"
+          },
+          {
+            "type": "command",
+            "if": "Bash(git commit *)",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook\" pre-tool-commit --platform claude",
+            "async": false,
+            "timeout": 30,
+            "statusMessage": "Tenetora commit guard"
+          },
+          {
+            "type": "command",
+            "if": "Bash(git push *)",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook\" pre-tool-commit --platform claude",
+            "async": false,
+            "timeout": 30,
+            "statusMessage": "Tenetora commit guard"
+          },
+          {
+            "type": "command",
+            "if": "Bash(git -C * commit *)",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook\" pre-tool-commit --platform claude",
+            "async": false,
+            "timeout": 30,
+            "statusMessage": "Tenetora commit guard"
+          },
+          {
+            "type": "command",
+            "if": "Bash(git -C * push *)",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook\" pre-tool-commit --platform claude",
+            "async": false,
+            "timeout": 30,
+            "statusMessage": "Tenetora commit guard"
+          },
+          {
+            "type": "command",
+            "if": "Bash(*tenetora.cli*)",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook\" pre-tool-commit --platform claude",
+            "async": false,
+            "timeout": 10,
+            "statusMessage": "Tenetora CLI"
+          },
+          {
+            "type": "command",
+            "if": "Bash(*agent_harness.cli*)",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook\" pre-tool-commit --platform claude",
+            "async": false,
+            "timeout": 10,
+            "statusMessage": "Tenetora CLI"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook\" pre-tool-commit --platform claude",
+            "async": false,
+            "timeout": 30,
+            "statusMessage": "Tenetora local environment guard"
+          }
+        ]
+      },
+      {
+        "matcher": "WebFetch|WebSearch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook\" pre-tool-external-input --platform claude",
+            "async": false,
+            "timeout": 10,
+            "statusMessage": "Tenetora external input"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "WebFetch|WebSearch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook\" post-tool-external-input --platform claude",
+            "async": false,
+            "timeout": 20,
+            "statusMessage": "Tenetora external scan"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook\" subagent-start --platform claude",
+            "async": false,
+            "timeout": 10,
+            "statusMessage": "Tenetora subagent"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook\" subagent-stop --platform claude",
+            "async": false,
+            "timeout": 10,
+            "statusMessage": "Tenetora subagent result"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook\" stop --platform claude",
+            "async": false,
+            "timeout": 10,
+            "statusMessage": "Tenetora session"
+          }
+        ]
+      }
+    ]
+  }
+}

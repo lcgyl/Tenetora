@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "__TENETORA_RUN_HOOK__ session-start --platform cursor",
+        "timeout": 10,
+        "failClosed": false
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "command": "__TENETORA_RUN_HOOK__ pre-tool-commit --platform cursor",
+        "timeout": 30,
+        "failClosed": true
+      }
+    ],
+    "stop": [
+      {
+        "command": "__TENETORA_RUN_HOOK__ stop --platform cursor",
+        "timeout": 10,
+        "loop_limit": 1,
+        "failClosed": false
+      }
+    ]
+  }
+}

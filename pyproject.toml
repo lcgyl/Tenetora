@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tenetora"
+dynamic = ["version"]
+description = "Govern shared project context, rules, evidence, and runtime controls for engineering agents."
+requires-python = ">=3.9"
+readme = "README.md"
+
+[project.scripts]
+tenetora = "tenetora.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/lcgyl/Tenetora"
+Repository = "https://github.com/lcgyl/Tenetora"
+
+[tool.setuptools]
+package-dir = {"" = "cli"}
+
+[tool.setuptools.packages.find]
+where = ["cli"]
+
+[tool.setuptools.dynamic]
+version = {attr = "tenetora.__version__"}
