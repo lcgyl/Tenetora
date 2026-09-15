@@ -1,0 +1,85 @@
+{
+  "description": "Tenetora runtime governance hooks for Codex",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/hooks/run-hook\" session-start --platform codex",
+            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" session-start --platform codex",
+            "timeout": 10,
+            "statusMessage": "Tenetora context"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/hooks/run-hook\" user-prompt-submit --platform codex",
+            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" user-prompt-submit --platform codex",
+            "timeout": 20,
+            "statusMessage": "Tenetora routing"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/hooks/run-hook\" pre-tool-commit --platform codex",
+            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" pre-tool-commit --platform codex",
+            "timeout": 30,
+            "statusMessage": "Tenetora commit guard"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/hooks/run-hook\" subagent-start --platform codex",
+            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" subagent-start --platform codex",
+            "timeout": 10,
+            "statusMessage": "Tenetora subagent"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/hooks/run-hook\" subagent-stop --platform codex",
+            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" subagent-stop --platform codex",
+            "timeout": 10,
+            "statusMessage": "Tenetora subagent result"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/hooks/run-hook\" stop --platform codex",
+            "commandWindows": "\"%PLUGIN_ROOT%\\hooks\\run-hook.cmd\" stop --platform codex",
+            "timeout": 10,
+            "statusMessage": "Tenetora session"
+          }
+        ]
+      }
+    ]
+  }
+}

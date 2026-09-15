@@ -1,0 +1,6 @@
+interface:
+  display_name: "Tenetora Decision Interview"
+  short_description: "Resolve material engineering ambiguity"
+  default_prompt: "Use $tenetora-decision-interview inside an active Tenetora lifecycle to investigate facts and ask one bounded engineering decision question at a time."
+policy:
+  allow_implicit_invocation: true

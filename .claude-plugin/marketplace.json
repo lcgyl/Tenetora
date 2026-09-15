@@ -1,0 +1,20 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "tenetora-local",
+  "description": "Tenetora lifecycle governance plugins",
+  "owner": {
+    "name": "LCGYL"
+  },
+  "plugins": [
+    {
+      "name": "tenetora",
+      "description": "Tenetora shared engineering-agent governance with portable role contracts, built-in subagent fallback, and runtime hooks.",
+      "version": "0.3.40",
+      "author": {
+        "name": "LCGYL"
+      },
+      "source": ".",
+      "category": "development"
+    }
+  ]
+}

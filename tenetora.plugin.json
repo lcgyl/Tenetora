@@ -1,0 +1,70 @@
+{
+  "schema": "tenetora.plugin-adapters.v1",
+  "name": "tenetora",
+  "version": "0.3.40",
+  "displayName": "Tenetora",
+  "description": "Tenetora shared engineering-agent governance with decision alignment, qualified built-in subagent role fallback, and cross-tool runtime adapters.",
+  "skills": "./skills/",
+  "adapters": [
+    {
+      "tool": "codex",
+      "status": "native-plugin",
+      "manifest": ".codex-plugin/plugin.json",
+      "skills": "./skills/",
+      "notes": "Codex plugin manifest exposes all lifecycle skills and Codex-specific runtime hooks, including observation of host-dispatched subagents. Hooks never spawn agents. Non-managed hooks require explicit review in /hooks before they execute.",
+      "hooks": "./hooks/hooks.json"
+    },
+    {
+      "tool": "claude-code",
+      "status": "native-plugin",
+      "manifest": ".claude-plugin/plugin.json",
+      "skills": "./skills/",
+      "notes": "Claude Code plugin manifest exposes lifecycle skills and runtime hooks for route/rules, alignment recommendations, commit guard, external-input guard, subagent lifecycle observation, and claim-proof enforcement.",
+      "hooks": "./hooks/hooks-claude.json"
+    },
+    {
+      "tool": "opencode",
+      "status": "runtime-plugin-adapter",
+      "skills": "./skills/",
+      "hooks": "./hooks/opencode-plugin.js",
+      "runtime": "active-partial",
+      "notes": "The installer writes lifecycle skills plus an auto-loaded JavaScript plugin for session context, compaction context, and pre-tool Git guards. OpenCode has no equivalent enforced Stop hook, so runtime coverage is partial."
+    },
+    {
+      "tool": "pi",
+      "status": "runtime-extension-adapter",
+      "skills": "./skills/",
+      "hooks": "./hooks/pi-extension.ts",
+      "runtime": "active-partial",
+      "notes": "Pi uses a global auto-loaded TypeScript extension for session context, prompt context, compaction refresh, and pre-tool Git guards. Project extensions remain gated by Pi project trust. Pi has no verified Tenetora subagent or mandatory Stop contract here, so runtime coverage and delegation remain host-dependent."
+    },
+    {
+      "tool": "cursor",
+      "status": "runtime-hooks-adapter",
+      "skills": "./skills/",
+      "hooks": "./hooks/hooks-cursor.json",
+      "runtime": "active",
+      "notes": "The installer merges managed entries into user or project hooks.json without replacing unrelated hooks. Session context, shell Git guards, and bounded stop follow-up are enabled."
+    },
+    {
+      "tool": "zcode",
+      "status": "native-plugin",
+      "manifest": ".zcode-plugin/plugin.json",
+      "skills": "./skills/",
+      "hooks": "./hooks/hooks-zcode.json",
+      "notes": "ZCode uses a dedicated process-hook manifest with ZCODE_PLUGIN_ROOT, observes recognized host subagent lifecycle events without spawning them, and is installed through its registered plugin cache."
+    },
+    {
+      "tool": "generic-agents",
+      "status": "skills-only",
+      "skills": "./skills/",
+      "runtime": "skills-only",
+      "notes": "Generic Agents has no shared runtime-hook standard. Lifecycle skills and the CLI remain available, but hook activation must never be inferred from skill installation."
+    }
+  ],
+  "fallback": {
+    "installer": "install.sh",
+    "package": "release-zip",
+    "notes": "Tools without a verified runtime-hook adapter install the same lifecycle skills and CLI from the release zip and are reported as skills-only."
+  }
+}

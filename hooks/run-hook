@@ -1,0 +1,83 @@
+#!/bin/sh
+set -eu
+
+PYTHONDONTWRITEBYTECODE=1
+export PYTHONDONTWRITEBYTECODE
+
+MINIMUM_PYTHON_MAJOR=3
+MINIMUM_PYTHON_MINOR=9
+
+if [ "$#" -lt 1 ]; then
+  exit 1
+fi
+
+case "$0" in
+  */*) SCRIPT_PARENT=${0%/*} ;;
+  *) SCRIPT_PARENT=. ;;
+esac
+[ -n "$SCRIPT_PARENT" ] || SCRIPT_PARENT=/
+if ! SCRIPT_DIR=$(CDPATH= cd "$SCRIPT_PARENT" 2>/dev/null && pwd -P); then
+  echo "Tenetora hook launcher cannot resolve its package directory: $0" >&2
+  exit 1
+fi
+
+python_is_compatible() {
+  candidate=$1
+  [ -f "$candidate" ] && [ -x "$candidate" ] || return 1
+  "$candidate" -c "import sys; raise SystemExit(0 if sys.version_info >= (${MINIMUM_PYTHON_MAJOR}, ${MINIMUM_PYTHON_MINOR}) else 1)" >/dev/null 2>&1
+}
+
+EXPLICIT_PYTHON=${TENETORA_PYTHON:-}
+if [ -n "$EXPLICIT_PYTHON" ]; then
+  if python_is_compatible "$EXPLICIT_PYTHON"; then
+    PYTHON_BIN=$EXPLICIT_PYTHON
+  else
+    echo "Tenetora hook launcher rejected TENETORA_PYTHON=$EXPLICIT_PYTHON; expected an executable Python ${MINIMUM_PYTHON_MAJOR}.${MINIMUM_PYTHON_MINOR} or newer." >&2
+    exit 1
+  fi
+else
+  PYTHON_BIN=
+fi
+
+TENETORA_HOME_VALUE=${TENETORA_HOME:-${HOME:-}/.tenetora}
+RUNTIME_FILE=${TENETORA_RUNTIME_PYTHON_FILE:-$TENETORA_HOME_VALUE/runtime/python}
+RUNTIME_PYTHON=
+if [ -z "$PYTHON_BIN" ] && [ -r "$RUNTIME_FILE" ]; then
+  IFS= read -r RUNTIME_PYTHON < "$RUNTIME_FILE" || RUNTIME_PYTHON=
+  if [ -n "$RUNTIME_PYTHON" ] && python_is_compatible "$RUNTIME_PYTHON"; then
+    PYTHON_BIN=$RUNTIME_PYTHON
+  fi
+fi
+
+if [ -z "$PYTHON_BIN" ]; then
+  for candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+    if python_is_compatible "$candidate"; then
+      PYTHON_BIN=$candidate
+      break
+    fi
+  done
+fi
+
+if [ -z "$PYTHON_BIN" ]; then
+  for command_name in python3.13 python3.12 python3.11 python3.10 python3.9 python3 python; do
+    candidate=$(command -v "$command_name" 2>/dev/null || true)
+    if [ -n "$candidate" ] && python_is_compatible "$candidate"; then
+      PYTHON_BIN=$candidate
+      break
+    fi
+  done
+fi
+
+if [ -z "$PYTHON_BIN" ]; then
+  echo "Tenetora hooks require Python ${MINIMUM_PYTHON_MAJOR}.${MINIMUM_PYTHON_MINOR} or newer." >&2
+  echo "Managed runtime pointer: $RUNTIME_FILE${RUNTIME_PYTHON:+ -> $RUNTIME_PYTHON}" >&2
+  echo "PATH: ${PATH:-<unset>}" >&2
+  echo "Reinstall Tenetora or set TENETORA_PYTHON to a compatible absolute path." >&2
+  exit 1
+fi
+
+if [ "$1" = "--check" ]; then
+  exec "$PYTHON_BIN" "$SCRIPT_DIR/tenetora_hook.py" --runtime-check
+fi
+
+exec "$PYTHON_BIN" "$SCRIPT_DIR/tenetora_hook.py" "$@"

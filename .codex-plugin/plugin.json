@@ -1,0 +1,39 @@
+{
+  "name": "tenetora",
+  "version": "0.3.40",
+  "description": "Tenetora governance for shared engineering-agent context, decision alignment, evidence, runtime controls, and bounded execution.",
+  "author": {
+    "name": "LCGYL",
+    "url": "https://github.com/lcgyl/Tenetora"
+  },
+  "homepage": "https://github.com/lcgyl/Tenetora",
+  "repository": "https://github.com/lcgyl/Tenetora",
+  "license": "MIT",
+  "keywords": [
+    "tenetora",
+    "harness-engineering",
+    "skills",
+    "ai-governance",
+    "prompt-guard",
+    "decision-alignment"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Tenetora",
+    "shortDescription": "Govern shared .tenetora context for engineering agents",
+    "longDescription": "Tenetora packages lifecycle skills and a deterministic CLI for shared .tenetora governance: pre-execution decision alignment, portable role contracts with qualified built-in subagent fallback, project initialization, evidence refresh, stability audit, bounded execution loops, and prompt-injection guardrails across AI coding tools.",
+    "developerName": "LCGYL",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Align this high-risk engineering task before implementation.",
+      "Initialize .tenetora for this project.",
+      "Update and audit this project's .tenetora."
+    ],
+    "brandColor": "#2563EB"
+  }
+}

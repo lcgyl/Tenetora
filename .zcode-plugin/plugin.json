@@ -1,0 +1,17 @@
+{
+  "name": "tenetora",
+  "version": "0.3.40",
+  "description": "Tenetora lifecycle governance with decision alignment, built-in subagent role fallback, and hook-driven enforcement.",
+  "description_i18n": {
+    "en": "Tenetora lifecycle governance with decision alignment, built-in subagent role fallback, and hook-driven enforcement.",
+    "zh-CN": "Tenetora 面向工程智能体提供决策对齐、内置子智能体角色兜底、规则路由、运行时门禁和有界执行循环。"
+  },
+  "author": {
+    "name": "LCGYL",
+    "url": "https://github.com/lcgyl/Tenetora"
+  },
+  "homepage": "https://github.com/lcgyl/Tenetora",
+  "repository": "https://github.com/lcgyl/Tenetora",
+  "license": "MIT",
+  "skills": "skills"
+}
