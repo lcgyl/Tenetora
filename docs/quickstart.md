@@ -84,7 +84,7 @@ tenetora upgrade --apply
 `--apply` is a compatibility alias for older automation. A 0.2.x user enters the 0.3 bridge once with a fixed-version bootstrap; later upgrades do not fetch a remote script:
 
 ```bash
-curl -fsSL https://github.com/lcgyl/Tenetora/-/raw/0.3.11/install.sh \
+curl -fsSL https://github.com/lcgyl/Tenetora/-/raw/0.3.40/install.sh \
   | bash -s -- --lang en --tools all --both --path "$PWD"
 ```
 
@@ -102,6 +102,16 @@ tenetora repair --apply --path .
 ```
 
 `upgrade` does not initialize a project, and `update` without install-mode flags does not create a new skill installation surface. Do not merge software maintenance with project semantics.
+
+For local environment files and ordinary scratch workspaces:
+
+```bash
+tenetora local-env --path . --allow config/local/app.conf
+tenetora status --path . --json
+tenetora installations --json list
+```
+
+Projects without `.tenetora/` remain outside governance; installation is global capability, not automatic project enrollment.
 
 ## 7. Daily High-risk Boundaries
 

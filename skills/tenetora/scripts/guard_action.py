@@ -1251,7 +1251,7 @@ def explicit_guard_identity(args: argparse.Namespace) -> dict[str, str]:
 
     return {
         "session_id": _arg_or_environment(
-            args, "session_id", "TENETORA_ALIGNMENT_SESSION_ID", "TENETORA_SESSION_ID"
+            args, "session_id", "TENETORA_ALIGNMENT_SESSION_ID"
         ),
         "owner_id": _arg_or_environment(
             args, "owner_id", "TENETORA_ALIGNMENT_OWNER_ID", "TENETORA_OWNER_ID"
@@ -1320,6 +1320,39 @@ def alignment_session_for_identity(
     return None, None, None
 
 
+def terminal_alignments_for_identity(
+    root: Path,
+    *,
+    continuity_id: str = "",
+    conversation_id: str = "",
+    owner_id: str = "",
+) -> list[dict[str, str]]:
+    """Return terminal task goals matching all available stable host identity fields."""
+
+    expected = {
+        "conversation_continuity_id": continuity_id,
+        "conversation_id": conversation_id,
+        "owner_id": owner_id,
+    }
+    if not any(expected.values()):
+        return []
+    terminal_statuses = {"completed", "archived", "expired", "abandoned"}
+    candidates: list[dict[str, str]] = []
+    for session_id, record in alignment_state.load_lifecycle(root).get("records", {}).items():
+        if record.get("status") not in terminal_statuses:
+            continue
+        if any(value and str(record.get(field) or "") != value for field, value in expected.items()):
+            continue
+        candidates.append(
+            {
+                "session_id": str(session_id),
+                "lifecycle_status": str(record.get("status") or ""),
+                "goal": str(record.get("goal") or ""),
+            }
+        )
+    return candidates
+
+
 def prepare_guard_identity(args: argparse.Namespace) -> dict[str, Any]:
     """Bind a guard request to a cached host context without inventing an alignment id."""
 
@@ -1376,6 +1409,30 @@ def prepare_guard_identity(args: argparse.Namespace) -> dict[str, Any]:
         setattr(args, "_execution_identity_resolution", resolution)
         return resolution
     if not session_id:
+        closed_candidates = terminal_alignments_for_identity(
+            args.path,
+            continuity_id=continuity_id,
+            conversation_id=conversation_id,
+            owner_id=owner_id,
+        )
+        if closed_candidates:
+            resolution = {
+                "status": "alignment-closed",
+                "context": context,
+                "candidate_count": len(closed_candidates),
+                "reason": "host execution identity matches only terminal task alignments",
+                "source": source,
+                "candidates": closed_candidates,
+            }
+            if len(closed_candidates) == 1:
+                resolution.update(
+                    {
+                        "alignment_session_id": closed_candidates[0]["session_id"],
+                        "lifecycle_status": closed_candidates[0]["lifecycle_status"],
+                    }
+                )
+            setattr(args, "_execution_identity_resolution", resolution)
+            return resolution
         resolution = {
             "status": "alignment-missing",
             "context": context,
@@ -1413,7 +1470,7 @@ def prepare_guard_identity(args: argparse.Namespace) -> dict[str, Any]:
 def identity_resolution_failure(args: argparse.Namespace, *, proof_lookup: bool = False) -> dict[str, Any] | None:
     resolution = getattr(args, "_execution_identity_resolution", {})
     status = str(resolution.get("status") or "") if isinstance(resolution, dict) else ""
-    if status not in {"ambiguous", "alignment-missing"}:
+    if status not in {"ambiguous", "alignment-missing", "alignment-closed"}:
         return None
     context = resolution.get("context") if isinstance(resolution, dict) else None
     host_session = str(context.get("session_id") or "") if isinstance(context, dict) else ""
@@ -1421,16 +1478,28 @@ def identity_resolution_failure(args: argparse.Namespace, *, proof_lookup: bool 
     if status == "ambiguous":
         code = "claim-execution-identity-ambiguous"
         message = "Multiple alignment sessions match the current host execution identity; automatic binding is refused."
+        recommendation = "Pass the actual alignment --session-id and --owner-id explicitly."
+    elif status == "alignment-closed":
+        code = "claim-alignment-goal-closed"
+        message = "The host conversation matches only terminal Tenetora task alignments; a closed goal cannot authorize a different task."
+        recommendation = (
+            "Start a new task alignment with a new alignment session id while keeping the same host owner and conversation identity."
+        )
     else:
         code = "claim-alignment-session-not-found"
         message = "The host execution identity was found, but no matching Tenetora alignment session exists."
+        recommendation = "Start the task alignment, or pass its actual --session-id and --owner-id explicitly."
     details = {
         "execution_identity_status": status,
         "host_session_id": host_session,
         "candidate_count": resolution.get("candidate_count", 0) if isinstance(resolution, dict) else 0,
         "reason": reason,
-        "recommendation": "Pass the actual alignment --session-id and --owner-id explicitly, or start/resume the matching isolated alignment session.",
+        "recommendation": recommendation,
     }
+    if isinstance(resolution, dict) and resolution.get("alignment_session_id"):
+        details["alignment_session_id"] = resolution["alignment_session_id"]
+    if isinstance(resolution, dict) and resolution.get("lifecycle_status"):
+        details["lifecycle_status"] = resolution["lifecycle_status"]
     if isinstance(resolution, dict) and isinstance(resolution.get("candidates"), list):
         details["candidates"] = resolution["candidates"]
     if proof_lookup:

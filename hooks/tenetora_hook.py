@@ -706,6 +706,47 @@ def comparable_version(value: str) -> tuple[int, ...] | None:
     return tuple(int(part) for part in value.strip().split("."))
 
 
+def _defaults_version(path: Path) -> int | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    value = payload.get("version") if isinstance(payload, dict) else None
+    return value if type(value) is int and value >= 1 else None
+
+
+def project_governance_update_context(root: Path) -> str:
+    """Prompt the model when a package upgrade outpaces project semantics."""
+
+    runtime_defaults = _defaults_version(
+        plugin_root() / "skills" / "tenetora" / "defaults" / "manifest.json"
+    )
+    governance = root / ".tenetora"
+    if runtime_defaults is None or not governance.is_dir():
+        return ""
+    try:
+        project_payload = json.loads(
+            (governance / "manifest.json").read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        project_payload = {}
+    project_defaults = project_payload.get("defaults_version") if isinstance(project_payload, dict) else None
+    if type(project_defaults) is int and project_defaults >= runtime_defaults:
+        return ""
+    observed = str(project_defaults) if type(project_defaults) is int else "unrecorded"
+    return localized_text(
+        "- Project governance update recommended: the project default-pack revision is "
+        f"{observed}, behind runtime revision {runtime_defaults}. Tell the user that the package upgrade "
+        "does not semantically update project-owned `.tenetora` content, and recommend "
+        "`use tenetora-update update .tenetora`. Do not run the update or overwrite project rules "
+        "without the user's decision. This reminder is non-blocking for unrelated work.\n",
+        "- 建议更新项目治理：项目默认规则包修订为 "
+        f"{observed}，落后于 runtime 修订 {runtime_defaults}。请明确提醒用户：软件包升级不会语义更新"
+        "项目自有的 `.tenetora` 内容，建议执行 `use tenetora-update 更新 .tenetora`。"
+        "未经用户决定不得自行更新或覆盖项目规则；与此无关的任务不被本提醒阻断。\n",
+    )
+
+
 def stale_project_skill_context(root: Path) -> str:
     host_dir = PROJECT_SKILL_HOST_DIRS.get(hook_platform())
     if not host_dir:
@@ -1488,11 +1529,11 @@ def execution_identity_context(root: Path, event: dict[str, Any]) -> str:
         "# Tenetora host execution identity\n"
         f"- source: `{status}`; host session: `{context.get('session_id', '')}`; owner: `{context.get('owner_id', '')}`.\n"
         f"- conversation: `{context.get('conversation_id', '')}`; continuity: `{context.get('conversation_continuity_id', '') or '<not supplied>'}`; tool: `{context.get('tool', hook_platform())}`.\n"
-        "- This identity is project-scoped and local-only. Reuse it for this conversation; never replace it with a pid, random value, or another conversation's id. Tenetora resolves the matching alignment session for claims.",
+        "- This identity is project-scoped and local-only. Reuse it for this conversation; never replace it with a pid, random value, or another conversation's id. It is not a task alignment id: Tenetora resolves a distinct open alignment goal for claims, and a later goal in this conversation receives a new alignment id.",
         "# Tenetora 宿主执行身份\n"
         f"- 来源：`{status}`；宿主会话：`{context.get('session_id', '')}`；owner：`{context.get('owner_id', '')}`。\n"
         f"- 对话：`{context.get('conversation_id', '')}`；连续性：`{context.get('conversation_continuity_id', '') or '<未提供>'}`；工具：`{context.get('tool', hook_platform())}`。\n"
-        "- 此身份仅按项目保存在本机。当前对话应持续复用它，不要换成进程 ID、随机值或其他对话的 ID；Tenetora 会为 claim 解析匹配的 alignment 会话。",
+        "- 此身份仅按项目保存在本机。当前对话应持续复用它，不要换成进程 ID、随机值或其他对话的 ID。它不是任务 alignment ID：Tenetora 会为 claim 解析独立的开放目标，同一对话中的后续目标会获得新的 alignment ID。",
     )
 
 
@@ -1878,6 +1919,7 @@ def session_start(event: dict[str, Any]) -> int:
         text += "\n" + identity_context + "\n"
     text += stale_project_skill_context(root)
     text += stale_effective_skill_context(root)
+    text += project_governance_update_context(root)
     feedback = governance_feedback(root)
     if feedback:
         text += "\n" + feedback + "\n"

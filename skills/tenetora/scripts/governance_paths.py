@@ -56,6 +56,17 @@ def package_version(scripts_dir: Path) -> str:
     return "unknown"
 
 
+def default_pack_version(scripts_dir: Path) -> int:
+    """Return the semantic default-pack revision shipped with this runtime."""
+
+    manifest = scripts_dir.resolve().parent / "defaults" / "manifest.json"
+    payload = read_json_object(manifest)
+    value = payload.get("version") if payload is not None else None
+    if type(value) is not int or value < 1:
+        raise ValueError(f"invalid Tenetora defaults manifest version: {manifest}")
+    return value
+
+
 def read_json_object(path: Path) -> dict[str, Any] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -87,6 +98,9 @@ def manifest_errors(directory: Path) -> list[str]:
     ownership = payload.get("ownership")
     if not isinstance(ownership, dict) or ownership.get("ecosystem") != PRODUCT_ID:
         errors.append("manifest ownership ecosystem is not tenetora")
+    defaults_version = payload.get("defaults_version")
+    if defaults_version is not None and (type(defaults_version) is not int or defaults_version < 1):
+        errors.append("manifest defaults_version is invalid")
     return errors
 
 
@@ -170,5 +184,23 @@ def ensure_manifest(
         evidence_families=evidence_families,
         source_fingerprint=source_fingerprint,
     )
+    write_json_atomic(directory / MANIFEST_NAME, payload)
+    return payload
+
+
+def record_defaults_reviewed(directory: Path) -> dict[str, Any]:
+    """Record the runtime default-pack revision after successful review.
+
+    Merely opening or refreshing a project must not advance this marker: it is
+    the durable evidence used by upgrade/session reminders.  Callers may use
+    this function only after a fresh initialization installed current defaults
+    or after an explicit model-owned semantic review completed successfully.
+    """
+    existing = read_manifest(directory)
+    if existing is None or manifest_errors(directory):
+        raise RuntimeError(f"cannot record defaults review for invalid {directory / MANIFEST_NAME}")
+    payload = dict(existing)
+    payload["updated_at"] = utc_now()
+    payload["defaults_version"] = default_pack_version(Path(__file__).resolve().parent)
     write_json_atomic(directory / MANIFEST_NAME, payload)
     return payload

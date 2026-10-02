@@ -9,7 +9,7 @@
     {
       "name": "tenetora",
       "description": "Tenetora shared engineering-agent governance with portable role contracts, built-in subagent fallback, and runtime hooks.",
-      "version": "0.3.40",
+      "version": "0.3.40-preview.7",
       "author": {
         "name": "LCGYL"
       },

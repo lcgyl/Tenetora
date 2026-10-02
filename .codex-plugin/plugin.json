@@ -1,6 +1,6 @@
 {
   "name": "tenetora",
-  "version": "0.3.40",
+  "version": "0.3.40-preview.7",
   "description": "Tenetora governance for shared engineering-agent context, decision alignment, evidence, runtime controls, and bounded execution.",
   "author": {
     "name": "LCGYL",

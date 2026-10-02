@@ -15,6 +15,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from path_security import validate_existing_project_path
+from governance_paths import canonical_dir, record_defaults_reviewed
 
 
 def existing_project_path(raw: str) -> Path:
@@ -65,6 +66,14 @@ def main() -> int:
         ),
     )
     parser.add_argument("--apply", action="store_true", help="Apply a refresh strategy before reviewing.")
+    parser.add_argument(
+        "--confirm-defaults-reviewed",
+        action="store_true",
+        help=(
+            "Record the current default-pack revision only after the model has semantically reviewed "
+            "and merged or intentionally preserved every applicable default change."
+        ),
+    )
     parser.add_argument(
         "--strategy",
         choices=("diff", "backup", "merge", "replace"),
@@ -189,6 +198,19 @@ def main() -> int:
         print(validation.stderr, end="", file=sys.stderr)
     if audit.stderr:
         print(audit.stderr, end="", file=sys.stderr)
+    if args.confirm_defaults_reviewed:
+        if validation.returncode != 0 or audit.returncode != 0 or audit_status != "pass":
+            print(
+                "Cannot confirm the default-pack review until validation and strict audit pass.",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            manifest = record_defaults_reviewed(canonical_dir(root))
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(f"Default-pack review confirmed: revision {manifest['defaults_version']}")
     return 0
 
 

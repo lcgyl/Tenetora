@@ -647,6 +647,7 @@ def replace_self_references(text: str) -> str:
         ("agent-harness-init", "tenetora-init"),
         ("agent-harness-align", "tenetora-align"),
         ("agent-harness-loop", "tenetora-loop"),
+        ("agent-harness-plan", "tenetora-plan"),
         ("use agent-harness-", "use tenetora-"),
         ("use agent-harness", "use tenetora"),
         (".agents/skills/agent-harness", ".agents/skills/tenetora"),

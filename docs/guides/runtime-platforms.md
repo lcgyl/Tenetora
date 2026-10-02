@@ -79,6 +79,12 @@ The auto-loaded TypeScript extension is installed at `~/.pi/agent/extensions/ten
 
 Generic Agents receive lifecycle skills and CLI only. A skills directory does not prove that runtime Hooks executed.
 
+### Local Environment and Unmanaged Workspaces
+
+Project-specific local-environment protection is available when the host exposes structured PreToolUse data. The guard reads only the registered relative paths, denies high-confidence destructive operations, and leaves opaque tool payloads alone. Generic Agents remain `skills-only`; use commit guard and doctor/status for their available protection layers.
+
+All hosts share the same opt-in workspace contract: a directory without `.tenetora/` or `.harness/` receives no project governance injection. This is independent of the global plugin/runtime installation.
+
 ## Runtime CLI Contract
 
 Each host must bootstrap the CLI from the exact Tenetora skill it loaded and use the returned absolute command. Do not borrow a skill directory from another host or persist a tool-local `PYTHONPATH`. An older project skill may delegate forward to the managed current release, but it must not downgrade the CLI shim.

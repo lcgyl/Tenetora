@@ -1,6 +1,6 @@
 {
   "name": "tenetora",
-  "version": "0.3.40",
+  "version": "0.3.40-preview.7",
   "description": "Tenetora lifecycle governance with decision alignment, built-in subagent role fallback, and hook-driven enforcement.",
   "description_i18n": {
     "en": "Tenetora lifecycle governance with decision alignment, built-in subagent role fallback, and hook-driven enforcement.",

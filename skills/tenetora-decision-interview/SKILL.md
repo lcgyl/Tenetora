@@ -79,6 +79,18 @@ Ask one question at a time. Each decision question must include:
 
 After the answer, summarize only the resulting decision and remaining uncertainty. Do not store the full conversation or hidden reasoning.
 
+## Plan Integration
+
+When `tenetora-plan` finds multiple materially different options, this
+interview is the decision boundary for the plan. The plan supplies repository
+facts and the option set; the interview supplies one question at a time. Keep
+the model recommendation first, label its confidence, explain its assumptions
+and tradeoffs, list the other viable options, and always offer a custom answer
+path. Never turn the recommendation into a default user decision. After the
+user answers, return only the decision summary and remaining open questions to
+the plan; the plan then reclassifies `MUST`, `SAFE`, and `LATER` items before
+freezing execution prompts.
+
 ## Convergence And Checkpoint
 
 - Stop asking when goal, scope, non-goals, material tradeoffs, risks, approval boundaries, rollback expectations, acceptance criteria, and any applicable skeleton boundaries/proof are sufficiently determined for the task's risk level.

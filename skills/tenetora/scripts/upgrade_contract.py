@@ -4,8 +4,16 @@
 from __future__ import annotations
 
 import re
+import sys
+from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from release_version import ReleaseVersionError, manifest_identity, version_key as release_version_key  # noqa: E402
 
 
 BRIDGE_PROTOCOL = 1
@@ -27,7 +35,6 @@ REQUIRED_MANIFEST_FIELDS = {
     "files",
     "file_sha256",
 }
-VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -35,11 +42,11 @@ class UpgradeContractError(RuntimeError):
     """Raised when a release or bridge contract is incomplete or unsafe."""
 
 
-def version_key(value: str) -> tuple[int, int, int]:
-    if not isinstance(value, str) or not VERSION_RE.fullmatch(value.strip()):
-        raise UpgradeContractError("release version must use MAJOR.MINOR.PATCH")
-    major, minor, patch = value.strip().split(".")
-    return int(major), int(minor), int(patch)
+def version_key(value: str) -> tuple[int, int, int, int, int]:
+    try:
+        return release_version_key(value)
+    except ReleaseVersionError as exc:
+        raise UpgradeContractError(str(exc)) from exc
 
 
 def normalize_manifest(payload: object, *, require_artifact: bool) -> dict[str, Any]:
@@ -52,7 +59,10 @@ def normalize_manifest(payload: object, *, require_artifact: bool) -> dict[str, 
         raise UpgradeContractError("release manifest identity or format is invalid")
     if not isinstance(payload.get("commit"), str) or not str(payload["commit"]).strip():
         raise UpgradeContractError("release commit identity is invalid")
-    version_key(str(payload.get("version") or ""))
+    try:
+        identity = manifest_identity(payload)
+    except ReleaseVersionError as exc:
+        raise UpgradeContractError(str(exc)) from exc
     version_key(str(payload.get("minimum_bridge_version") or ""))
     if type(payload.get("installer_protocol")) is not int or int(payload["installer_protocol"]) < INSTALLER_PROTOCOL:
         raise UpgradeContractError("release installer protocol is older than this upgrader supports")
@@ -88,14 +98,24 @@ def normalize_manifest(payload: object, *, require_artifact: bool) -> dict[str, 
     for key, value in state_schemas.items():
         if not isinstance(key, str) or not key or type(value) is not int or value < 1:
             raise UpgradeContractError("release state schema contract is invalid")
+    project_defaults_version = payload.get("project_defaults_version")
+    if project_defaults_version is not None and (
+        type(project_defaults_version) is not int or project_defaults_version < 1
+    ):
+        raise UpgradeContractError("release project defaults version is invalid")
     if require_artifact:
         artifact = payload.get("artifact")
         digest = payload.get("sha256")
-        if artifact not in {f"tenetora-{payload['version']}.zip", "tenetora-latest.zip"}:
+        if artifact not in {identity.artifact_name, identity.alias_name}:
             raise UpgradeContractError("release artifact name is invalid")
         if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
             raise UpgradeContractError("release SHA256 is invalid")
-    return dict(payload)
+    normalized = dict(payload)
+    normalized.setdefault("channel", identity.channel)
+    normalized.setdefault("stable_version", None if identity.channel == "stable" else identity.stable_version)
+    normalized.setdefault("preview_sequence", identity.preview_sequence)
+    normalized.setdefault("adapter_version", identity.adapter_version)
+    return normalized
 
 
 def ensure_source_supported(source_version: str, manifest: dict[str, Any]) -> None:

@@ -30,6 +30,10 @@ from path_security import (
 RELEASE_CONTRACT_FIELDS = (
     "name",
     "version",
+    "channel",
+    "stable_version",
+    "preview_sequence",
+    "adapter_version",
     "commit",
     "format",
     "installer_protocol",

@@ -86,6 +86,8 @@ LEGACY_COMMANDS = {
     "run-all": "run_all_guardrails.py",
     "setup-ci": "setup_ci.py",
     "upgrade": "upgrade_skill.py",
+    "cleanup": "maintenance.py",
+    "uninstall": "maintenance.py",
     "validate": "validate_harness.py",
 }
 LIFECYCLE_SKILLS = {
@@ -97,6 +99,7 @@ LIFECYCLE_SKILLS = {
     "tenetora-prompt-guard",
     "tenetora-align",
     "tenetora-decision-interview",
+    "tenetora-plan",
 }
 
 
