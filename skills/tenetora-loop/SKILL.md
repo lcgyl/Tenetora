@@ -67,7 +67,7 @@ Before editing files or running broad commands, establish:
 
 Use automatic triggering only from a user message or from an AI tool's skill router. The policy name is `user-message-or-tool-routing-only`. Never start from state alone, never run in the background, and never start a background loop.
 
-Read `.tenetora/state/loop-state.json` when it exists. Treat it as resumable state, not ground truth. Loop state is owner-bound; an active state from another conversation or a legacy unowned state is reported as `conflict` with its goal withheld:
+Read `.tenetora/state/loop-state.json` when it exists. Treat it as resumable state, not ground truth. Loop state is owner-bound; an active state from another logical conversation or a legacy unowned state is reported as `conflict` with its goal withheld. A terminal `done`/`idle` state owned by another conversation is exposed as neutral `idle` and must not block a new explicit goal:
 
 - `status: active` means a current user message such as continue/resume/next step may resume the loop.
 - `next_loop_prompt` is the preferred user-facing prompt for continuation.
@@ -75,7 +75,8 @@ Read `.tenetora/state/loop-state.json` when it exists. Treat it as resumable sta
 - `transitions[]` records status changes and helps explain how the loop reached the current state.
 - `review_cycle` records at most three reviews and two repairs; it is governance state, not permission for background execution.
 - `policy.background_execution` must remain false.
-- `session_id`, `owner_id`, `conversation_id`, and `revision` identify the writer; never adopt an active state without the matching identities.
+- `session_id` identifies the current host execution and may rotate when a host restarts. `conversation_continuity_id` (falling back to a stable `conversation_id`) identifies the logical conversation. Exact session/owner identity is preferred; the same continuity and host tool may resume after rotation, but the loop must rebind to the current session and discard old alignment/review evidence.
+- Never adopt an active state from a different continuity. A completed foreign state is history, not an active ownership conflict.
 
 Use the CLI to inspect or update this state:
 
@@ -87,11 +88,11 @@ tenetora loop-state --write --session-id "<session-id>" --owner-id "<owner-id>" 
 
 ## Continuing Across Conversations
 
-An active loop, alignment handoff, or verification claim belongs to its recorded session and owner. A new conversation must not treat a project-level status file as its own goal:
+An active loop belongs to its recorded logical conversation. A host restart may create a new execution session without creating a new logical conversation; use the stable conversation continuity to resume and rebind the loop. Alignment handoffs and verification claims remain task- and execution-bound and are never silently transferred. A genuinely new conversation must not treat a project-level status file as its own goal:
 
 1. Run `tenetora alignment --list --json` when the session id is unknown.
 2. Inspect the selected session with `tenetora alignment --status --session-id <id> --owner-id <owner> --json`.
-3. Resume or mutate only with the matching session and owner; verify the conversation id when the host provides one.
+3. Resume or mutate with the matching session/owner, or with the same stable conversation continuity and host tool after session rotation. A continuity rebind clears old alignment/review evidence, which must be re-established when required.
 4. Run the verification again and create a new claim bound to the current session, owner, conversation, tool, and goal fingerprint.
 
 The Stop hook's missing-proof reminder explains this boundary deliberately. A normal Stop is non-blocking and does not authorize adopting another conversation's goal, require a passed claim, or start a follow-up loop. Fail-closed claim enforcement is reserved for an explicitly marked completion workflow (`completion_workflow: true`, `completion_status: completed`, or `TENETORA_REQUIRE_COMPLETION_CLAIM=1`). Blocked, failed, partial, and awaiting-input reports do not need a passed completion claim. An old claim proof is never a substitute for current verification.

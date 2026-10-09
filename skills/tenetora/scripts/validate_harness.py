@@ -186,15 +186,25 @@ def validate_alignment(root: Path) -> list[str]:
                 alignment_state.ensure_safe_text(value, f"{label}.{field}")
             except alignment_state.AlignmentStateError as exc:
                 failures.append(str(exc))
-        expected = str(payload.get("goal_fingerprint", ""))
-        actual = alignment_state.goal_fingerprint(
-            str(payload.get("goal", "")),
-            list(payload.get("scope", [])),
-            list(payload.get("non_goals", [])),
-            list(payload.get("acceptance_criteria", [])),
+        # Lifecycle v1 was intentionally compact and historical records may not
+        # contain the semantic lists used to derive the fingerprint. Treat their
+        # stored fingerprint as an opaque identity instead of recomputing it from
+        # an incomplete projection. New lifecycle records carry all three lists
+        # and remain fully stale-checked.
+        semantic_fields = ("scope", "non_goals", "acceptance_criteria")
+        can_recompute = not label.startswith("lifecycle[") or all(
+            field in payload for field in semantic_fields
         )
-        if alignment_state.is_stale(expected, actual):
-            failures.append(f"stale {label} alignment goal fingerprint")
+        if can_recompute:
+            expected = str(payload.get("goal_fingerprint", ""))
+            actual = alignment_state.goal_fingerprint(
+                str(payload.get("goal", "")),
+                list(payload.get("scope", [])),
+                list(payload.get("non_goals", [])),
+                list(payload.get("acceptance_criteria", [])),
+            )
+            if alignment_state.is_stale(expected, actual):
+                failures.append(f"stale {label} alignment goal fingerprint")
 
     if current is not None:
         expected_hash = str(current.get("handoff_hash", ""))

@@ -21,7 +21,7 @@ This guide covers the transition from the Agent Harness naming to Tenetora 0.3.x
 A 0.2.x user enters the bridge once with a fixed-version bootstrap, then every platform uses the installed CLI:
 
 ```bash
-curl -fsSL https://github.com/lcgyl/Tenetora/-/raw/0.3.11/install.sh | bash -s -- --lang en --tools all --both --path "$PWD"
+curl -fsSL https://github.com/lcgyl/Tenetora/-/raw/0.3.40/install.sh | bash -s -- --lang en --tools all --both --path "$PWD"
 tenetora upgrade
 ```
 

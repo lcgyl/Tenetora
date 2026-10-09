@@ -38,6 +38,7 @@ LIFECYCLE_SKILLS = [
     "tenetora-prompt-guard",
     "tenetora-align",
     "tenetora-decision-interview",
+    "tenetora-plan",
 ]
 COMMIT_HOOK_STATE_REL = ".tenetora/state/commit-hooks.json"
 COMMIT_HOOK_NAMES = ("pre-commit", "commit-msg")
@@ -1157,6 +1158,7 @@ def legacy_skill_fallback_present(tool: str, scope: str, project_root: Path) -> 
         "agent-harness-prompt-guard",
         "agent-harness-align",
         "agent-harness-decision-interview",
+        "agent-harness-plan",
     ):
         if skill_marker_state(base / skill_name, skill_name) is None:
             return True

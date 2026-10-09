@@ -28,6 +28,8 @@ The problem is not that the agents cannot write code. The problem is that the wo
 | Ambiguous high-risk work starts with assumptions. | Decision alignment records the decision, scope, non-goals, and acceptance conditions before implementation. |
 | A shared API or Hook change has an unknown blast radius. | Change-impact preflight records the affected contract and requires a rescan after editing. |
 | External reports and pasted prompts are treated as instructions. | Prompt guard treats them as untrusted data until inspected. |
+| Local environment files can be overwritten or disappear without a visible signal. | Registered paths are reported by status/doctor and protected by commit and high-confidence PreToolUse guards. |
+| A global installation interrupts scratch workspaces. | Project governance is opt-in; workspaces without `.tenetora/` or `.harness/` remain silent. |
 | A local test is mistaken for whole-task verification. | The project declares a verification command and a completion claim is tied to its result. |
 | A stale project record silently guides the next task. | `update`, `repair`, `audit`, evidence, and guardrails expose drift and incomplete maintenance. |
 
@@ -101,6 +103,8 @@ A prompt template can remind an agent to run tests. Tenetora can distinguish a p
 Claude Code, Codex, Cursor, OpenCode, ZCode, and generic agents do not have identical Hook or plugin capabilities. Tenetora shares the project record and CLI semantics while reporting each platform's real runtime ceiling. `active`, `active-partial`, `skills-only`, and `needs-trust-review` are capability states, not marketing labels.
 
 The machine installation registry records existing global and project surfaces. Project alignment and completion evidence are owner-bound: a later conversation or another tool must not silently inherit a previous conversation's active goal or claim. A normal Stop reminder is non-blocking; only an explicit completion workflow requires a completion claim.
+
+Local environment protection is deliberately layered: registration and doctor/status provide discovery, commit guard prevents staged leakage, and host PreToolUse adapters deny high-confidence destructive operations when the host exposes enough structured tool information. The registry also exposes stale and expired project entries without deleting project content automatically.
 
 ## One Conversation, Several Models
 

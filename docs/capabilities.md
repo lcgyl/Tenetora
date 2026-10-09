@@ -24,6 +24,26 @@ This guide explains the public capabilities individually. It is organized by eng
 
 **Boundary:** installing Tenetora globally does not initialize projects or weaken governance inside an explicitly initialized project. Parent governance owns gitlinks, cross-repository impact, and aggregate evidence; each governed submodule owns its code, tests, secrets, release rules, and local state through its own `.tenetora/`.
 
+## Local Environment Protection
+
+**Problem:** a project may need `.env`, local configuration, certificates, or other machine-only files to remain available without ever entering Git or shared evidence.
+
+**How it works:** register project-relative paths with `tenetora local-env --allow`. `status` and `doctor` inspect the registry without reading file contents and report missing paths. Commit guard combines built-in sensitive-path rules with the registered set. Hosts that expose structured PreToolUse tool data can deny high-confidence destructive, move, truncate, write, or edit operations targeting those paths.
+
+**Observable result:** a missing registered path becomes a named diagnostic with a checkpoint-oriented next action; a destructive tool call receives a deny decision instead of silently removing the file.
+
+**Boundary:** only registered paths receive the extra project-specific protection. Hosts that cannot expose a reliable tool name and path are not guessed at or broadly blocked; built-in staged-file checks still apply.
+
+## Registry Hygiene
+
+**Problem:** machine-level observation can leave historical project entries after a project loses its surfaces or moves away.
+
+**How it works:** `tenetora installations list` marks entries as stale and marks stale entries older than the bounded retention window as expired. `tenetora installations prune --expired` is an explicit cleanup action.
+
+**Observable result:** stale and expired state is visible before cleanup, and cleanup removes registry metadata only.
+
+**Boundary:** no background cleanup deletes project directories, `.tenetora/`, local environment files, or third-party configuration.
+
 ## Context Routing and Rule Loading
 
 **Problem:** loading every rule wastes context, while loading none makes the agent rely on memory.
@@ -48,9 +68,9 @@ This guide explains the public capabilities individually. It is organized by eng
 
 **Problem:** a conversation can be archived or deleted by its host, while its local alignment records otherwise remain eligible forever and can make a later goal ambiguous.
 
-**How it works:** confirmed handoffs enter an `open` lifecycle index. A completion claim marks the goal `completed`; the owner can explicitly run `tenetora alignment --archive --session-id <id> --owner-id <owner>` when the host conversation is no longer relevant. Open goals expire after 30 days without owner activity. Terminal lifecycle records are capped at 64, and terminal handoff history is pruned to 128 records or 90 days while retained handoffs remain explicitly readable.
+**How it works:** confirmed handoffs enter an `open` lifecycle index. The host conversation id stays stable, while each task goal receives a distinct alignment session id. A completion claim marks the goal `completed`; the owner can explicitly run `tenetora alignment --archive --session-id <id> --owner-id <owner>` when the host conversation is no longer relevant. Later goals in the same conversation get new alignment ids. Open goals expire after 30 days without owner activity. Terminal lifecycle records are capped at 64, and terminal handoff history is pruned to 128 records or 90 days while retained handoffs remain explicitly readable.
 
-**Observable result:** automatic binding considers only live sessions and registered open goals. One matching goal may bind; multiple goals produce a short-lived, current-turn-bound candidate request that the host model may use to select one goal only when the user request is semantically clear; otherwise the original fail-closed behavior remains. A completed, archived, expired, or abandoned goal cannot authorize a new high-risk action.
+**Observable result:** automatic binding considers only live sessions and registered open goals. One matching goal may bind; multiple goals produce a short-lived, current-turn-bound candidate request that the host model may use to select one goal only when the user request is semantically clear; otherwise the original fail-closed behavior remains. A completed, archived, expired, or abandoned goal cannot authorize a new high-risk action. If a claim matches only terminal goals, it reports a closed-goal diagnostic rather than the false claim that no alignment exists.
 
 **Boundary:** the local runtime cannot observe whether a host conversation was archived or deleted. Explicit archive is the immediate close operation; activity expiry and bounded pruning are the automatic fallback. Model routing selects context only, is prompt-bound and short-lived, and never counts as user confirmation or execution authorization. Unsafe, stale, identity-mismatched, or ambiguous requests remain unselected, and high-risk work still requires the existing guards.
 

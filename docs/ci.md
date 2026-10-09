@@ -28,6 +28,32 @@ Supported providers:
 
 Existing files are preserved unless `--force` is also supplied. The template is a reviewable starting point; retain the project's own build and test jobs.
 
+## Release-tag gate
+
+The canonical `.gitlab-ci.yml` avoids rerunning the generic suite on version tags. A
+release tag first runs `verify_main_pipeline.py`, which requires a successful `main`
+push pipeline for the exact tagged commit and verifies the required test, Python 3.9,
+package, and smoke jobs through GitHub's read-only API. A missing, inaccessible, or
+incomplete API response fails closed. The tag pipeline then runs only packaging and
+release-specific checks; branch and merge-request pipelines keep the full suite.
+
+## R2 artifact pointer
+
+The private GitHub pipeline remains the only producer. The manual `publish_r2_stable` job and the
+automatic protected-preview-tag `publish_r2_preview` job reuse the already gated package artifact, upload immutable objects under
+`stable/<version>/` or `preview/<version>/`, verify them, and update that channel's `latest.json`
+last. They require protected/masked GitHub variables `R2_ACCOUNT_ID`, `R2_BUCKET`,
+`R2_ACCESS_KEY_ID`, and `R2_SECRET_ACCESS_KEY`; the jobs do not read a repository `.env` file.
+Because the variables are protected, release tag patterns must also be protected in the
+project settings. The jobs fail closed when `CI_COMMIT_REF_PROTECTED` is not `true`.
+Keep tag protection and preview retirement permissions aligned: a protected preview tag
+may require a maintainer-operated retirement step before its Git tag is deleted.
+Stable publication remains manual; a matching protected preview tag publishes automatically and
+fails the pipeline if the upload or verification fails. These R2 jobs are the only new artifact publisher. After the Worker download
+smoke test passes, public release jobs publish refs and release notes only; historical public
+attachments remain untouched. The installer/upgrade use the pointer by default; set
+`TENETORA_RELEASE_INDEX_BASE=https://<worker-host>` only for another compatible Worker.
+
 ## Recommended Check Chain
 
 Run from the project root:

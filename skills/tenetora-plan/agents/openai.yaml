@@ -1,0 +1,6 @@
+interface:
+  display_name: "Tenetora Plan"
+  short_description: "Plan complex work and create bounded execution prompts"
+  default_prompt: "Use $tenetora-plan when Plan mode is active or a task is complex, cross-boundary, or large enough to need a frozen implementation plan before coding."
+policy:
+  allow_implicit_invocation: true

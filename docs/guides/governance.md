@@ -31,6 +31,7 @@ Skipping a stage changes the meaning of the result. A passing focused test is us
 | Skill | Use it when |
 | --- | --- |
 | `tenetora` | The correct lifecycle phase is unclear. |
+| `tenetora-plan` | Plan mode or a complex/large task needs a frozen implementation plan and bounded execution prompts. |
 | `tenetora-align` | The user explicitly wants decisions aligned before a high-risk implementation. |
 | `tenetora-decision-interview` | A lifecycle needs a bounded model-callable interview primitive. |
 | `tenetora-init` | `.tenetora` is missing or the baseline must be rebuilt. |
@@ -172,7 +173,7 @@ tenetora guard --action alignment --goal "<goal>" --risk-level high --path .
 ```
 Confirmation ends alignment; it does not start planning or implementation. Waiting for confirmation has a seven-day review lease; a matching owner may resume it, but must re-enter awaiting-confirmation before confirming. Expired sessions without running attempts or pending confirmation are historical and non-blocking; sessions with running attempts or pending user confirmation remain actionable and require explicit session identity.
 
-Confirmed handoffs have a separate lifecycle: completion claims mark goals `completed`, while `tenetora alignment --archive --session-id <session-id> --owner-id <owner-id>` closes a host-archived or deleted conversation. The local runtime cannot observe host deletion, so open goals expire after 30 days without owner activity; automatic lookup uses only open goals. Multiple matches create a short-lived, prompt-bound request for the host model to select one semantically clear target, while an absent, stale, unsafe, or ambiguous selection remains fail-closed. Routing is context selection only, not confirmation or authorization; terminal lifecycle/history is pruned to 64/128 records or 90 days while retained handoffs remain explicitly readable.
+Confirmed handoffs have a separate lifecycle. The host session/conversation id remains stable across the chat, but every task goal has a distinct alignment session id. A completion claim marks one goal `completed`; `tenetora alignment --archive --session-id <session-id> --owner-id <owner-id>` closes a goal whose host conversation is no longer relevant. A later task in the same conversation therefore gets a new alignment id instead of reusing the terminal goal or colliding with the host session id. The local runtime cannot observe host deletion, so open goals expire after 30 days without owner activity; automatic lookup uses only open goals. Multiple matches create a short-lived, prompt-bound request for the host model to select one semantically clear target, while an absent, stale, unsafe, or ambiguous selection remains fail-closed. If identity matches only terminal goals, the claim guard reports that closed-goal state explicitly instead of saying no alignment ever existed. Routing is context selection only, not confirmation or authorization; terminal lifecycle/history is pruned to 64/128 records or 90 days while retained handoffs remain explicitly readable.
 
 ## End-to-End Skeleton First
 
