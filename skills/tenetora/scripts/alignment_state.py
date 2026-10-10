@@ -215,9 +215,15 @@ def isolated_session_path(root: Path, session_id: str) -> Path:
 
 
 def requested_session_id(args: argparse.Namespace, *, required: bool = False) -> str:
-    value = str(getattr(args, "session_id", "") or environment_value(
-        "TENETORA_ALIGNMENT_SESSION_ID", "TENETORA_SESSION_ID"
-    )).strip()
+    # An alignment session identifies one task goal, while TENETORA_SESSION_ID
+    # identifies the longer-lived host conversation. Conflating the two makes
+    # a second goal in the same conversation collide with the first goal's
+    # terminal history record. Only the alignment-specific variable may select
+    # or mutate an alignment session implicitly.
+    value = str(
+        getattr(args, "session_id", "")
+        or environment_value("TENETORA_ALIGNMENT_SESSION_ID")
+    ).strip()
     if not value:
         if required:
             raise AlignmentStateError(
@@ -383,6 +389,14 @@ def validate_lifecycle(payload: dict[str, Any], label: str = "alignment-lifecycl
             raise AlignmentStateError(f"{label} has an invalid goal")
         if goal:
             ensure_safe_text(goal, "alignment lifecycle goal")
+        for field in ("scope", "non_goals", "acceptance_criteria"):
+            if field not in record:
+                continue
+            values = record[field]
+            if not isinstance(values, list) or not all(isinstance(item, str) for item in values):
+                raise AlignmentStateError(f"{label} has an invalid {field}")
+            for item in values:
+                ensure_safe_text(item, f"alignment lifecycle {field}")
         for field in (
             "created_at",
             "confirmed_at",
@@ -445,6 +459,9 @@ def lifecycle_record_from_handoff(payload: dict[str, Any], *, now: str = "") -> 
         "tool": str(payload.get("tool") or "unknown"),
         "goal": str(payload.get("goal") or ""),
         "goal_fingerprint": str(payload.get("goal_fingerprint") or ""),
+        "scope": list(payload.get("scope") or []),
+        "non_goals": list(payload.get("non_goals") or []),
+        "acceptance_criteria": list(payload.get("acceptance_criteria") or []),
         "handoff_hash": str(payload.get("handoff_hash") or ""),
         "status": "open",
         "created_at": str(payload.get("created_at") or timestamp),
@@ -631,6 +648,9 @@ def update_lifecycle_for_terminal_session(
             "tool": str(state.get("tool") or "unknown"),
             "goal": str(state.get("goal") or ""),
             "goal_fingerprint": str(state.get("goal_fingerprint") or ""),
+            "scope": list(state.get("scope") or []),
+            "non_goals": list(state.get("non_goals") or []),
+            "acceptance_criteria": list(state.get("acceptance_criteria") or []),
             "handoff_hash": "",
             "status": "open",
             "created_at": str(state.get("created_at") or now),

@@ -15,6 +15,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from path_security import validate_existing_project_path
+from governance_paths import canonical_dir, record_defaults_reviewed, record_defaults_review_pending
 
 
 def existing_project_path(raw: str) -> Path:
@@ -65,6 +66,14 @@ def main() -> int:
         ),
     )
     parser.add_argument("--apply", action="store_true", help="Apply a refresh strategy before reviewing.")
+    parser.add_argument(
+        "--confirm-defaults-reviewed",
+        action="store_true",
+        help=(
+            "Record the current default-pack revision only after the model has semantically reviewed "
+            "and merged or intentionally preserved every applicable default change."
+        ),
+    )
     parser.add_argument(
         "--strategy",
         choices=("diff", "backup", "merge", "replace"),
@@ -158,17 +167,21 @@ def main() -> int:
     update_diff = latest(root, "*-update-diff.patch")
     changes_index = root / ".tenetora" / "changes" / "INDEX.md"
     validation = run_script("validate_harness.py", root)
-    audit = run_script("audit_harness_quality.py", root, "--profile", "engineering", "--json")
+    audit = run_script("audit_harness_quality.py", root, "--profile", "engineering", "--strict", "--json")
     audit_status = "unknown"
+    payload = {}
     scores = ""
     if audit.stdout:
         try:
             payload = json.loads(audit.stdout)
+            if not isinstance(payload, dict):
+                raise ValueError("Audit report must be an object")
             audit_status = str(payload.get("status", "unknown"))
             score_payload = payload.get("scores", {})
             if isinstance(score_payload, dict):
                 scores = ", ".join(f"{key} {value}" for key, value in score_payload.items())
-        except json.JSONDecodeError:
+        except ValueError:
+            payload = {}
             audit_status = "invalid-json"
 
     print(f"{'变更索引' if chinese else 'Changes index'}: {rel(root, changes_index if changes_index.exists() else None)}")
@@ -189,6 +202,61 @@ def main() -> int:
         print(validation.stderr, end="", file=sys.stderr)
     if audit.stderr:
         print(audit.stderr, end="", file=sys.stderr)
+    if args.confirm_defaults_reviewed:
+        # Reviewing defaults is not a goal-completion claim. These lifecycle
+        # warnings must not force an unrelated alignment or spoofed completion.
+        completion_warnings = {
+            "verification-completion-history-missing",
+            "verification-latest-not-completion",
+        }
+        warnings = payload.get("warnings", [])
+        only_completion_warnings = (
+            isinstance(warnings, list)
+            and bool(warnings)
+            and all(isinstance(item, dict) and item.get("code") in completion_warnings for item in warnings)
+        )
+        audit_acceptable = not payload.get("blocking_issues") and (
+            audit_status == "pass" or (audit_status == "warn" and only_completion_warnings)
+        )
+        if validation.returncode != 0 or audit.returncode != 0 or not audit_acceptable:
+            if validation.returncode == 0:
+                codes = []
+                for field in ("warnings", "blocking_issues"):
+                    items = payload.get(field, [])
+                    if isinstance(items, list):
+                        codes.extend(
+                            item["code"] for item in items
+                            if isinstance(item, dict) and isinstance(item.get("code"), str)
+                        )
+                try:
+                    manifest = record_defaults_review_pending(canonical_dir(root), codes or ["audit-not-passed"])
+                except (OSError, RuntimeError, ValueError) as exc:
+                    print(str(exc), file=sys.stderr)
+                    return 2
+                review = manifest["defaults_review"]
+                print(
+                    f"默认规则语义审查已记录：修订 {review['version']}；待审计验收，未标记为最新。"
+                    if chinese else f"Semantic defaults review recorded: revision {review['version']}; audit pending, not marked current."
+                )
+                print(f"{'审计问题' if chinese else 'Audit issues'}: {', '.join(review['audit_codes'])}")
+                print(
+                    "下一步：在本项目执行 tenetora audit --strict --path .；解决审计问题后重新执行 "
+                    "tenetora review --confirm-defaults-reviewed --path ."
+                    if chinese else
+                    "Next: tenetora audit --strict --path .; resolve the audit issues, then rerun "
+                    "tenetora review --confirm-defaults-reviewed --path ."
+                )
+            print(
+                "Cannot confirm the default-pack review until validation and strict audit pass.",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            manifest = record_defaults_reviewed(canonical_dir(root))
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(f"Default-pack review confirmed: revision {manifest['defaults_version']}")
     return 0
 
 

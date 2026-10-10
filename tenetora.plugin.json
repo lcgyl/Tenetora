@@ -1,7 +1,7 @@
 {
   "schema": "tenetora.plugin-adapters.v1",
   "name": "tenetora",
-  "version": "0.3.40",
+  "version": "0.3.40-preview.9",
   "displayName": "Tenetora",
   "description": "Tenetora shared engineering-agent governance with decision alignment, qualified built-in subagent role fallback, and cross-tool runtime adapters.",
   "skills": "./skills/",

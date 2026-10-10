@@ -35,6 +35,19 @@ def _is_volatile_path(relative: str) -> bool:
     )
 
 
+def git_repository_env() -> dict[str, str]:
+    """Select a repository by path without inheriting another Git hook's paths."""
+    env = os.environ.copy()
+    for name in (
+        "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_PREFIX", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE",
+        "GIT_SHALLOW_FILE", "GIT_INTERNAL_SUPER_PREFIX",
+    ):
+        env.pop(name, None)
+    return env
+
+
 def run_git(root: Path, *args: str, text: bool = True) -> subprocess.CompletedProcess[Any]:
     return subprocess.run(
         ["git", "-C", str(root), *args],
@@ -42,6 +55,7 @@ def run_git(root: Path, *args: str, text: bool = True) -> subprocess.CompletedPr
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        env=git_repository_env(),
     )
 
 

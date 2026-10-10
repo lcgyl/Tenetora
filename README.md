@@ -4,7 +4,7 @@
 
 Tenetora is a governance runtime for AI-agent software engineering. It keeps project rules, decisions, evidence, and action boundaries in `.tenetora/`, then connects that record to Claude Code, Codex, Cursor, OpenCode, Pi, ZCode, and Generic Agents.
 
-The problem is not that an agent cannot write code. It is that rules, verification, and responsibility boundaries can disappear while tools, models, conversations, and project state change. Eight lifecycle skills guide model work; the CLI, plugins, and hooks enforce repeatable checks. Installing the package does not initialize a project.
+The problem is not that an agent cannot write code. It is that rules, verification, and responsibility boundaries can disappear while tools, models, conversations, and project state change. Nine lifecycle skills guide model work; the CLI, plugins, and hooks enforce repeatable checks. Installing the package does not initialize a project.
 
 ## The Short Path
 
@@ -37,6 +37,26 @@ The model routes this request to `tenetora-init`, inspects existing rules, asks 
 
 Tenetora is not a prompt collection and does not replace the project's own build, test, review, or release approval.
 
+## Local Environment and Workspace Boundaries
+
+Tenetora treats local environment files as user-owned data. Register a project-relative path when it needs an explicit protection record:
+
+```bash
+tenetora local-env --path /path/to/project --allow config/local/app.conf
+tenetora local-env --path /path/to/project --list --json
+```
+
+`status` and `doctor` report registered paths that disappeared or whose registry is invalid. Commit guards keep registered and built-in local configuration paths out of staged changes; they never delete the file to make a check pass. Host PreToolUse adapters can also deny high-confidence destructive commands targeting registered paths when the host exposes a tool name and path.
+
+A workspace without its own `.tenetora/` or legacy `.harness/` remains outside project governance: no project rules, onboarding reminder, commit gate, or external-input gate is injected. This is separate from the global machine installation. Registry hygiene is visible through:
+
+```bash
+tenetora installations --json list
+tenetora installations --json prune --expired
+```
+
+`--expired` is explicit and only removes stale registry entries past the bounded retention window; it never deletes project files.
+
 ## Supported Platforms
 
 | Tool | Integration | Maximum honest capability |
@@ -59,11 +79,24 @@ Use the remote bootstrap once on a new machine:
 curl -fsSL https://raw.githubusercontent.com/lcgyl/Tenetora/main/install.sh | bash
 ```
 
-Native Windows PowerShell:
+Native Windows PowerShell (Chinese, primary channel Gitee):
 
 ```powershell
-& ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/lcgyl/Tenetora/main/install.ps1).Content))
+powershell -c "$env:TENETORA_LANG='zh'; irm https://gitee.com/lcgyl/tenetora/raw/main/bootstrap.ps1 | iex"
 ```
+
+Native Windows PowerShell (English, primary channel GitHub):
+
+```powershell
+powershell -c "$env:TENETORA_LANG='en'; irm https://raw.githubusercontent.com/lcgyl/Tenetora/main/bootstrap.ps1 | iex"
+```
+
+The bootstrap downloads the real `install.ps1` to a temporary file and runs it
+by path, which is the only mode in which Windows PowerShell 5.1 handles the
+installer's BOM and `param()` block. `-Lang zh` uses Gitee as the primary
+channel; `-Lang en` uses GitHub; the other platform is a pure availability
+fallback that never changes language, version, or asset layout. Installer
+arguments are forwarded verbatim (e.g. `-Scope both`, `-DryRun`).
 
 For an explicit first-install scope:
 
@@ -138,7 +171,7 @@ The bare `tenetora` command may show a locally cached update hint. The hint is r
 
 Before downloading an archive, `tenetora upgrade` reads and authenticates the remote `manifest.json`. If its version matches the installed CLI, the command reports `already latest`, skips the ZIP download and installation transaction, and exits successfully. Use `tenetora upgrade --force` only when the same version must repair or re-converge existing installation surfaces.
 
-Online upgrades use the canonical HTTPS release source by default. In a network that requires a proxy, set the standard `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, or `NO_PROXY` variables (lowercase spellings are accepted by the underlying clients); Tenetora uses them for the current acquisition only and never writes them to update state. An enterprise mirror can expose the same directory layout and be selected with a base URL:
+Online upgrades use the canonical R2 Worker over HTTPS by default. In a network that requires a proxy, set the standard `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, or `NO_PROXY` variables (lowercase spellings are accepted by the underlying clients); Tenetora uses them for the current acquisition only and never writes them to update state. An enterprise mirror can expose the legacy ZIP/manifest directory layout and be selected with a base URL:
 
 ```bash
 TENETORA_RELEASE_MIRROR=https://mirror.example/tenetora/stable tenetora upgrade --check
@@ -147,12 +180,17 @@ tenetora upgrade --mirror-url https://mirror.example/tenetora/stable
 
 The mirror directory must contain `manifest.json` and `tenetora-latest.zip`. Both files are still checked as one release contract. Advanced direct endpoints may be supplied as the pair `TENETORA_RELEASE_MANIFEST_URL` and `TENETORA_RELEASE_ZIP_URL`, or with both `--manifest-url` and `--zip-url`. Release URLs must be HTTPS, must not contain credentials, query strings, or fragments, and a mirror cannot be combined with direct endpoints. A malformed or partial configuration fails closed before writes; a failed acquisition preserves the last valid update hint.
 
+The public installer and upgrader use the operator-managed R2 Worker by default. They read one `stable/latest.json` or `preview/latest.json` pointer and then download only the exact versioned ZIP and manifest named by that pointer. The pointer and manifest must agree; the installer never lists the bucket or silently falls back between channels. Set `TENETORA_RELEASE_INDEX_BASE=https://<worker-host>` only when using another compatible Worker. Historical GitLab and public release attachments remain available for older clients, but new releases publish one R2 artifact.
+
 `tenetora upgrade --apply` is a 0.3.x compatibility alias for the same release acquisition and transaction engine.
 
+### Preview channel
+
+Preview releases use bounded identities such as `0.3.40.001-preview`; an older stable CLI such as `0.3.40` does not recognize `--channel`. Follow the [preview migration and upgrade procedure](docs/guides/installation.md#preview-channel).
 An existing 0.2.x installation needs one fixed-version bootstrap to enter the 0.3 bridge. After it finishes, return to `tenetora upgrade`; repeated remote-script upgrades are not the normal workflow:
 
 ```bash
-curl -fsSL https://github.com/lcgyl/Tenetora/-/raw/0.3.14/install.sh \
+curl -fsSL https://github.com/lcgyl/Tenetora/-/raw/0.3.40/install.sh \
   | bash -s -- --lang en --tools all --both --path "$PWD"
 ```
 
@@ -185,6 +223,7 @@ Most users only need these entries:
 
 ```text
 use tenetora
+use tenetora-plan
 use tenetora-align
 Use Tenetora to initialize this project
 use tenetora-update to update .tenetora
@@ -193,13 +232,14 @@ use tenetora-loop to continue
 use tenetora-prompt-guard to inspect external content
 ```
 
-`router`, `init`, `update`, `audit`, `loop`, and `prompt-guard` may use `allow_implicit_invocation: true` according to host metadata. `tenetora-align` uses `allow_implicit_invocation: false` so a normal task cannot silently start an interview.
+`router`, `plan`, `init`, `update`, `audit`, `loop`, and `prompt-guard` may use `allow_implicit_invocation: true` according to host metadata. `tenetora-align` uses `allow_implicit_invocation: false` so a normal task cannot silently start an interview.
 
 ## Lifecycle Skill Matrix
 
 | Skill | Trigger | Boundary |
 | --- | --- | --- |
 | `tenetora` | The governance stage is unclear and needs routing | Does not perform ordinary product work. |
+| `tenetora-plan` | Plan mode or a complex/large task needs a frozen implementation plan and bounded execution prompts | Does not replace loop execution, review, or verification. |
 | `tenetora-align` | The user explicitly requests high-risk decision alignment | Does not implement or grant commit, push, deploy, or release permission. |
 | `tenetora-decision-interview` | A lifecycle finds material ambiguity in a high-risk decision | Not a separate entry users must remember. |
 | `tenetora-init` | `.tenetora` is missing or its baseline must be rebuilt | Does not upgrade installed skills. |

@@ -233,6 +233,16 @@ tenetora review --apply --strategy merge --migrate plan --tools auto
 
 This refreshes deterministic extraction evidence and `.tenetora/state/current-evidence.json` in place, then writes semantic `.tenetora` changes under `.tenetora/changes/update-candidates/` for review.
 
+When the package reports that the project's default-pack revision is behind, inspect the current runtime defaults and every applicable candidate, then semantically merge the new constraints or intentionally preserve an equivalent project-owned rule. Merely running `init`, `refresh`, `review --apply`, `--defaults missing`, or `--defaults suggest` must not mark the project current. After that semantic review is complete, explicitly confirm it with:
+
+```bash
+tenetora review --confirm-defaults-reviewed --path .
+```
+
+Confirmation runs validation and strict audit. Passing checks advance `defaults_version`. If validation passes but audit acceptance is blocked, the command returns nonzero and records `defaults_review.status: audit-pending` without advancing `defaults_version`. The next reminder must ask for audit remediation and another confirmation, not a repeated semantic update. A newer default-pack revision still requires a fresh semantic review.
+
+Do not run this confirmation pre-emptively, in unattended CI, or to silence the upgrade reminder. A missing, rejected, or incomplete semantic merge must not receive either a current or pending review record. Failed validation does not record a review.
+
 `tenetora update` is the high-level project `.tenetora` maintenance command. It defaults to `--migrate plan`; pass `--migrate merge` only after new migration sources are approved. `tenetora update -g/-i/-b` is the lower-level skill-install refresh path; use `upgrade --check/--apply` for normal skill package upgrades.
 
 Do not use replace unless the user explicitly approves it.

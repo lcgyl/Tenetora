@@ -1698,8 +1698,10 @@ def audit_governance_effectiveness(root: Path, warnings: list[dict[str, str]]) -
                 "Run `tenetora guard --action claim --claim-kind completion --verification-command '<full-command>' --verification-status passed` after the full verification command.",
             ),
         )
-    else:
-        latest_claim = claim_events[-1] if claim_events else {}
+    # A failed latest verification matters even before the first completion.
+    # Otherwise ordinary defaults reviews could mistake its absence for success.
+    if claim_events:
+        latest_claim = claim_events[-1]
         if latest_claim.get("claim_kind") in {"failed", "blocked"} or latest_claim.get("verification_status") != "passed":
             add_unique(
                 warnings,
@@ -1708,11 +1710,11 @@ def audit_governance_effectiveness(root: Path, warnings: list[dict[str, str]]) -
                     "governance_effectiveness",
                     "verification-latest-failed",
                     GOVERNANCE_TRAIL_REL,
-                    "The latest verification event is not passed; an older completion claim cannot cover the newer failure or block.",
+                    "The latest verification event is not passed; completion history cannot cover a newer failure or block.",
                     "Report the latest failure or blocker, then run a new full completion verification before claiming completion.",
                 ),
             )
-        elif latest_claim.get("claim_kind") != "completion":
+        elif completion_events and latest_claim.get("claim_kind") != "completion":
             add_unique(
                 warnings,
                 issue(
@@ -1724,7 +1726,7 @@ def audit_governance_effectiveness(root: Path, warnings: list[dict[str, str]]) -
                     "Run a new full verification and record a claim with --claim-kind completion before reporting completion.",
                 ),
             )
-        elif not CLAIM_PROOF_PATTERN.match(str(latest_claim.get("claim_proof", ""))):
+        elif completion_events and not CLAIM_PROOF_PATTERN.match(str(latest_claim.get("claim_proof", ""))):
             add_unique(
                 warnings,
                 issue(

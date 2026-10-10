@@ -263,8 +263,24 @@ AMBIGUITY_KEYWORDS = (
     "权限边界",
     "兼容窗口",
 )
+MATERIAL_CHOICE_KEYWORDS = (
+    "multiple options",
+    "alternative",
+    "choose between",
+    "which approach",
+    "tradeoff",
+    "多个方案",
+    "选项",
+    "二选一",
+    "多选一",
+    "选择哪",
+    "推荐方案",
+    "取舍",
+    "权衡",
+)
 COMPLETE_PLAN_RE = re.compile(
     r"(按(?:已|已经)(?:确认|批准)的(?:计划)?|"
+    r"按(?:已|已经)(?:确认|批准)(?:的)?计划|"
     r"计划(?:已|已经)(?:确认|批准)|"
     r"已有完整计划|已完成决策对齐|"
     r"according to the approved plan|approved plan)",
@@ -323,8 +339,57 @@ PARALLEL_VALUE_KEYWORDS = (
     "独立审查",
     "并行调查",
 )
-
-
+PLAN_MODE_KEYWORDS = (
+    "plan mode",
+    "planning mode",
+    "计划模式",
+    "规划模式",
+)
+COMPLEX_BOUNDARY_KEYWORDS = (
+    "frontend",
+    "backend",
+    "database",
+    "persistence",
+    "permission",
+    "authorization",
+    "async",
+    "external service",
+    "runtime",
+    "plugin",
+    "release",
+    "deploy",
+    "前端",
+    "后端",
+    "数据库",
+    "持久化",
+    "权限",
+    "异步",
+    "外部服务",
+    "运行时",
+    "插件",
+    "发布",
+    "部署",
+)
+COMPLEX_DELIVERY_KEYWORDS = (
+    "end-to-end",
+    "cross-boundary",
+    "multi-stage",
+    "multi-step",
+    "full feature",
+    "complete feature",
+    "from scratch",
+    "multiple roles",
+    "cross-module",
+    "端到端",
+    "跨边界",
+    "多阶段",
+    "多步骤",
+    "完整功能",
+    "从头实现",
+    "全链路",
+    "多个角色",
+    "跨模块",
+)
 def existing_project_path(raw: str) -> Path:
     try:
         return validate_existing_project_path(raw)
@@ -366,6 +431,49 @@ def matches(text: str, keyword: str) -> bool:
 
 def matched_keywords(text: str, keywords: tuple[str, ...]) -> list[str]:
     return [keyword for keyword in keywords if matches(text, keyword)]
+
+
+def planning_route(message: str) -> dict[str, Any]:
+    normalized = normalize(message)
+    plan_mode_hits = matched_keywords(normalized, PLAN_MODE_KEYWORDS)
+    boundary_hits = matched_keywords(normalized, COMPLEX_BOUNDARY_KEYWORDS)
+    delivery_hits = matched_keywords(normalized, COMPLEX_DELIVERY_KEYWORDS)
+    explicit_plan_hits = matched_keywords(normalized, CONTEXT_KEYWORDS["planning"])
+    approved_plan = bool(COMPLETE_PLAN_RE.search(normalized)) and not bool(
+        UNRESOLVED_DECISION_RE.search(normalized)
+    )
+    if plan_mode_hits:
+        return {
+            "recommendation": "default",
+            "trigger": "plan-mode",
+            "signals": plan_mode_hits,
+            "reasons": ["Plan mode is active or explicitly requested"],
+            "confidence": "heuristic",
+        }
+    if explicit_plan_hits and not (approved_plan and len(explicit_plan_hits) == 1):
+        return {
+            "recommendation": "default",
+            "trigger": "explicit-planning",
+            "signals": explicit_plan_hits,
+            "reasons": ["the request explicitly asks for planning or decomposition"],
+            "confidence": "heuristic",
+        }
+    if len(boundary_hits) >= 2 or delivery_hits:
+        signals = boundary_hits[:4] + delivery_hits[:3]
+        return {
+            "recommendation": "default",
+            "trigger": "complex-or-large-task",
+            "signals": signals,
+            "reasons": ["multiple delivery boundaries or stages require a frozen plan"],
+            "confidence": "heuristic",
+        }
+    return {
+        "recommendation": "not-needed",
+        "trigger": "none",
+        "signals": [],
+        "reasons": ["no Plan mode or material complexity signal detected"],
+        "confidence": "heuristic",
+    }
 
 
 def alignment_route(message: str) -> dict[str, Any]:
@@ -411,6 +519,37 @@ def alignment_route(message: str) -> dict[str, Any]:
         "risk_level": risk_level,
         "reasons": reasons,
         "confidence": "heuristic",
+    }
+
+
+def choice_route(message: str) -> dict[str, Any]:
+    """Describe the mode-independent material-choice interaction contract."""
+
+    normalized = normalize(message)
+    signals = matched_keywords(normalized, MATERIAL_CHOICE_KEYWORDS)
+    approved = bool(COMPLETE_PLAN_RE.search(normalized)) or bool(
+        re.search(r"按(?:既定|已确认的|已批准的)方案", normalized)
+    )
+    unresolved = bool(UNRESOLVED_DECISION_RE.search(normalized))
+    explicit_choice = bool(re.search(r"(?:让我|由我|请我).{0,8}(?:选|决定)|let me choose", normalized))
+    if (
+        not signals
+        or (approved and not unresolved and not explicit_choice)
+        or (FACTUAL_PREFIX_RE.search(normalized) and not unresolved and not explicit_choice)
+    ):
+        return {
+            "recommendation": "not-needed",
+            "signals": [],
+            "transport": "direct-text",
+            "format": "recommended-alternative-custom",
+            "reason": "no unresolved material choice signal detected",
+        }
+    return {
+        "recommendation": "ask-directly",
+        "signals": signals[:4],
+        "transport": "native-sync-when-available-otherwise-direct-text",
+        "format": "recommended-alternative-custom",
+        "reason": "material choices are handled in every mode; queued follow-up input is not a fallback",
     }
 
 
@@ -505,6 +644,7 @@ def delegation_route(message: str, contexts: list[str]) -> dict[str, Any]:
 
 def route_message(message: str) -> dict[str, Any]:
     normalized = normalize(message)
+    planning = planning_route(message)
     contexts: list[str] = []
     reasons: list[dict[str, str]] = []
     for context in CONTEXT_ORDER:
@@ -527,10 +667,14 @@ def route_message(message: str) -> dict[str, Any]:
         if hits:
             contexts.append(context)
             reasons.append({"context": context, "matched": hits[0]})
+    if planning["recommendation"] == "default" and "planning" not in contexts:
+        contexts.append("planning")
+        reasons.append({"context": "planning", "matched": str(planning["signals"][0])})
     if not contexts:
         contexts = ["build", "test"]
         reasons.append({"context": "build,test", "matched": "fallback: general code task"})
     alignment = alignment_route(message)
+    choice = choice_route(message)
     delegation = delegation_route(message, contexts)
     commands = [f"tenetora rules --context {','.join(contexts)}"]
     if "change-impact" in contexts:
@@ -552,7 +696,9 @@ def route_message(message: str) -> dict[str, Any]:
         "fallback_contexts": FALLBACK_CONTEXTS,
         "confidence": "heuristic",
         "reasons": reasons,
+        "planning": planning,
         "alignment": alignment,
+        "choice": choice,
         "delegation": delegation,
         "commands": commands,
     }
@@ -571,6 +717,28 @@ def print_text(payload: dict[str, Any]) -> None:
     )
     for reason in alignment["reasons"]:
         print(f"- {route_reason_text(reason)}")
+    planning = payload["planning"]
+    print(
+        f"规划技能：{planning['recommendation']}（{planning['trigger']}）"
+        if use_chinese()
+        else f"Planning skill: {planning['recommendation']} ({planning['trigger']})"
+    )
+    for reason in planning["reasons"]:
+        print(f"- {reason}")
+    choice = payload["choice"]
+    print(
+        f"选择交互：{choice['recommendation']}（{choice['transport']}）"
+        if use_chinese()
+        else f"Choice interaction: {choice['recommendation']} ({choice['transport']})"
+    )
+    if choice["signals"]:
+        print("- " + ("检测到：" if use_chinese() else "Signals: ") + ", ".join(choice["signals"]))
+    if choice["recommendation"] == "ask-directly":
+        print(
+            "- 直接问题格式：推荐方案 + 替代方案 + 自定义方案；不使用排队追问"
+            if use_chinese()
+            else "- Direct format: recommended + alternative + custom; no queued follow-up"
+        )
     delegation = payload["delegation"]
     print(
         f"子代理调度：{delegation['recommendation']}（heuristic；CLI 不会启动 agent）"
@@ -616,7 +784,9 @@ def main(argv: list[str] | None = None) -> int:
                 "status": payload["status"],
                 "recommended_contexts": payload["recommended_contexts"],
                 "fallback_contexts": payload["fallback_contexts"],
+                "planning": payload["planning"],
                 "alignment": payload["alignment"],
+                "choice": payload["choice"],
                 "delegation": {
                     "recommendation": payload["delegation"]["recommendation"],
                     "roles": [item["role"] for item in payload["delegation"]["roles"]],

@@ -16,6 +16,26 @@ For the mechanics behind each referenced feature, see the [Capability Guide](cap
 
 **Boundary:** Tenetora cannot transfer a model's hidden chain of thought. A handoff still needs an explicit goal, current state, verification result, and next action.
 
+## A Project Depends on Local Environment Files
+
+**Failure without governance:** a local configuration file is overwritten, moved, or disappears while an agent edits the project; the next startup fails and the team cannot tell whether the file was intentionally removed.
+
+**Tenetora path:** register the project-relative path with `tenetora local-env --allow`. Doctor/status report missing registered paths without reading their contents. Commit guard prevents staging, and hosts with structured PreToolUse data deny high-confidence destructive operations. Checkpoints remain the recovery inspection path.
+
+**Observable result:** the project reports the missing path and a recovery-oriented next action instead of silently continuing with a broken environment.
+
+**Boundary:** protection is scoped to registered paths and host capabilities. Tenetora does not copy secrets into evidence or guess at opaque tool payloads.
+
+## A Global Installation Meets a Scratch Workspace
+
+**Failure without governance:** a globally installed runtime injects project rules or reminders into a notes directory, conversation workspace, or ordinary document folder that was never intended to be governed.
+
+**Tenetora path:** governance is opt-in at the project root. Without `.tenetora/` or legacy `.harness/`, SessionStart, UserPromptSubmit, Stop, commit, and external-input paths stay quiet. Explicit onboarding decline/dismiss decisions remain machine-local.
+
+**Observable result:** a scratch workspace remains usable while governed repositories retain their full lifecycle behavior.
+
+**Boundary:** entering an independent Git submodule creates a separate boundary; parent rules do not silently govern child source.
+
 ## One Conversation Switches Models After a Limit
 
 **Failure without governance:** model A is rate-limited halfway through a task. The host starts model B with a new local identity, so the task either loses its alignment or creates a second active goal. A later completion report cannot tell which model verified which state.

@@ -23,7 +23,7 @@ Supported providers:
 | Provider | File | Contents |
 | --- | --- | --- |
 | GitHub Actions | `.github/workflows/tenetora.yml` | CLI, validate, audit, run-all, and SARIF. |
-| GitHub CI | `.gitlab-ci-tenetora.yml` | An independent sidecar job that does not replace the existing pipeline. |
+| GitLab CI | `.gitlab-ci-tenetora.yml` | An independent sidecar job that does not replace the existing pipeline. |
 | pre-commit | `.pre-commit-config.yaml` or a separate config | Staged-content and commit-message checks. |
 
 Existing files are preserved unless `--force` is also supplied. The template is a reviewable starting point; retain the project's own build and test jobs.

@@ -16,6 +16,6 @@ The root [`README.md`](../README.md) gives the product position and shortest sta
 | Coordinate multiple agents and repository units | [`guides/multi-agent-repository-collaboration.md`](guides/multi-agent-repository-collaboration.md) ||
 | Prompt guard, repair, evidence, and maintenance | [`guides/security-maintenance.md`](guides/security-maintenance.md) ||
 | Migrate from an Agent Harness installation | [`guides/tenetora-migration.md`](guides/tenetora-migration.md) ||
-| GitHub/GitHub CI and pre-commit | [`ci.md`](ci.md) ||
+| GitHub/GitLab CI and pre-commit | [`ci.md`](ci.md) ||
 | Current release changes | [`../CHANGELOG.md`](../CHANGELOG.md) | [`../CHANGELOG.md`](../CHANGELOG.md) |
 
