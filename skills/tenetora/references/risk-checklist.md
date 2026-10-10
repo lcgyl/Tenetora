@@ -4,7 +4,7 @@
 
 Flag without printing values:
 
-- GitHub tokens: `glpat-...`
+- GitLab tokens: `glpat-...`
 - GitHub tokens: `ghp_...`, `github_pat_...`
 - Private key blocks
 - `TOKEN=...`, `PASSWORD=...`, `SECRET=...`

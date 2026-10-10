@@ -6,9 +6,12 @@ MINIMUM_PYTHON_MINOR=9
 REQUIRED_INSTALLER_PROTOCOL=3
 MAX_ARCHIVE_BYTES=$((128*1024*1024))
 DEFAULT_RAW_URL="https://raw.githubusercontent.com/lcgyl/Tenetora/main/install.sh"
-DEFAULT_ZIP_URL="https://github.com/lcgyl/Tenetora/releases/latest/download/tenetora-latest.zip"
-DEFAULT_MANIFEST_URL="https://github.com/lcgyl/Tenetora/releases/latest/download/manifest.json"
+DEFAULT_ZIP_URL="https://r2.lcgylupup.workers.dev/stable/0.3.40/tenetora-0.3.40.zip"
+DEFAULT_MANIFEST_URL="https://r2.lcgylupup.workers.dev/stable/0.3.40/manifest.json"
+DEFAULT_PREVIEW_ZIP_URL="https://r2.lcgylupup.workers.dev/preview/0.3.40.009-preview/tenetora-0.3.40.009-preview.zip"
+DEFAULT_PREVIEW_MANIFEST_URL="https://r2.lcgylupup.workers.dev/preview/0.3.40.009-preview/manifest.json"
 DEFAULT_SOURCE_ZIP_URL="https://github.com/lcgyl/Tenetora/archive/refs/heads/main.zip"
+DEFAULT_RELEASE_INDEX_BASE="https://r2.lcgylupup.workers.dev"
 
 ZIP_URL="${TENETORA_ZIP_URL:-$DEFAULT_ZIP_URL}"
 ZIP_URL_EXPLICIT=0
@@ -18,6 +21,10 @@ fi
 ZIP_FILE="${TENETORA_ZIP_FILE:-}"
 ZIP_SHA256="${TENETORA_SHA256:-}"
 MANIFEST_URL="${TENETORA_MANIFEST_URL:-$DEFAULT_MANIFEST_URL}"
+CHANNEL="${TENETORA_CHANNEL:-stable}"
+RELEASE_INDEX_BASE="${TENETORA_RELEASE_INDEX_BASE:-}"
+R2_INDEX_ACTIVE=0
+POINTER_SHA256=""
 export PYTHONDONTWRITEBYTECODE=1
 external_manifest_sha=""
 HARNESS_HOME="${TENETORA_HOME:-}"
@@ -296,6 +303,8 @@ Tenetora 在线安装器
 
 语言：
   --lang <en|zh>         选择英文或中文。交互终端会在第一步询问；自动化环境可显式传入。
+  --channel <stable|preview>
+                          选择正式版或当前预览版；预览版不存在时不会回退正式版。
 
 包来源：
   --zip-url <url>        在线 zip 包地址。默认：${DEFAULT_ZIP_URL}
@@ -304,6 +313,9 @@ Tenetora 在线安装器
                           显式设置 --zip-url 或 TENETORA_ZIP_URL 时不会回退。
   --zip-file <file>      离线 zip 包路径。
   --sha256 <hex>         期望的 zip SHA-256，离线或固定版本安装时建议使用。
+  TENETORA_RELEASE_INDEX_BASE=<https-url>
+                          可选的 stable/preview R2 Worker 基址；读取一次渠道 latest.json
+                          后只下载同一版本的不可变 zip 和 manifest。
   --source-dir <dir>     仅开发使用：直接使用本地 Tenetora 源码目录。
 
 安装选项：
@@ -365,6 +377,8 @@ Runtime:
 
 Language:
   --lang <en|zh>         Select English or Chinese. Interactive terminals prompt first.
+  --channel <stable|preview>
+                          Select the stable release or the active preview; preview never falls back to stable.
 
 Package source:
   --zip-url <url>         Online zip package URL. Default: ${DEFAULT_ZIP_URL}
@@ -373,6 +387,9 @@ Package source:
                           Explicit --zip-url or TENETORA_ZIP_URL disables this fallback.
   --zip-file <file>       Offline zip package path.
   --sha256 <hex>          Expected zip SHA-256. Recommended for offline or pinned installs.
+  TENETORA_RELEASE_INDEX_BASE=<https-url>
+                          Optional stable/preview R2 Worker base. Reads one channel latest.json
+                          and downloads only that immutable version's ZIP and manifest.
   --source-dir <dir>      Developer-only: use an existing local Tenetora source tree instead of a zip.
 
 Install options:
@@ -403,7 +420,7 @@ Install options:
   --help                  Show this help message.
 
 Environment:
-  TENETORA_LANG, TENETORA_ZIP_URL, TENETORA_ZIP_FILE, TENETORA_SHA256, TENETORA_HOME,
+  TENETORA_LANG, TENETORA_CHANNEL, TENETORA_ZIP_URL, TENETORA_ZIP_FILE, TENETORA_SHA256, TENETORA_HOME,
   TENETORA_SOURCE_DIR, TENETORA_TOOLS, TENETORA_SCOPE, TENETORA_MODE, TENETORA_PATH,
   TENETORA_CODEX_HOOKS, TENETORA_PROGRESS,
   CODEX_HOME, CLAUDE_CONFIG_DIR, CLAUDE_HOME, CURSOR_HOME,
@@ -441,6 +458,9 @@ validate_choice() {
 }
 
 validate_package_source_selection() {
+  if [[ -n "$RELEASE_INDEX_BASE" && ( -n "$SOURCE_DIR" || -n "$ZIP_FILE" || "$ZIP_URL_EXPLICIT" == "1" || -n "$ZIP_SHA256" || -n "${TENETORA_MANIFEST_URL:-}" ) ]]; then
+    die "$(i18n_text "Release index base cannot be combined with another package source." "版本索引地址不能与其他安装包来源同时使用。")"
+  fi
   if [[ -n "$SOURCE_DIR" && ( -n "$ZIP_FILE" || "$ZIP_URL_EXPLICIT" == "1" || -n "$ZIP_SHA256" ) ]]; then
     die "$(i18n_text "Package source options are mutually exclusive: --source-dir cannot be combined with --zip-file, an explicit --zip-url, or --sha256." "安装包来源选项互斥：--source-dir 不能与 --zip-file、显式 --zip-url 或 --sha256 同时使用。")"
   fi
@@ -584,7 +604,7 @@ PY
 
 validate_package_version() {
   local version="$1"
-  if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.][0-9]{3}-preview)?$ ]]; then
     die "$(i18n_text "Package version is invalid; refusing to use it as a path: ${version}" "安装包版本无效，拒绝将其用于路径：${version}")"
   fi
 }
@@ -660,7 +680,18 @@ package_contract_missing() {
 }
 
 is_default_latest_package() {
-  [[ "$ZIP_URL_EXPLICIT" == "0" && -z "$ZIP_FILE" && -z "$ZIP_SHA256" && "$ZIP_URL" == "$DEFAULT_ZIP_URL" ]]
+  [[ "$ZIP_URL_EXPLICIT" == "0" && -z "$ZIP_FILE" && -z "$ZIP_SHA256" &&
+    "$CHANNEL" == "stable" && "$ZIP_URL" == "$DEFAULT_ZIP_URL" ]]
+}
+
+is_default_channel_package() {
+  [[ "$R2_INDEX_ACTIVE" == "1" ]] && return 0
+  [[ "$ZIP_URL_EXPLICIT" == "0" && -z "$ZIP_FILE" && -z "$ZIP_SHA256" ]] || return 1
+  if [[ "$CHANNEL" == "stable" ]]; then
+    [[ "$ZIP_URL" == "$DEFAULT_ZIP_URL" ]]
+  else
+    [[ "$CHANNEL" == "preview" && "$ZIP_URL" == "$DEFAULT_PREVIEW_ZIP_URL" ]]
+  fi
 }
 
 stamp_manifest_sha() {
@@ -718,17 +749,44 @@ except (OSError, json.JSONDecodeError) as exc:
 if not isinstance(external, dict) or not isinstance(embedded, dict):
     raise SystemExit("release manifest must be a JSON object")
 version = str(external.get("version") or "")
+channel = str(external.get("channel") or "stable")
+stable_version = str(external.get("stable_version") or "")
+preview_sequence = str(external.get("preview_sequence") or "")
+adapter_version = str(external.get("adapter_version") or "")
+stable_ok = bool(re.fullmatch(r"\d+\.\d+\.\d+", version))
+preview_ok = bool(re.fullmatch(r"\d+\.\d+\.\d+\.\d{3}-preview", version))
+if channel == "stable":
+    identity_ok = stable_ok and stable_version in {"", version} and not preview_sequence and adapter_version in {"", version}
+    allowed_artifacts = {f"tenetora-{version}.zip", "tenetora-latest.zip"}
+elif channel == "preview":
+    expected_adapter = ""
+    if preview_ok:
+        base = version.rsplit(".", 1)[0]
+        sequence = int(version.split(".")[-1].split("-", 1)[0])
+        expected_adapter = f"{base}-preview.{sequence}"
+    identity_ok = (
+        preview_ok
+        and bool(re.fullmatch(r"\d+\.\d+\.\d+", stable_version))
+        and bool(re.fullmatch(r"[0-9]{3}", preview_sequence))
+        and int(preview_sequence or "0") > 0
+        and adapter_version == expected_adapter
+    )
+    allowed_artifacts = {f"tenetora-{version}.zip", "tenetora-preview.zip"}
+else:
+    identity_ok = False
+    allowed_artifacts = set()
 if (
     external.get("name") != "tenetora"
     or external.get("format") != "tenetora-release-zip-v1"
     or external.get("zip_root") != "tenetora"
-    or not re.fullmatch(r"\d+\.\d+\.\d+", version)
-    or external.get("artifact") not in {f"tenetora-{version}.zip", "tenetora-latest.zip"}
+    or not identity_ok
+    or external.get("artifact") not in allowed_artifacts
     or str(external.get("sha256") or "").lower() != actual_sha.lower()
 ):
     raise SystemExit("external release manifest identity is invalid")
 fields = (
-    "name", "version", "commit", "format", "installer_protocol", "bridge_protocol",
+    "name", "version", "channel", "stable_version", "preview_sequence", "adapter_version",
+    "commit", "format", "installer_protocol", "bridge_protocol",
     "minimum_bridge_version", "upgrade_entrypoint", "state_schemas", "zip_root", "files",
     "file_sha256",
 )
@@ -839,6 +897,64 @@ download_zip() {
     return $?
   fi
   die "$(i18n_text "curl or wget is required to download ${url}" "下载 ${url} 需要 curl 或 wget")"
+}
+
+resolve_release_pointer() {
+  local pointer_file="$1"
+  "$PYTHON_BIN" - "$pointer_file" "$RELEASE_INDEX_BASE" "$CHANNEL" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+from urllib.parse import urljoin, urlsplit
+
+pointer_path, raw_base, channel = sys.argv[1:]
+parsed = urlsplit(raw_base)
+if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+        or parsed.query or parsed.fragment or any(char.isspace() for char in raw_base)):
+    raise SystemExit("release index base must be a credential-free HTTPS URL")
+if pointer_path == "--url":
+    print(f"{raw_base.rstrip('/')}/{channel}/latest.json")
+    raise SystemExit(0)
+if Path(pointer_path).stat().st_size > 4096:
+    raise SystemExit("release pointer exceeds the size limit")
+try:
+    pointer = json.loads(Path(pointer_path).read_text(encoding="utf-8"))
+except (OSError, UnicodeError, ValueError) as exc:
+    raise SystemExit(f"release pointer is invalid: {exc}")
+version = pointer.get("version") if isinstance(pointer, dict) else None
+pattern = r"\d+\.\d+\.\d+\.\d{3}-preview" if channel == "preview" else r"\d+\.\d+\.\d+"
+if (not isinstance(version, str) or not re.fullmatch(pattern, version)
+        or pointer.get("schema") != 1 or pointer.get("channel") != channel):
+    raise SystemExit("release pointer identity is invalid")
+prefix = f"{channel}/{version}"
+if (pointer.get("zip_key") != f"{prefix}/tenetora-{version}.zip"
+        or pointer.get("manifest_key") != f"{prefix}/manifest.json"
+        or not isinstance(pointer.get("sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", pointer["sha256"])):
+    raise SystemExit("release pointer object keys or digest are invalid")
+base = raw_base.rstrip("/") + "/"
+print("\t".join((urljoin(base, pointer["zip_key"]),
+                 urljoin(base, pointer["manifest_key"]), pointer["sha256"], version)))
+PY
+}
+
+validate_pointer_manifest() {
+  "$PYTHON_BIN" - "$1" "$CHANNEL" "$POINTER_VERSION" "$POINTER_SHA256" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path, channel, version, sha256 = sys.argv[1:]
+try:
+    manifest = json.loads(Path(path).read_text(encoding="utf-8"))
+except (OSError, UnicodeError, ValueError) as exc:
+    raise SystemExit(f"release manifest is invalid: {exc}")
+if (not isinstance(manifest, dict) or manifest.get("channel") != channel
+        or manifest.get("version") != version or manifest.get("sha256") != sha256
+        or manifest.get("artifact") != f"tenetora-{version}.zip"):
+    raise SystemExit("release manifest does not match the channel pointer")
+PY
 }
 
 extract_zip() {
@@ -1070,6 +1186,11 @@ choose_language "$@"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --channel)
+      need_value "$1" "${2:-}"
+      CHANNEL="$2"
+      shift 2
+      ;;
     --lang)
       need_value "$1" "${2:-}"
       shift 2
@@ -1199,7 +1320,18 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -z "${TENETORA_LEGACY_RELEASE_SOURCE:-}" && -z "$RELEASE_INDEX_BASE" && "$ZIP_URL_EXPLICIT" == "0" && -z "$ZIP_FILE" &&
+  -z "$ZIP_SHA256" && -z "$SOURCE_DIR" && -z "${TENETORA_MANIFEST_URL:-}" ]]; then
+  RELEASE_INDEX_BASE="$DEFAULT_RELEASE_INDEX_BASE"
+fi
+
 validate_package_source_selection
+
+validate_choice "channel" "$CHANNEL" "stable,preview"
+if [[ "$CHANNEL" == "preview" && "$ZIP_URL_EXPLICIT" == "0" && -z "${TENETORA_MANIFEST_URL:-}" ]]; then
+  ZIP_URL="$DEFAULT_PREVIEW_ZIP_URL"
+  MANIFEST_URL="$DEFAULT_PREVIEW_MANIFEST_URL"
+fi
 
 if [[ -z "$HARNESS_HOME" ]]; then
   if [[ -z "$USER_HOME" ]]; then
@@ -1282,6 +1414,10 @@ else
       fi
       say "would install zip file ${ZIP_FILE}" "将安装 zip 文件 ${ZIP_FILE}"
     else
+      if [[ -n "$RELEASE_INDEX_BASE" ]]; then
+        pointer_url="$(resolve_release_pointer --url)" || die "$(i18n_text "Invalid release index URL." "版本索引地址无效。")"
+        say "would download release pointer ${pointer_url}" "将下载版本指针 ${pointer_url}"
+      fi
       say "would download ${ZIP_URL}" "将下载 ${ZIP_URL}"
       if [[ -e "${HARNESS_HOME}/current" || -L "${HARNESS_HOME}/current" ]]; then
         if ! resolved_current_source="$(resolve_managed_current_source "${HARNESS_HOME}")"; then
@@ -1297,6 +1433,18 @@ else
     tmp_dir="$(mktemp -d)"
     TEMP_DIRS+=("$tmp_dir")
     package_zip="${tmp_dir}/tenetora.zip"
+    if [[ -n "$RELEASE_INDEX_BASE" ]]; then
+      pointer_file="${tmp_dir}/release-pointer.json"
+      pointer_url="$(resolve_release_pointer --url)" || die "$(i18n_text "Invalid release index URL." "版本索引地址无效。")"
+      if ! download_zip "$pointer_url" "$pointer_file"; then
+        die "$(i18n_text "Failed to download the ${CHANNEL} release pointer." "无法下载 ${CHANNEL} 渠道版本指针。")"
+      fi
+      pointer_values="$(resolve_release_pointer "$pointer_file")" || die "$(i18n_text "The release pointer is invalid." "版本指针无效。")"
+      IFS=$'\t' read -r ZIP_URL MANIFEST_URL POINTER_SHA256 POINTER_VERSION <<<"$pointer_values"
+      ZIP_URL_EXPLICIT=0
+      R2_INDEX_ACTIVE=1
+      say "Package pointer: ${CHANNEL}/${POINTER_SHA256:0:12}" "安装指针：${CHANNEL}/${POINTER_SHA256:0:12}"
+    fi
     if [[ -n "$ZIP_FILE" ]]; then
       if [[ ! -f "$ZIP_FILE" ]]; then
         die "$(i18n_text "Zip file does not exist: $ZIP_FILE" "Zip 文件不存在：$ZIP_FILE")"
@@ -1305,14 +1453,26 @@ else
       say "Package: local ${package_zip}" "安装包：本地 ${package_zip}"
     else
       if download_zip "$ZIP_URL" "$package_zip"; then
-        if [[ "$ZIP_URL_EXPLICIT" == "0" && "$ZIP_URL" == "$DEFAULT_ZIP_URL" ]]; then
+        if is_default_channel_package; then
           external_manifest="${tmp_dir}/external-manifest.json"
           if download_zip "$MANIFEST_URL" "$external_manifest"; then
             external_manifest_sha="$(manifest_sha256 "$external_manifest")"
             if [[ -z "$external_manifest_sha" ]]; then
               die "$(i18n_text "The latest release manifest has no valid SHA256." "latest release manifest 没有有效 SHA256。")"
             fi
+            if [[ "$R2_INDEX_ACTIVE" == "1" && "$external_manifest_sha" != "$POINTER_SHA256" ]]; then
+              die "$(i18n_text "The release manifest does not match the channel pointer." "release manifest 与渠道版本指针不匹配。")"
+            fi
+            if [[ "$R2_INDEX_ACTIVE" == "1" ]] && ! validate_pointer_manifest "$external_manifest"; then
+              die "$(i18n_text "The release manifest identity does not match the channel pointer." "release manifest 身份与渠道版本指针不匹配。")"
+            fi
           else
+            if [[ "$R2_INDEX_ACTIVE" == "1" ]]; then
+              die "$(i18n_text "The R2 release manifest is unavailable; refusing an unauthenticated package." "R2 release manifest 不可用，拒绝安装未经认证的安装包。")"
+            fi
+            if [[ "$CHANNEL" != "stable" ]]; then
+              die "$(i18n_text "The preview release manifest is unavailable; refusing an unauthenticated preview package." "预览版 release manifest 不可用，拒绝安装未经认证的预览包。")"
+            fi
             warn \
               "Package: latest release manifest unavailable; falling back to ${DEFAULT_SOURCE_ZIP_URL}" \
               "安装包：latest release manifest 不可用，回退到 ${DEFAULT_SOURCE_ZIP_URL}"
@@ -1328,7 +1488,7 @@ else
         if [[ "$SOURCE_ARCHIVE_FALLBACK" != "1" ]]; then
           say "Package: downloaded ${ZIP_URL}" "安装包：已下载 ${ZIP_URL}"
         fi
-      elif [[ "$ZIP_URL_EXPLICIT" == "0" && "$ZIP_URL" == "$DEFAULT_ZIP_URL" ]]; then
+      elif [[ "$R2_INDEX_ACTIVE" != "1" && "$ZIP_URL_EXPLICIT" == "0" && "$ZIP_URL" == "$DEFAULT_ZIP_URL" && "$CHANNEL" == "stable" ]]; then
         warn "Package: latest release zip unavailable; falling back to ${DEFAULT_SOURCE_ZIP_URL}" "安装包：最新 release zip 不可用，回退到 ${DEFAULT_SOURCE_ZIP_URL}"
         rm -f "$package_zip"
         if ! download_zip "$DEFAULT_SOURCE_ZIP_URL" "$package_zip"; then
@@ -1361,6 +1521,9 @@ else
     fi
     package_version="$(source_version "$extracted_source")"
     validate_package_version "$package_version"
+    if [[ "$R2_INDEX_ACTIVE" == "1" && "$package_version" != "$POINTER_VERSION" ]]; then
+      die "$(i18n_text "Release package version does not match its channel pointer." "release 安装包版本与渠道指针不匹配。")"
+    fi
     STAGED_RELEASE_DIR="${HARNESS_HOME}/releases/${package_version}"
     SOURCE_DIR="$(canonical_dir "$extracted_source")"
     package_protocol="$(source_installer_protocol "$SOURCE_DIR")"
@@ -1542,6 +1705,7 @@ if [[ "$BRIDGE_PROTOCOL" -ge 1 ]]; then
     "--mode" "$MODE"
     "--codex-hooks" "$CODEX_HOOKS"
     "--progress" "$PROGRESS_MODE"
+    "--channel" "$CHANNEL"
     "--configure-path"
     "--log-file" "$LOG_FILE"
     "--events-jsonl" "$EVENT_FILE"

@@ -1,13 +1,13 @@
 ---
 name: tenetora-decision-interview
-description: Use when a governed engineering task needs a bounded decision alignment interview because material ambiguity, risk, conflicting constraints, or unresolved user-owned choices remain before planning or execution.
+description: Use when any governed task needs a bounded decision alignment interview because material ambiguity, risk, conflicting constraints, or unresolved user-owned choices remain before planning, execution, or review.
 ---
 
 # Tenetora Decision Interview
 
 ## Overview
 
-This skill is the model-callable semantic primitive used by Tenetora lifecycle skills. It separates facts from decisions, investigates what the repository can answer, asks one question at a time, explains recommendations transparently, detects conflicts, and stops at convergence or checkpoint.
+This skill is the model-callable semantic primitive used by Tenetora lifecycle skills and by ordinary governed work in any host mode. It separates facts from decisions, investigates what the repository can answer, asks one question at a time, explains recommendations transparently, detects conflicts, and stops at convergence or checkpoint.
 
 Do not answer decisions for the user. Do not plan or implement the engineering task.
 
@@ -33,7 +33,8 @@ Before recording `unavailable` for any portable subagent role, inspect the curre
 | Trigger | Action |
 | --- | --- |
 | `tenetora-align` has an active session with unresolved material decisions | Continue the bounded interview. |
-| Router, init, update, or loop detects high risk plus material ambiguity | Recommend or invoke this primitive only within an explicit governed lifecycle. |
+| Router, init, update, loop, Plan, review, test, release, or ordinary implementation detects a material choice | Use this primitive within the current lifecycle; do not require Plan mode. |
+| The host exposes a synchronous native question selector in the current mode | Use it as an optional presentation enhancement. |
 | Repository facts conflict with a proposed decision or acceptance criterion | Surface the conflict and ask the user to resolve the decision. |
 | The current batch reaches 8 questions | Stop at checkpoint; do not continue automatically. |
 
@@ -46,12 +47,17 @@ Before recording `unavailable` for any portable subagent role, inspect the curre
 
 ## Session Gate
 
-Before asking a decision question, run `tenetora alignment --status --json` with the current conversation's `--session-id` and `--owner-id` (or the corresponding `TENETORA_ALIGNMENT_*` environment variables). An unscoped `conflict` result is not a usable session.
+Ordinary material-choice questions do not require an alignment session. Use the
+current task's existing authorization, ask directly, and record the concise
+decision in the task's plan or handoff. Do not implicitly invoke `tenetora-align`
+or ask for permission again merely to present a question.
+
+For a tracked alignment interview, run `tenetora alignment --status --json` with the current conversation's `--session-id` and `--owner-id` (or the corresponding `TENETORA_ALIGNMENT_*` environment variables). An unscoped `conflict` result is not a usable session.
 
 - Continue only when a governed alignment session is active and the current user message authorizes the next question or resume action.
 - Never inherit an unscoped active or legacy session. Use `tenetora alignment --list --json` to show candidates and require an explicit owner/session choice.
 - At `checkpoint`, `paused`, `blocked`, or `awaiting-confirmation`, wait for the user's explicit choice before changing state.
-- If no active session exists, return control to `tenetora-align`; do not conduct an untracked interview.
+- If no active session exists, do not mutate alignment state. Return to the lifecycle caller; ordinary material-choice questions remain available without creating an alignment.
 
 ## Facts And Decisions
 
@@ -79,14 +85,65 @@ Ask one question at a time. Each decision question must include:
 
 After the answer, summarize only the resulting decision and remaining uncertainty. Do not store the full conversation or hidden reasoning.
 
+## Mode-Independent Question Delivery
+
+Material choices are not a Plan-only concern. They can appear during coding,
+testing, review, release, deployment, or troubleshooting. The model must ask
+the question whenever the choice is material, regardless of the current host
+mode.
+
+Use this transport order:
+
+1. If the current host explicitly exposes a synchronous native question
+   selector, use it. The selector is optional; never change modes merely to
+   obtain it.
+2. Otherwise ask directly in the current assistant message using the text
+   template below and stop execution until the user answers.
+
+Do **not** use an asynchronous or queued follow-up input as the fallback. It
+is easy to miss in a terminal and does not provide a reliable cross-host
+choice interaction. Do not start a blocking `select`, `fzf`, `curses`, or
+custom terminal subprocess either: its answer cannot be safely bound back to
+the model conversation across hosts and it would introduce an unnecessary
+runtime dependency.
+
+The direct text form is the terminal-compatible fallback and must always offer
+the recommended option, at least one alternative, and a custom path:
+
+```text
+Decision: <what changes and why it matters>
+Option A (Recommended): <proposal>
+  Reason: <evidence and expected outcome>
+  Tradeoff: <cost or risk>
+Option B: <proposal and tradeoff>
+Custom option: provide another proposal or modify an option.
+Please reply with A, B, or a custom proposal. Work is paused until you choose.
+```
+
+The Plan-mode material-choice protocol and any `grill-me` integration must
+reuse this contract rather than defining a second selector or silently making
+the choice.
+
+## Plan Integration
+
+When `tenetora-plan` finds multiple materially different options, this
+interview is the decision boundary for the plan. The plan supplies repository
+facts and the option set; the interview supplies one question at a time. Keep
+the model recommendation first, label its confidence, explain its assumptions
+and tradeoffs, list the other viable options, and always offer a custom answer
+path. Never turn the recommendation into a default user decision. After the
+user answers, return only the decision summary and remaining open questions to
+the plan; the plan then reclassifies `MUST`, `SAFE`, and `LATER` items before
+freezing execution prompts.
+
 ## Convergence And Checkpoint
 
 - Stop asking when goal, scope, non-goals, material tradeoffs, risks, approval boundaries, rollback expectations, acceptance criteria, and any applicable skeleton boundaries/proof are sufficiently determined for the task's risk level.
 - Ask no more than 8 questions in one batch.
-- The eighth recorded answer automatically enters `checkpoint`; do not issue a second `--checkpoint` command. Stop and let the user choose whether to continue, pause, move to `--await-confirmation`, or abandon.
-- At semantic convergence before the eighth question, use `tenetora alignment --await-confirmation`; use explicit `--checkpoint` only for an earlier voluntary stop.
+- In a tracked alignment interview, the eighth recorded answer automatically enters `checkpoint`; do not issue a second `--checkpoint` command. Stop and let the user choose whether to continue, pause, move to `--await-confirmation`, or abandon. Ordinary questions use a conversational checkpoint without mutating alignment state.
+- At semantic convergence of a tracked interview before the eighth question, use `tenetora alignment --await-confirmation`; use explicit `--checkpoint` only for an earlier voluntary stop.
 - If new evidence invalidates an earlier answer, explain the conflict and reopen only the affected decision.
-- At convergence, prepare the handoff summary and return control to `tenetora-align`; do not choose the next lifecycle action.
+- At convergence, prepare the handoff summary and return to the lifecycle caller (or `tenetora-align` for a tracked interview); do not choose the next lifecycle action.
 
 ## Safety Contract
 

@@ -28,6 +28,7 @@ SUBAGENT_REPORT_ARCHIVE_REL = ".tenetora/.cache/subagents/archive"
 SUBAGENT_REPORT_RETENTION_DAYS = 7
 CURRENT_SCHEMA_VERSION = 3
 ACTIVE_LOOP_STATUSES = {"active", "blocked"}
+TERMINAL_LOOP_STATUSES = {"idle", "done"}
 DEFAULT_NEXT_PROMPT = "use tenetora-loop 继续"
 APPROVAL_BOUNDARIES = [
     "commits",
@@ -93,6 +94,8 @@ def default_state() -> dict[str, object]:
         "session_id": "",
         "owner_id": "",
         "conversation_id": "",
+        "conversation_continuity_id": "",
+        "continuity_available": False,
         "tool": "unknown",
         "status": "idle",
         "current_goal": "",
@@ -144,6 +147,10 @@ def parser() -> argparse.ArgumentParser:
     command_parser.add_argument("--session-id", help="Stable conversation/session identity for loop state.")
     command_parser.add_argument("--owner-id", help="Owner identity for loop state mutations.")
     command_parser.add_argument("--conversation-id", help="Host conversation identity.")
+    command_parser.add_argument(
+        "--conversation-continuity-id",
+        help="Stable logical-conversation identity across host session restarts.",
+    )
     command_parser.add_argument("--tool", help="Host tool identity (for diagnostics).")
     command_parser.add_argument(
         "--adopt-legacy",
@@ -208,50 +215,121 @@ def requested_identity(args: argparse.Namespace) -> dict[str, str]:
         getattr(args, "session_id", "")
         or os.environ.get("TENETORA_SESSION_ID", "")
         or os.environ.get("TENETORA_ALIGNMENT_SESSION_ID", "")
+        or os.environ.get("TENETORA_HOST_SESSION_ID", "")
     ).strip()
     owner_id = str(
         getattr(args, "owner_id", "")
         or os.environ.get("TENETORA_OWNER_ID", "")
         or os.environ.get("TENETORA_ALIGNMENT_OWNER_ID", "")
+        or os.environ.get("TENETORA_HOST_OWNER_ID", "")
     ).strip()
     conversation_id = str(
-        getattr(args, "conversation_id", "") or os.environ.get("TENETORA_CONVERSATION_ID", "")
+        getattr(args, "conversation_id", "")
+        or os.environ.get("TENETORA_CONVERSATION_ID", "")
+        or os.environ.get("TENETORA_HOST_CONVERSATION_ID", "")
     ).strip()
-    tool = str(getattr(args, "tool", "") or os.environ.get("TENETORA_TOOL", "unknown")).strip() or "unknown"
+    conversation_continuity_id = str(
+        getattr(args, "conversation_continuity_id", "")
+        or os.environ.get("TENETORA_CONVERSATION_CONTINUITY_ID", "")
+        or os.environ.get("TENETORA_HOST_CONVERSATION_CONTINUITY_ID", "")
+    ).strip()
+    tool = str(
+        getattr(args, "tool", "")
+        or os.environ.get("TENETORA_TOOL", "")
+        or os.environ.get("TENETORA_HOOK_PLATFORM", "unknown")
+    ).strip() or "unknown"
     if session_id:
         alignment_state.validate_identity(session_id, "session_id", alignment_state.SESSION_ID_RE)
     if owner_id:
         alignment_state.validate_identity(owner_id, "owner_id", alignment_state.OWNER_ID_RE)
     if conversation_id:
         alignment_state.validate_identity(conversation_id, "conversation_id", alignment_state.OWNER_ID_RE)
+    if conversation_continuity_id:
+        alignment_state.validate_identity(
+            conversation_continuity_id,
+            "conversation_continuity_id",
+            alignment_state.OWNER_ID_RE,
+        )
     alignment_state.validate_identity(tool, "tool", alignment_state.OWNER_ID_RE)
+    stable_conversation = conversation_continuity_id or conversation_id
     return {
         "session_id": session_id,
         "owner_id": owner_id,
         "conversation_id": conversation_id or owner_id,
+        "conversation_continuity_id": stable_conversation or owner_id,
+        "continuity_available": bool(stable_conversation),
         "tool": tool,
     }
 
 
-def identity_matches(state: dict[str, object], identity: dict[str, str]) -> bool:
+def identity_match_kind(state: dict[str, object], identity: dict[str, str]) -> str:
+    """Match an execution exactly or by a stable logical-conversation identity."""
     stored_session = str(state.get("session_id") or "")
     stored_owner = str(state.get("owner_id") or "")
-    return bool(
+    if (
         identity.get("session_id")
         and identity.get("owner_id")
         and stored_session == identity["session_id"]
         and stored_owner == identity["owner_id"]
+    ):
+        return "exact"
+    stored_continuity = (
+        str(state.get("conversation_continuity_id") or state.get("conversation_id") or "")
+        if state.get("continuity_available")
+        else ""
     )
+    requested_continuity = (
+        str(identity.get("conversation_continuity_id") or identity.get("conversation_id") or "")
+        if identity.get("continuity_available")
+        else ""
+    )
+    stored_tool = str(state.get("tool") or "unknown")
+    requested_tool = str(identity.get("tool") or "unknown")
+    if (
+        stored_continuity
+        and requested_continuity
+        and stored_continuity == requested_continuity
+        and stored_tool == requested_tool
+    ):
+        return "conversation-continuity"
+    return ""
+
+
+def identity_matches(state: dict[str, object], identity: dict[str, str]) -> bool:
+    return bool(identity_match_kind(state, identity))
+
+
+def neutral_terminal_view(state: dict[str, object]) -> dict[str, object]:
+    """Expose an unrelated terminal singleton as idle without leaking task identity."""
+    view = default_state()
+    view.update(
+        {
+            "revision": state.get("revision", 0),
+            "updated_at": state.get("updated_at"),
+            "ignored_terminal_state": True,
+            "prior_state_status": state.get("status", "idle"),
+        }
+    )
+    return view
 
 
 def safe_state_view(state: dict[str, object], args: argparse.Namespace) -> dict[str, object]:
     """Hide another conversation's loop goal instead of treating it as current state."""
-    if not str(state.get("current_goal") or ""):
-        return state
     identity = requested_identity(args)
-    if identity_matches(state, identity):
+    match_kind = identity_match_kind(state, identity)
+    if match_kind == "exact":
         return state
+    if match_kind == "conversation-continuity":
+        view = dict(state)
+        view["identity_match"] = match_kind
+        view["session_rebind_required"] = True
+        return view
+    status = str(state.get("status") or "idle")
+    if status in TERMINAL_LOOP_STATUSES and (state.get("session_id") or state.get("owner_id")):
+        return neutral_terminal_view(state)
     goal = str(state.get("current_goal") or "")
+    if not goal and status not in ACTIVE_LOOP_STATUSES:
+        return state
     view = default_state()
     view.update(
         {
@@ -292,6 +370,11 @@ def migrate_schema(payload: dict[str, object]) -> dict[str, object]:
     migrated.setdefault("session_id", "")
     migrated.setdefault("owner_id", "")
     migrated.setdefault("conversation_id", "")
+    migrated.setdefault(
+        "conversation_continuity_id",
+        migrated.get("conversation_id", ""),
+    )
+    migrated.setdefault("continuity_available", bool(migrated.get("conversation_id")))
     migrated.setdefault("tool", "unknown")
     if version > CURRENT_SCHEMA_VERSION:
         print(
@@ -418,10 +501,71 @@ def apply_updates(root: Path, state: dict[str, object], args: argparse.Namespace
     identity = requested_identity(args)
     previous_status = str(state.get("status", "idle"))
     previous_goal = str(state.get("current_goal", ""))
-    if (state.get("session_id") or state.get("owner_id")) and not identity_matches(state, identity):
-        raise ValueError(
-            "loop state belongs to another or unknown conversation; pass matching --session-id/--owner-id"
+    match_kind = identity_match_kind(state, identity)
+    exact_identity = match_kind == "exact"
+    owned_state = bool(state.get("session_id") or state.get("owner_id"))
+    replace_terminal_state = bool(
+        owned_state
+        and not match_kind
+        and previous_status in TERMINAL_LOOP_STATUSES
+        and (
+            args.reset
+            or (
+                args.status == "active"
+                and str(args.goal or "").strip()
+                and identity["session_id"]
+                and identity["owner_id"]
+            )
         )
+    )
+    if replace_terminal_state:
+        archive_goal_reports(root, state, previous_goal)
+        expected_revision = state.get("revision", 0)
+        state = default_state()
+        state["revision"] = expected_revision
+    elif owned_state and not match_kind:
+        raise ValueError(
+            "loop state belongs to another or unknown conversation; pass matching --session-id/--owner-id "
+            "or the stable --conversation-continuity-id"
+        )
+    elif exact_identity:
+        stored_continuity = (
+            str(state.get("conversation_continuity_id") or state.get("conversation_id") or "")
+            if state.get("continuity_available")
+            else ""
+        )
+        requested_continuity = str(identity.get("conversation_continuity_id") or "")
+        if stored_continuity and requested_continuity and stored_continuity != requested_continuity:
+            raise ValueError(
+                "loop state continuity conflicts with the current exact session; "
+                "do not overwrite an existing logical-conversation identity"
+            )
+        if not stored_continuity and requested_continuity and identity.get("continuity_available"):
+            state["conversation_id"] = identity["conversation_id"]
+            state["conversation_continuity_id"] = requested_continuity
+            state["continuity_available"] = True
+            if str(state.get("tool") or "unknown") == "unknown":
+                state["tool"] = identity["tool"]
+    elif match_kind == "conversation-continuity" and not exact_identity:
+        archive_goal_reports(root, state, previous_goal)
+        state["session_id"] = identity["session_id"]
+        state["owner_id"] = identity["owner_id"]
+        state["conversation_id"] = identity["conversation_id"]
+        state["conversation_continuity_id"] = identity["conversation_continuity_id"]
+        state["continuity_available"] = bool(identity["continuity_available"])
+        state["tool"] = identity["tool"]
+        state["alignment"] = default_state()["alignment"]
+        state["review_cycle"] = default_review_cycle()
+        notes = state.get("notes", [])
+        if not isinstance(notes, list):
+            notes = []
+        rebind_note = (
+            "host session identity changed within the same conversation continuity; "
+            "alignment and review evidence must be re-established"
+        )
+        if rebind_note not in notes:
+            notes.append(rebind_note)
+        state["notes"] = notes
     if previous_status in ACTIVE_LOOP_STATUSES and previous_goal:
         if not identity_matches(state, identity):
             if not args.adopt_legacy or state.get("owner_id") or not identity["session_id"] or not identity["owner_id"]:
@@ -432,6 +576,8 @@ def apply_updates(root: Path, state: dict[str, object], args: argparse.Namespace
             state["session_id"] = identity["session_id"]
             state["owner_id"] = identity["owner_id"]
             state["conversation_id"] = identity["conversation_id"]
+            state["conversation_continuity_id"] = identity["conversation_continuity_id"]
+            state["continuity_available"] = bool(identity["continuity_available"])
             state["tool"] = identity["tool"]
     requested_status = args.status or previous_status
     if requested_status in ACTIVE_LOOP_STATUSES and (not identity["session_id"] or not identity["owner_id"]):
@@ -440,6 +586,8 @@ def apply_updates(root: Path, state: dict[str, object], args: argparse.Namespace
         state["session_id"] = identity["session_id"]
         state["owner_id"] = identity["owner_id"]
         state["conversation_id"] = identity["conversation_id"]
+        state["conversation_continuity_id"] = identity["conversation_continuity_id"]
+        state["continuity_available"] = bool(identity["continuity_available"])
         state["tool"] = identity["tool"]
     previous_exit_criteria = state.get("exit_criteria", [])
     if not isinstance(previous_exit_criteria, list):

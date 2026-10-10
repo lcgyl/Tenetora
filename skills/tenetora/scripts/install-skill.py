@@ -105,6 +105,7 @@ CANONICAL_SKILL_NAMES = (
     "tenetora-prompt-guard",
     "tenetora-align",
     "tenetora-decision-interview",
+    "tenetora-plan",
 )
 LEGACY_SKILL_NAMES = (
     "agent-harness",
@@ -115,6 +116,7 @@ LEGACY_SKILL_NAMES = (
     "agent-harness-prompt-guard",
     "agent-harness-align",
     "agent-harness-decision-interview",
+    "agent-harness-plan",
 )
 PLUGIN_SKILL_NAMES = CANONICAL_SKILL_NAMES
 RECOGNIZED_SKILL_NAMES = (*CANONICAL_SKILL_NAMES, *LEGACY_SKILL_NAMES)
@@ -1080,6 +1082,28 @@ def package_version(path: Path) -> str | None:
     return version or None
 
 
+def package_adapter_version(path: Path) -> str | None:
+    """Return the native-plugin adapter version for a release package.
+
+    Preview packages expose a user-facing release id such as
+    ``0.3.40.001-preview`` in the lifecycle VERSION file, while native tool
+    manifests intentionally keep the SemVer-compatible adapter id
+    ``0.3.40-preview.1``.  Stable packages have no adapter override.
+    """
+
+    release_version = package_version(path)
+    manifest_path = path / "manifest.json"
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        payload = None
+    if isinstance(payload, dict) and payload.get("channel") == "preview":
+        adapter = payload.get("adapter_version")
+        if isinstance(adapter, str) and adapter:
+            return adapter
+    return release_version
+
+
 def plugin_version(path: Path) -> str | None:
     """Read the installed ZCode plugin manifest version."""
 
@@ -1476,15 +1500,19 @@ def clean_superseded_plugin_caches(
     report: InstallReport,
     dry_run: bool,
     transaction: "ZCodeInstallTransaction | None" = None,
+    preserve_paths: set[Path] | None = None,
 ) -> None:
     cache_root = ensure_safe_directory_chain(cache_root, label=f"{target} plugin cache root")
     if not cache_root.is_dir():
         return
     current_resolved = current.resolve(strict=False)
+    preserved = {path.resolve(strict=False) for path in (preserve_paths or set())}
     for candidate in sorted(cache_root.iterdir()):
         if path_is_redirected(candidate):
             continue
         if candidate.resolve(strict=False) == current_resolved:
+            continue
+        if candidate.resolve(strict=False) in preserved:
             continue
         managed_cache = plugin_is_tenetora_managed(candidate) or any(
             (candidate / "hooks" / name).is_file()
@@ -1504,6 +1532,45 @@ def clean_superseded_plugin_caches(
         report.lines.append(
             status_line("MIGRATE", target, "global", "plugin", f"removed superseded cache {candidate}")
         )
+
+
+@contextmanager
+def preserve_active_native_plugin_cache(
+    target: str,
+    project_root: Path,
+    previous_path: Path | None,
+    source_version: str,
+):
+    """Keep the old hook path alive while a host process may still reference it."""
+    if previous_path is None or not previous_path.exists():
+        yield set()
+        return
+    expected = native_plugin_cache_root(target, project_root) / source_version
+    if previous_path.resolve(strict=False) == expected.resolve(strict=False):
+        yield set()
+        return
+    if not native_plugin_is_managed(target, previous_path):
+        yield set()
+        return
+
+    config_root = target_base(target, "global", project_root).parent
+    backup_root = ensure_safe_directory_chain(
+        config_root / ".tenetora-native-upgrade-backups",
+        label=f"{target} native plugin upgrade backup",
+    )
+    ensure_unredirected_directory(backup_root, label=f"{target} native plugin upgrade backup")
+    temporary = Path(tempfile.mkdtemp(prefix=f".{target}-", dir=str(backup_root)))
+    backup = temporary / "plugin"
+    try:
+        shutil.copytree(previous_path, backup)
+        preserved = {previous_path.resolve(strict=False)}
+        yield preserved
+    finally:
+        if not previous_path.exists() and backup.exists():
+            ensure_safe_directory_chain(previous_path.parent, label=f"{target} native plugin cache parent")
+            shutil.copytree(backup, previous_path)
+        if temporary.exists() or path_is_redirected(temporary):
+            remove_existing(temporary)
 
 
 def next_legacy_plugin_backup(project_root: Path, scope: str) -> Path:
@@ -1749,6 +1816,43 @@ class ZCodeInstallTransaction:
             destination,
         )
 
+    def _replace_path(self, source: Path, destination: Path) -> None:
+        """Directory rename with bounded retries for WinError 5 only.
+
+        Newly copied directory trees (test fixtures and installer staging
+        alike) can be transiently held open by the Windows indexer or
+        antivirus after the creating process exits, making Path.replace
+        raise WinError 5 (ERROR_ACCESS_DENIED) for a short window. Retry
+        contract: 5 attempts, exponential backoff, total wait capped by the
+        budget (0.05s..0.4s). Only OSError subclasses whose ``winerror``
+        attribute equals 5 are retried; any other PermissionError, and any
+        other OSError, is re-raised immediately without sleeping. The
+        original exception is preserved as ``__cause__`` with
+        source/destination in the diagnostic message once the budget is
+        exhausted. Non-Windows behaviour is a plain replace.
+        """
+        if os.name != "nt":
+            source.replace(destination)
+            return
+        last_error: OSError | None = None
+        for attempt in range(5):
+            try:
+                source.replace(destination)
+                return
+            except PermissionError as error:
+                if getattr(error, "winerror", None) != 5:
+                    raise
+                last_error = error
+                if attempt < 4:
+                    time.sleep(0.05 * (2**attempt))
+            except OSError as error:
+                raise
+        raise OSError(
+            f"directory rename still blocked after 5 retries "
+            f"(WinError 5 sharing violation; source={source}, "
+            f"destination={destination}): {last_error}"
+        ) from last_error
+
     def stage_destination(self) -> None:
         if not (self.destination.exists() or path_is_redirected(self.destination)):
             return
@@ -1756,7 +1860,7 @@ class ZCodeInstallTransaction:
         backup = self.destination.parent / f".{self.destination.name}.tenetora-rollback-{stamp}"
         ensure_unredirected_directory(self.destination.parent, label="ZCode plugin cache parent")
         validate_unredirected_entry_path(backup, label="ZCode plugin rollback backup")
-        self.destination.replace(backup)
+        self._replace_path(self.destination, backup)
         self.destination_backup = backup
 
     def _transaction_root(self) -> Path:
@@ -1776,7 +1880,7 @@ class ZCodeInstallTransaction:
         staged = root / f"remove-{len(self.path_moves):04d}-{path.name}"
         validate_unredirected_path(path.parent, label="ZCode managed removal parent")
         validate_unredirected_entry_path(staged, label="ZCode removal backup")
-        path.replace(staged)
+        self._replace_path(path, staged)
         self.path_moves.append((path, staged, False))
 
     def stage_archive(self, path: Path, archive: Path) -> None:
@@ -1785,7 +1889,7 @@ class ZCodeInstallTransaction:
         validate_unredirected_path(path.parent, label="ZCode managed archive source parent")
         ensure_unredirected_directory(archive.parent, label="ZCode legacy archive parent")
         validate_unredirected_entry_path(archive, label="ZCode legacy archive")
-        path.replace(archive)
+        self._replace_path(path, archive)
         self.path_moves.append((path, archive, True))
 
     @staticmethod
@@ -1984,7 +2088,7 @@ def install_zcode_plugin(
         return None
     source = PACKAGE_ROOT
     report = InstallReport()
-    source_version = package_version(source) or "unknown"
+    source_version = package_adapter_version(source) or "unknown"
     plugin_base = ensure_safe_directory_chain(
         zcode_plugin_base(scope, project_root),
         label="ZCode plugin cache",
@@ -2541,6 +2645,23 @@ def native_plugin_cache_root(
     )
 
 
+def managed_native_plugin_cache_paths(target: str, project_root: Path) -> list[Path]:
+    """Find managed native caches without requiring the host CLI to be installed."""
+    paths: list[Path] = []
+    for root in (
+        native_plugin_cache_root(target, project_root),
+        legacy_native_plugin_cache_root(target, project_root),
+    ):
+        try:
+            entries = list(root.iterdir()) if root.is_dir() else []
+        except OSError as exc:
+            raise RuntimeError(f"cannot inspect {target} native plugin cache: {root}: {exc}") from exc
+        for candidate in entries:
+            if candidate.is_dir() and native_plugin_is_managed(target, candidate):
+                paths.append(candidate)
+    return paths
+
+
 def legacy_native_plugin_cache_root(target: str, project_root: Path) -> Path:
     return native_plugin_cache_root(
         target,
@@ -2602,7 +2723,7 @@ def _install_native_cli_plugin(
     if not native_plugin_cli_available(target, project_root):
         return None
     package_source = PACKAGE_ROOT
-    source_version = package_version(package_source) or "unknown"
+    source_version = package_adapter_version(package_source) or "unknown"
     source_issues = native_plugin_payload_issues(target, package_source, source=True)
     if source_issues:
         raise FileNotFoundError(f"source {target} plugin payload is incomplete: {'; '.join(source_issues)}")
@@ -2667,77 +2788,80 @@ def _install_native_cli_plugin(
         clean_legacy_native_skills(target, project_root, report, dry_run=True)
         return report
 
-    if refresh:
-        source = materialize_native_plugin_source(package_source, source_version, target)
-        if entry is not None:
-            remove_native_plugin(target, project_root)
-        refresh_native_marketplace(target, project_root, source)
-        add_native_plugin(target, project_root)
-        entry = native_plugin_entry(target, project_root)
-        install_path = native_plugin_install_path(target, entry, project_root) if entry else None
-    if entry is None or install_path is None or not install_path.exists():
-        raise RuntimeError(f"{target} plugin installation did not register {NATIVE_PLUGIN_ID}")
-    final_issues = native_plugin_payload_issues(target, install_path)
-    if final_issues:
-        raise RuntimeError(f"installed {target} plugin is incomplete: {'; '.join(final_issues)}")
-    final_enabled = bool(entry.get("enabled", True))
-    if not final_enabled:
-        raise RuntimeError(f"installed {target} plugin is disabled")
-    if managed_legacy is not None:
-        remove_native_plugin(target, project_root, LEGACY_NATIVE_PLUGIN_ID)
-        if legacy_native_plugin_entry(target, project_root) is not None:
-            raise RuntimeError(
-                f"legacy managed plugin {LEGACY_NATIVE_PLUGIN_ID} remains registered after installing {NATIVE_PLUGIN_ID}"
+    with preserve_active_native_plugin_cache(target, project_root, install_path, source_version) as preserved_paths:
+        if refresh:
+            source = materialize_native_plugin_source(package_source, source_version, target)
+            if entry is not None:
+                remove_native_plugin(target, project_root)
+            refresh_native_marketplace(target, project_root, source)
+            add_native_plugin(target, project_root)
+            entry = native_plugin_entry(target, project_root)
+            install_path = native_plugin_install_path(target, entry, project_root) if entry else None
+        if entry is None or install_path is None or not install_path.exists():
+            raise RuntimeError(f"{target} plugin installation did not register {NATIVE_PLUGIN_ID}")
+        final_issues = native_plugin_payload_issues(target, install_path)
+        if final_issues:
+            raise RuntimeError(f"installed {target} plugin is incomplete: {'; '.join(final_issues)}")
+        final_enabled = bool(entry.get("enabled", True))
+        if not final_enabled:
+            raise RuntimeError(f"installed {target} plugin is disabled")
+        if managed_legacy is not None:
+            remove_native_plugin(target, project_root, LEGACY_NATIVE_PLUGIN_ID)
+            if legacy_native_plugin_entry(target, project_root) is not None:
+                raise RuntimeError(
+                    f"legacy managed plugin {LEGACY_NATIVE_PLUGIN_ID} remains registered after installing {NATIVE_PLUGIN_ID}"
+                )
+            remove_native_marketplace(target, project_root, LEGACY_NATIVE_MARKETPLACE_ID)
+            report.lines.append(
+                status_line(
+                    "MIGRATE",
+                    target,
+                    scope,
+                    "plugin",
+                    f"replaced legacy registration {LEGACY_NATIVE_PLUGIN_ID} with {NATIVE_PLUGIN_ID}",
+                )
             )
-        remove_native_marketplace(target, project_root, LEGACY_NATIVE_MARKETPLACE_ID)
-        report.lines.append(
-            status_line(
-                "MIGRATE",
-                target,
-                scope,
-                "plugin",
-                f"replaced legacy registration {LEGACY_NATIVE_PLUGIN_ID} with {NATIVE_PLUGIN_ID}",
-            )
-        )
 
-    if refresh:
-        report.lines.append(
-            status_line(
-                "UPDATED" if had_install else "INSTALLED",
-                target,
-                scope,
-                "plugin",
-                f"installed {NATIVE_PLUGIN_ID} version {entry.get('version')}; hooks present; activation enabled",
+        if refresh:
+            report.lines.append(
+                status_line(
+                    "UPDATED" if had_install else "INSTALLED",
+                    target,
+                    scope,
+                    "plugin",
+                    f"installed {NATIVE_PLUGIN_ID} version {entry.get('version')}; hooks present; activation enabled",
+                )
             )
-        )
-        report.updated += int(had_install)
-        report.installed += int(not had_install)
-    else:
-        report.lines.append(
-            status_line(
-                "CURRENT",
-                target,
-                scope,
-                "plugin",
-                f"native plugin {install_path} version {installed_version}; hooks present; activation enabled",
+            report.updated += int(had_install)
+            report.installed += int(not had_install)
+        else:
+            report.lines.append(
+                status_line(
+                    "CURRENT",
+                    target,
+                    scope,
+                    "plugin",
+                    f"native plugin {install_path} version {installed_version}; hooks present; activation enabled",
+                )
             )
+            report.current += 1
+        report.plugins += 1
+        clean_superseded_plugin_caches(
+            target,
+            native_plugin_cache_root(target, project_root),
+            install_path,
+            report,
+            dry_run=False,
+            preserve_paths=preserved_paths,
         )
-        report.current += 1
-    report.plugins += 1
-    clean_superseded_plugin_caches(
-        target,
-        native_plugin_cache_root(target, project_root),
-        install_path,
-        report,
-        dry_run=False,
-    )
-    clean_superseded_plugin_caches(
-        target,
-        legacy_native_plugin_cache_root(target, project_root),
-        install_path,
-        report,
-        dry_run=False,
-    )
+        clean_superseded_plugin_caches(
+            target,
+            legacy_native_plugin_cache_root(target, project_root),
+            install_path,
+            report,
+            dry_run=False,
+            preserve_paths=preserved_paths,
+        )
     clean_legacy_native_skills(target, project_root, report, dry_run=False)
     if target == "codex":
         trust = codex_hook_trust(project_root)
@@ -3799,7 +3923,7 @@ def status_native_cli_plugin(target: str, scope: str, project_root: Path) -> Ins
     if not native_plugin_cli_available(target, project_root):
         return None
     report = InstallReport()
-    source_version = package_version(PACKAGE_ROOT) or "unknown"
+    source_version = package_adapter_version(PACKAGE_ROOT) or "unknown"
     inspection_error: str | None = None
     try:
         entry = native_plugin_entry(target, project_root)
@@ -3922,7 +4046,7 @@ def status_one(target: str, scope: str, project_root: Path) -> InstallReport:
         return native_report
     if tool_definition(target).installer == "zcode-native" and scope == "global" and PACKAGE_ROOT is not None:
         report = InstallReport()
-        source_version = package_version(PACKAGE_ROOT) or "unknown"
+        source_version = package_adapter_version(PACKAGE_ROOT) or "unknown"
         registration = zcode_registration(project_root)
         legacy_registration = legacy_zcode_registration(project_root)
         if legacy_registration is not None and zcode_entry_is_managed(legacy_registration):
@@ -4515,7 +4639,7 @@ def codex_hook_trust(project_root: Path) -> dict[str, object]:
             project_root,
             native_plugin_environment("codex", project_root),
             NATIVE_PLUGIN_ID,
-            client_version=package_version(PACKAGE_ROOT) or "unknown",
+            client_version=package_adapter_version(PACKAGE_ROOT) or "unknown",
         )
     except Exception as exc:
         return {"state": "unavailable", "detail": str(exc)}
@@ -4542,7 +4666,7 @@ def codex_hook_inventory(project_root: Path) -> dict[str, object]:
             command,
             project_root,
             native_plugin_environment("codex", project_root),
-            client_version=package_version(PACKAGE_ROOT) or "unknown",
+            client_version=package_adapter_version(PACKAGE_ROOT) or "unknown",
         )
     except Exception as exc:
         return {"state": "unavailable", "hooks": [], "detail": str(exc)}
@@ -5137,6 +5261,26 @@ def native_preflight(
         return
     command = native_plugin_command(target)
     if command is None:
+        try:
+            managed_caches = managed_native_plugin_cache_paths(target, project_root)
+        except RuntimeError as exc:
+            check.plugin_api = "unavailable-existing-state-unreadable"
+            check.planned = CAPABILITY_BLOCKED
+            check.degraded_reason = "native-cli-unavailable-existing-state-unreadable"
+            check.blocker = str(exc)
+            check.remediation = f"Restore {target}, repair its plugin cache, then rerun tenetora upgrade --force"
+            return
+        if managed_caches:
+            check.plugin_api = "unavailable-existing"
+            check.marketplace = "managed-cache-present"
+            check.planned = CAPABILITY_BLOCKED
+            check.degraded_reason = "native-cli-unavailable-existing-managed-plugin"
+            check.blocker = (
+                f"{target} CLI is unavailable while a managed native plugin cache exists; "
+                "the existing runtime cannot be converged safely"
+            )
+            check.remediation = f"Install or restore {target}, then rerun tenetora upgrade --force"
+            return
         check.plugin_api = "unavailable"
         check.planned = CAPABILITY_SKILLS_ONLY
         check.degraded_reason = "native-cli-unavailable"
@@ -5234,6 +5378,10 @@ def build_preflight(
                 existing_version=installed_skill_version(target, scope, project_root),
                 maximum=maximum_capability(target),
                 planned=maximum_capability(target),
+                # Start with the lifecycle release id.  After planning the
+                # surface, native global integrations are upgraded to the
+                # adapter id; project/fallback skill surfaces stay on the
+                # release id even when the tool also has a native plugin.
                 expected_version=package_version_value,
             )
             runtime_plan = runtime_plans.get(target)
@@ -5290,6 +5438,7 @@ def build_preflight(
                     registration = zcode_registration(project_root)
                     if registration and registration.get("version"):
                         check.existing_version = str(registration["version"])
+            check.expected_version = expected_surface_version(check, check.planned)
             checks.append(check)
     return CapabilityReport(
         phase="preflight",
@@ -5310,9 +5459,10 @@ def installed_surface_version(
     check: CapabilityCheck,
     project_root: Path,
 ) -> tuple[str | None, str, bool | None, list[str]]:
-    expected = check.expected_version
     target = check.tool
     scope = check.scope
+    expected = expected_surface_version(check, check.actual)
+    check.expected_version = expected
 
     if (
         target in NATIVE_PLUGIN_TARGETS
@@ -5373,6 +5523,32 @@ def installed_surface_version(
         source = "lifecycle-skill+runtime-adapter"
         evidence.append(f"runtime={check.actual}")
     return actual, source, matches, evidence
+
+
+def expected_surface_version(check: CapabilityCheck, status: str | None) -> str | None:
+    """Select the package identity for the surface actually being verified.
+
+    Preview releases intentionally carry two identities: lifecycle skills keep
+    the release id (for example ``0.3.40.001-preview``), while native plugins
+    use the SemVer-compatible adapter id (``0.3.40-preview.1``).  A project
+    scope, or a global skills-only fallback, must never be compared with the
+    native adapter id merely because the tool also has a native integration.
+    """
+
+    release = package_version(PACKAGE_ROOT) if PACKAGE_ROOT is not None else check.expected_version
+    if status not in {CAPABILITY_ACTIVE, CAPABILITY_PENDING_TRUST}:
+        return release
+    target = check.tool
+    native_surface = target == "zcode" and check.scope == "global"
+    native_surface = native_surface or (
+        target in NATIVE_PLUGIN_TARGETS
+        and check.scope == "global"
+        and check.marketplace != "unreadable"
+        and not (target == "codex" and check.hook_mode == "project-fallback")
+    )
+    if native_surface and PACKAGE_ROOT is not None:
+        return package_adapter_version(PACKAGE_ROOT) or release
+    return release
 
 
 def actual_capability(check: CapabilityCheck, project_root: Path) -> str:

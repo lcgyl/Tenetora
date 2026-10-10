@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -28,14 +29,22 @@ from path_security import is_redirected_path, validate_existing_project_path
 
 
 DEFAULT_MANIFEST_URL = (
-    "https://github.com/lcgyl/Tenetora/releases/latest/download/manifest.json"
+    "https://r2.lcgylupup.workers.dev/stable/0.3.40/manifest.json"
 )
 DEFAULT_ZIP_URL = (
-    "https://github.com/lcgyl/Tenetora/releases/latest/download/tenetora-latest.zip"
+    "https://r2.lcgylupup.workers.dev/stable/0.3.40/tenetora-0.3.40.zip"
+)
+PREVIEW_MANIFEST_URL = (
+    "https://r2.lcgylupup.workers.dev/preview/0.3.40.009-preview/manifest.json"
+)
+PREVIEW_ZIP_URL = (
+    "https://r2.lcgylupup.workers.dev/preview/0.3.40.009-preview/tenetora-0.3.40.009-preview.zip"
 )
 RELEASE_MIRROR_ENV = "TENETORA_RELEASE_MIRROR"
 RELEASE_MANIFEST_ENV = "TENETORA_RELEASE_MANIFEST_URL"
 RELEASE_ZIP_ENV = "TENETORA_RELEASE_ZIP_URL"
+RELEASE_INDEX_BASE_ENV = "TENETORA_RELEASE_INDEX_BASE"
+DEFAULT_RELEASE_INDEX_BASE = "https://r2.lcgylupup.workers.dev"
 MAX_RELEASE_URL_LENGTH = 4096
 MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
@@ -85,6 +94,7 @@ def resolve_release_urls(
     zip_url: str | None = None,
     mirror_url: str | None = None,
     environ: Mapping[str, str] | None = None,
+    channel: str = "stable",
 ) -> tuple[str, str]:
     """Resolve one release source without persisting its URL or credentials.
 
@@ -94,6 +104,9 @@ def resolve_release_urls(
     """
 
     environment = os.environ if environ is None else environ
+    if channel not in {"stable", "preview"}:
+        raise UpgradeAcquireError("release channel must be stable or preview")
+    alias_name = "tenetora-preview.zip" if channel == "preview" else "tenetora-latest.zip"
     explicit_values = (manifest_url, zip_url, mirror_url)
     if any(value is not None for value in explicit_values):
         if mirror_url is not None and (manifest_url is not None or zip_url is not None):
@@ -103,7 +116,7 @@ def resolve_release_urls(
             base = base.rstrip("/") + "/"
             return (
                 urllib.parse.urljoin(base, "manifest.json"),
-                urllib.parse.urljoin(base, "tenetora-latest.zip"),
+                urllib.parse.urljoin(base, alias_name),
             )
         if manifest_url is None or zip_url is None:
             raise UpgradeAcquireError("release manifest and ZIP URLs must be supplied together")
@@ -134,8 +147,10 @@ def resolve_release_urls(
         base = base.rstrip("/") + "/"
         return (
             urllib.parse.urljoin(base, "manifest.json"),
-            urllib.parse.urljoin(base, "tenetora-latest.zip"),
+            urllib.parse.urljoin(base, alias_name),
         )
+    if channel == "preview":
+        return PREVIEW_MANIFEST_URL, PREVIEW_ZIP_URL
     return DEFAULT_MANIFEST_URL, DEFAULT_ZIP_URL
 
 
@@ -145,8 +160,74 @@ def release_source_configured(environ: Mapping[str, str] | None = None) -> bool:
     environment = os.environ if environ is None else environ
     return any(
         _configured_value(environment, name) is not None
-        for name in (RELEASE_MIRROR_ENV, RELEASE_MANIFEST_ENV, RELEASE_ZIP_ENV)
+        for name in (RELEASE_MIRROR_ENV, RELEASE_MANIFEST_ENV, RELEASE_ZIP_ENV, RELEASE_INDEX_BASE_ENV)
     )
+
+
+def _release_pointer_urls(
+    workdir: Path,
+    *,
+    channel: str,
+    manifest_url: str | None,
+    zip_url: str | None,
+    mirror_url: str | None,
+) -> tuple[str, str, dict[str, Any] | None]:
+    environment = os.environ
+    base = _configured_value(environment, RELEASE_INDEX_BASE_ENV)
+    if base is not None and any(value is not None for value in (manifest_url, zip_url, mirror_url)):
+        raise UpgradeAcquireError("release index base cannot be combined with another release source")
+    if base is None and not _configured_value(environment, "TENETORA_LEGACY_RELEASE_SOURCE") and not any(value is not None for value in (manifest_url, zip_url, mirror_url)) and not any(
+        _configured_value(environment, name)
+        for name in (RELEASE_MIRROR_ENV, RELEASE_MANIFEST_ENV, RELEASE_ZIP_ENV)
+    ):
+        base = DEFAULT_RELEASE_INDEX_BASE
+    if base is None:
+        first, second = resolve_release_urls(
+            manifest_url=manifest_url, zip_url=zip_url, mirror_url=mirror_url, channel=channel
+        )
+        return first, second, None
+    if any(_configured_value(environment, name) for name in (RELEASE_MIRROR_ENV, RELEASE_MANIFEST_ENV, RELEASE_ZIP_ENV)):
+        raise UpgradeAcquireError("release index base conflicts with another release source")
+    base = _validate_release_url(base, label="release index base URL").rstrip("/") + "/"
+    pointer_path = workdir / "release-pointer.json"
+    if not pointer_path.is_file():
+        _download(urllib.parse.urljoin(base, f"{channel}/latest.json"), pointer_path, 4096)
+    try:
+        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise UpgradeAcquireError("release pointer is invalid") from exc
+    if not isinstance(pointer, dict) or pointer.get("schema") != 1 or pointer.get("channel") != channel:
+        raise UpgradeAcquireError("release pointer channel or schema is invalid")
+    version = pointer.get("version")
+    version_pattern = r"\d+\.\d+\.\d+\.\d{3}-preview" if channel == "preview" else r"\d+\.\d+\.\d+"
+    if not isinstance(version, str) or not re.fullmatch(version_pattern, version):
+        raise UpgradeAcquireError("release pointer version is invalid")
+    prefix = f"{channel}/{version}"
+    if (
+        pointer.get("zip_key") != f"{prefix}/tenetora-{version}.zip"
+        or pointer.get("manifest_key") != f"{prefix}/manifest.json"
+        or not isinstance(pointer.get("sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", pointer["sha256"])
+    ):
+        raise UpgradeAcquireError("release pointer object identity is invalid")
+    return (
+        urllib.parse.urljoin(base, pointer["manifest_key"]),
+        urllib.parse.urljoin(base, pointer["zip_key"]),
+        pointer,
+    )
+
+
+def _match_release_pointer(manifest: dict[str, Any], pointer: dict[str, Any] | None) -> None:
+    if pointer is not None and any(
+        manifest.get(field) != expected
+        for field, expected in (
+            ("version", pointer["version"]),
+            ("channel", pointer["channel"]),
+            ("artifact", f"tenetora-{pointer['version']}.zip"),
+            ("sha256", pointer["sha256"]),
+        )
+    ):
+        raise UpgradeAcquireError("release manifest does not match the channel pointer")
 
 
 def file_sha256(path: Path) -> str:
@@ -324,6 +405,7 @@ def inspect_release_manifest(
     mirror_url: str | None = None,
     zip_file: Path | None = None,
     expected_sha256: str = "",
+    channel: str = "stable",
 ) -> tuple[dict[str, Any], str]:
     """Authenticate enough release metadata to decide whether a download is needed.
 
@@ -341,14 +423,18 @@ def inspect_release_manifest(
         source_dir=None,
     )
     if zip_file is None:
-        manifest_url, _zip_url = resolve_release_urls(
+        manifest_url, _zip_url, pointer = _release_pointer_urls(
+            workdir,
             manifest_url=manifest_url,
             zip_url=zip_url,
             mirror_url=mirror_url,
+            channel=channel,
         )
         manifest_path = workdir / "manifest.json"
         _download(manifest_url, manifest_path, MAX_MANIFEST_BYTES)
-        return read_manifest(manifest_path, require_artifact=True), "release"
+        manifest = read_manifest(manifest_path, require_artifact=True)
+        _match_release_pointer(manifest, pointer)
+        return manifest, "release"
 
     source_path = zip_file.expanduser().resolve(strict=True)
     try:
@@ -457,6 +543,7 @@ def acquire_release(
     expected_sha256: str = "",
     source_dir: Path | None = None,
     prevalidated_manifest: dict[str, Any] | None = None,
+    channel: str = "stable",
 ) -> tuple[Path, dict[str, Any], str]:
     workdir.mkdir(parents=True, exist_ok=True)
     _validate_acquisition_options(
@@ -529,10 +616,12 @@ def acquire_release(
     archive = workdir / "tenetora.zip"
     external: dict[str, Any] | None = None
     if zip_file is None:
-        manifest_url, zip_url = resolve_release_urls(
+        manifest_url, zip_url, pointer = _release_pointer_urls(
+            workdir,
             manifest_url=manifest_url,
             zip_url=zip_url,
             mirror_url=mirror_url,
+            channel=channel,
         )
         if prevalidated_manifest is None:
             manifest_path = workdir / "manifest.json"
@@ -540,6 +629,7 @@ def acquire_release(
             external = read_manifest(manifest_path, require_artifact=True)
         else:
             external = normalize_manifest(prevalidated_manifest, require_artifact=True)
+        _match_release_pointer(external, pointer)
         _download(zip_url, archive, MAX_ARCHIVE_BYTES)
         expected = str(external["sha256"])
         source = "release"
@@ -560,7 +650,7 @@ def acquire_release(
         for field in (
             "name", "version", "commit", "format", "installer_protocol", "bridge_protocol",
             "minimum_bridge_version", "upgrade_entrypoint", "state_schemas", "zip_root", "files",
-            "file_sha256",
+            "file_sha256", "channel", "stable_version", "preview_sequence", "adapter_version",
         ):
             if external.get(field) != embedded.get(field):
                 raise UpgradeAcquireError("external and embedded release manifests disagree")

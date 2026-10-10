@@ -26,6 +26,8 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from install_progress import redact, write_failure_artifacts  # noqa: E402
+from installation_registry import RegistryError, registered_projects  # noqa: E402
+from governance_paths import pending_defaults_review  # noqa: E402
 
 
 def use_chinese() -> bool:
@@ -169,7 +171,13 @@ from upgrade_acquire import (  # noqa: E402
     inspect_release_manifest,
     release_source_configured,
 )
-from upgrade_contract import UpgradeContractError, ensure_source_supported, release_contract_fields, version_key  # noqa: E402
+from upgrade_contract import (  # noqa: E402
+    UpgradeContractError,
+    ensure_source_supported,
+    normalize_manifest,
+    release_contract_fields,
+    version_key,
+)
 from tenetora.update_hint import UpdateHintError, record_failure, record_success  # noqa: E402
 from upgrade_transaction import (  # noqa: E402
     UpgradeTransactionError,
@@ -1069,6 +1077,8 @@ def worker_arguments(args: argparse.Namespace, action: str) -> list[str]:
         args.progress,
         "--bridge-source-version",
         str(args.bridge_source_version or __version__),
+        "--channel",
+        getattr(args, "channel", "stable"),
     ]
     scope = selected_scope(args)
     if scope:
@@ -1132,6 +1142,7 @@ def render_apply_result(
     result: subprocess.CompletedProcess[str],
     manifest: dict[str, object],
     source_kind: str,
+    args: argparse.Namespace,
     *,
     dry_run: bool = False,
 ) -> dict[str, object]:
@@ -1140,13 +1151,13 @@ def render_apply_result(
         transaction = load_transaction(machine_home())
     except UpgradeTransactionError:
         transaction = None
-    return {
+    payload: dict[str, object] = {
         "status": "dry-run" if dry_run and result.returncode == 0 else ("completed" if result.returncode == 0 else "failed"),
         "action": "upgrade",
         "exit_code": result.returncode,
         "release": {
             key: manifest.get(key)
-            for key in ("version", "commit", "bridge_protocol", "installer_protocol", "artifact", "sha256")
+            for key in ("version", "channel", "stable_version", "preview_sequence", "adapter_version", "commit", "bridge_protocol", "installer_protocol", "artifact", "sha256")
             if manifest.get(key) is not None
         },
         "acquisition": source_kind,
@@ -1156,6 +1167,73 @@ def render_apply_result(
         } if transaction is not None else None,
         "error_code": "" if result.returncode == 0 else "upgrade-worker-failed",
     }
+    advisories = project_update_advisories(manifest, args)
+    if advisories:
+        payload["project_update"] = advisories[0]
+        payload["project_updates"] = advisories
+    return payload
+
+
+def project_update_advisory(
+    release_manifest: dict[str, object],
+    project_root: Path,
+) -> dict[str, object] | None:
+    """Describe a model-owned project refresh without mutating `.tenetora`."""
+
+    target = release_manifest.get("project_defaults_version")
+    if type(target) is not int or target < 1:
+        return None
+    project_root = Path(project_root).expanduser().absolute()
+    governance = project_root / ".tenetora"
+    if not governance.is_dir():
+        return None
+    path = governance / "manifest.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        payload = {}
+    current = payload.get("defaults_version") if isinstance(payload, dict) else None
+    if type(current) is int and current >= target:
+        return None
+    review = pending_defaults_review(payload, target)
+    return {
+        "status": "audit-pending" if review else "recommended",
+        "reason": "project-defaults-review-audit-pending" if review else "project-defaults-behind-runtime",
+        "project_defaults_version": current if type(current) is int else None,
+        "runtime_defaults_version": target,
+        "model_action": "tenetora audit --strict --path ." if review else "use tenetora-update 更新 .tenetora",
+        "automatic": False,
+        "project_path": str(project_root),
+    }
+
+
+def project_update_advisories(
+    release_manifest: dict[str, object],
+    args: argparse.Namespace,
+) -> list[dict[str, object]]:
+    """Inspect the explicit project plus every registered project.
+
+    Machine-wide upgrades are commonly launched from a user home directory.
+    Looking only at ``args.path`` would miss governed projects updated through
+    the installation registry, especially on skills-only hosts without a
+    SessionStart hook.  Registry inspection is read-only and advisory-only.
+    """
+    candidates = [Path(getattr(args, "path", Path.cwd()))]
+    try:
+        candidates.extend(registered_projects(machine_home()))
+    except (RegistryError, OSError, RuntimeError):
+        pass
+    seen: set[str] = set()
+    advisories: list[dict[str, object]] = []
+    for candidate in candidates:
+        normalized = str(candidate.expanduser().absolute())
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        advisory = project_update_advisory(release_manifest, Path(normalized))
+        if advisory is not None:
+            advisories.append(advisory)
+    return advisories
 
 
 def render_blocked_result(
@@ -1170,7 +1248,7 @@ def render_blocked_result(
         "exit_code": exit_code,
         "release": {
             key: manifest.get(key)
-            for key in ("version", "commit", "bridge_protocol", "installer_protocol", "artifact", "sha256")
+            for key in ("version", "channel", "stable_version", "preview_sequence", "adapter_version", "commit", "bridge_protocol", "installer_protocol", "artifact", "sha256")
             if manifest is not None and manifest.get(key) is not None
         },
         "acquisition": source_kind or "unavailable",
@@ -1231,6 +1309,27 @@ def render_terminal_apply_summary(
         scope_label,
         f"处理工具：{args.tools}" if use_chinese() else f"Tools: {args.tools}",
     ]
+    advisories = project_update_advisories(manifest or {}, args) if exit_code == 0 else []
+    if advisories:
+        lines.append(
+            f"项目治理更新：发现 {len(advisories)} 个项目待处理（语义审查或审计验收）；升级不会自动覆盖项目规则。"
+            if use_chinese()
+            else f"Project governance update: {len(advisories)} project(s) require semantic review or audit acceptance; the upgrade does not overwrite project rules automatically."
+        )
+        for advisory in advisories:
+            path = advisory["project_path"]
+            if advisory["status"] == "audit-pending":
+                lines.append(
+                    f"- {path}：已完成默认规则语义审查，待审计验收。请在该项目执行 `tenetora audit --strict --path .`；解决审计问题后重新执行 `tenetora review --confirm-defaults-reviewed --path .`。"
+                    if use_chinese()
+                    else f"- {path}: semantic defaults review recorded; audit pending. Run `tenetora audit --strict --path .` in this project; resolve audit issues, then rerun `tenetora review --confirm-defaults-reviewed --path .`."
+                )
+                continue
+            lines.append(
+                f"- {path}：请在该项目对话中执行 `use tenetora-update 更新 .tenetora`。"
+                if use_chinese()
+                else f"- {path}: run `use tenetora-update update .tenetora` in that project's conversation."
+            )
     if failure_stage is not None and exit_code != 0:
         label = stage_labels.get(failure_stage, failure_stage)
         lines.append(f"失败阶段：{label}" if use_chinese() else f"Failed stage: {label}")
@@ -1283,7 +1382,7 @@ def render_current_result(
     source_kind: str,
     args: argparse.Namespace,
 ) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "status": "current",
         "action": "upgrade",
         "exit_code": 0,
@@ -1292,7 +1391,7 @@ def render_current_result(
         "reason": "already-latest",
         "release": {
             key: manifest.get(key)
-            for key in ("version", "commit", "bridge_protocol", "installer_protocol", "artifact", "sha256")
+            for key in ("version", "channel", "stable_version", "preview_sequence", "adapter_version", "commit", "bridge_protocol", "installer_protocol", "artifact", "sha256")
             if manifest.get(key) is not None
         },
         "acquisition": source_kind,
@@ -1300,6 +1399,11 @@ def render_current_result(
         "tools": args.tools,
         "transaction": None,
     }
+    advisories = project_update_advisories(manifest, args)
+    if advisories:
+        payload["project_update"] = advisories[0]
+        payload["project_updates"] = advisories
+    return payload
 
 
 def render_terminal_current_summary(
@@ -1309,8 +1413,7 @@ def render_terminal_current_summary(
 ) -> str:
     version = str(manifest.get("version") or "unknown")
     if use_chinese():
-        return "\n".join(
-            (
+        lines = [
                 "升级结果：已是最新版本",
                 f"当前版本：{version}",
                 f"目标版本：{version}",
@@ -1318,11 +1421,10 @@ def render_terminal_current_summary(
                 f"升级范围：{selected_scope(args) or 'existing'}",
                 f"处理工具：{args.tools}",
                 "未下载 ZIP，未执行安装。若需修复安装面，请使用 tenetora upgrade --force。",
-                "下一步：tenetora doctor",
-            )
-        )
-    return "\n".join(
-        (
+        ]
+        lines.append("下一步：tenetora doctor")
+        return "\n".join(lines)
+    lines = [
             "Upgrade result: already latest",
             f"Current version: {version}",
             f"Target version: {version}",
@@ -1330,19 +1432,48 @@ def render_terminal_current_summary(
             f"Upgrade scope: {selected_scope(args) or 'existing'}",
             f"Tools: {args.tools}",
             "ZIP download and installation were skipped. Use tenetora upgrade --force to repair installation surfaces.",
-            "Next: tenetora doctor",
-        )
-    )
+    ]
+    lines.append("Next: tenetora doctor")
+    return "\n".join(lines)
 
 
 def ensure_release_direction(manifest: dict[str, object]) -> bool:
     """Return whether the release is newer and reject accidental downgrades."""
 
     target = version_key(str(manifest.get("version") or ""))
-    current = version_key(__version__)
+    current_version = __version__
+    current_manifest = machine_home() / "current" / "manifest.json"
+    if current_manifest.is_file():
+        try:
+            payload = json.loads(current_manifest.read_text(encoding="utf-8"))
+            normalized = normalize_manifest(payload, require_artifact=False)
+            current_version = str(normalized.get("version") or current_version)
+        except (OSError, UnicodeError, json.JSONDecodeError, UpgradeContractError):
+            pass
+    current = version_key(current_version)
     if target < current:
         raise UpgradeContractError("release version is older than the installed version")
     return target > current
+
+
+def manifest_channel(manifest: dict[str, object]) -> str:
+    return str(manifest.get("channel") or "stable")
+
+
+def installed_release_channel() -> str:
+    current_manifest = machine_home() / "current" / "manifest.json"
+    if current_manifest.is_file():
+        try:
+            payload = json.loads(current_manifest.read_text(encoding="utf-8"))
+            return manifest_channel(normalize_manifest(payload, require_artifact=False))
+        except (OSError, UnicodeError, json.JSONDecodeError, UpgradeContractError):
+            pass
+    return "preview" if str(__version__).endswith("-preview") else "stable"
+
+
+def ensure_requested_channel(manifest: dict[str, object], channel: str) -> None:
+    if manifest_channel(manifest) != channel:
+        raise UpgradeContractError("release manifest channel does not match the requested channel")
 
 
 def cache_update_hint(manifest: dict[str, object], source_kind: str) -> None:
@@ -1356,7 +1487,7 @@ def cache_update_hint(manifest: dict[str, object], source_kind: str) -> None:
             current_version=__version__,
             manifest=manifest,
         )
-    except UpdateHintError:
+    except (OSError, UpdateHintError):
         # Update hints are advisory. A read-only or damaged state directory
         # must never turn an otherwise valid upgrade check into a failure.
         return
@@ -1369,7 +1500,7 @@ def cache_update_failure(source_override: Path | None, zip_file: Path | None) ->
         return
     try:
         record_failure(machine_home(), current_version=__version__)
-    except UpdateHintError:
+    except (OSError, UpdateHintError):
         return
 
 
@@ -1383,6 +1514,7 @@ def run_release_controller(args: argparse.Namespace) -> int:
         source_override is None
         and args.zip_file is None
         and not args.explicit_remote_source
+        and args.channel == "stable"
         and not release_source_configured()
     ):
         source_override = developer_checkout()
@@ -1411,9 +1543,11 @@ def run_release_controller(args: argparse.Namespace) -> int:
                         mirror_url=args.mirror_url,
                         zip_file=args.zip_file,
                         expected_sha256=args.sha256,
+                        channel=args.channel,
                     )
                 observed_manifest = prevalidated_manifest
                 observed_source_kind = prevalidated_source_kind or ""
+                ensure_requested_channel(prevalidated_manifest, args.channel)
                 if not ensure_release_direction(prevalidated_manifest):
                     cache_update_hint(prevalidated_manifest, prevalidated_source_kind)
                     if args.json:
@@ -1429,12 +1563,14 @@ def run_release_controller(args: argparse.Namespace) -> int:
                 "zip_file": args.zip_file,
                 "expected_sha256": args.sha256,
                 "source_dir": source_override,
+                "channel": args.channel,
             }
             if prevalidated_manifest is not None and prevalidated_source_kind == "release":
                 acquire_kwargs["prevalidated_manifest"] = prevalidated_manifest
             source_root, manifest, source_kind = acquire_release(workdir, **acquire_kwargs)
             observed_manifest = manifest
             observed_source_kind = source_kind
+            ensure_requested_channel(manifest, args.channel)
             ensure_release_direction(manifest)
             cache_update_hint(manifest, source_kind)
             if not args.bootstrap_bridge:
@@ -1453,7 +1589,7 @@ def run_release_controller(args: argparse.Namespace) -> int:
                         payload["release"] = {
                             key: manifest.get(key)
                             for key in (
-                                "version", "commit", "bridge_protocol", "minimum_bridge_version",
+                                "version", "channel", "stable_version", "preview_sequence", "adapter_version", "commit", "bridge_protocol", "minimum_bridge_version",
                                 "installer_protocol", "artifact", "sha256",
                             )
                             if manifest.get(key) is not None
@@ -1565,7 +1701,7 @@ def run_release_controller(args: argparse.Namespace) -> int:
             if args.dry_run:
                 result = invoke_worker(source_root, args, "apply", capture=args.json)
                 if args.json:
-                    print(render_json(render_apply_result(result, manifest, source_kind, dry_run=True)))
+                    print(render_json(render_apply_result(result, manifest, source_kind, args, dry_run=True)))
                 else:
                     print(
                         render_terminal_apply_summary(
@@ -1598,7 +1734,7 @@ def run_release_controller(args: argparse.Namespace) -> int:
                     )
                 result = invoke_worker(release_root, args, "apply", capture=args.json)
                 if args.json:
-                    print(render_json(render_apply_result(result, manifest, source_kind)))
+                    print(render_json(render_apply_result(result, manifest, source_kind, args)))
                 else:
                     print(
                         render_terminal_apply_summary(
@@ -1616,7 +1752,21 @@ def run_release_controller(args: argparse.Namespace) -> int:
         if args.json:
             print(render_json(render_blocked_result(observed_manifest, observed_source_kind, "acquisition-or-contract-failed")))
         else:
-            print(f"升级被阻断：{issue_text(exc)}" if use_chinese() else f"Upgrade blocked: {exc}", file=sys.stderr)
+            if (
+                args.channel == "preview"
+                and observed_manifest is None
+                and source_override is None
+                and args.zip_file is None
+                and not args.explicit_remote_source
+            ):
+                message = (
+                    "当前没有发行中的预览版；未对现有安装做任何更改。"
+                    if use_chinese()
+                    else "No preview release is currently active; the existing installation was not changed."
+                )
+            else:
+                message = f"升级被阻断：{issue_text(exc)}" if use_chinese() else f"Upgrade blocked: {exc}"
+            print(message, file=sys.stderr)
             print(
                 render_terminal_apply_summary(
                     observed_manifest,
@@ -1724,6 +1874,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--zip-file", type=Path, default=None, help="离线 release ZIP；需要 --sha256 或同名 sidecar" if use_chinese() else "Offline release ZIP; requires --sha256 or a sibling sidecar")
     parser.add_argument("--sha256", default="", help="--zip-file 的预期 SHA256" if use_chinese() else "Expected SHA256 for --zip-file")
     parser.add_argument("--source-dir", type=Path, default=None, help="仅开发使用的 release 源目录" if use_chinese() else "Developer-only release source directory")
+    parser.add_argument(
+        "--channel",
+        choices=("stable", "preview"),
+        default=None,
+        help="选择 stable 或 preview；默认沿用当前安装渠道。" if use_chinese() else "Select stable or preview; defaults to the installed channel.",
+    )
     parser.add_argument("--log-file", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--events-jsonl", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
@@ -1733,6 +1889,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-j", "--json", action="store_true", help="输出机器可读 JSON" if use_chinese() else "Print machine-readable JSON")
     add_scope_flags(parser)
     args = parser.parse_args(effective_argv)
+    args.channel_explicit = args.channel is not None
+    args.channel = args.channel or installed_release_channel()
     args.compat_apply = "--apply" in effective_argv
     args.explicit_remote_source = any(
         token in {"--manifest-url", "--zip-url", "--mirror-url"}

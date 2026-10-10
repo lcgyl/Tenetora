@@ -23,6 +23,7 @@ from harness_io import atomic_write_text  # noqa: E402
 from worktree_fingerprint import (  # noqa: E402
     WORKTREE_FINGERPRINT_VERSION,
     git_state_fingerprint,
+    git_repository_env,
     normalize_scopes,
     verification_scopes_intersect,
 )
@@ -37,13 +38,20 @@ REGISTRY_REL = ".tenetora/state/repository-units.json"
 REGISTRY_VERSION = 1
 
 
-def run_git(root: Path, *args: str, text: bool = True) -> subprocess.CompletedProcess[Any]:
+def run_git(root: Path, *args: str, text: bool = True, foreign_repository: bool = False) -> subprocess.CompletedProcess[Any]:
+    env = None
+    if foreign_repository:
+        # Git hooks export the parent repository's index and repository paths.
+        # Preserve them for parent checks (including alternate indexes), but
+        # never let them redirect an explicitly selected child repository.
+        env = git_repository_env()
     return subprocess.run(
         ["git", "-C", str(root), *args],
         text=text,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        env=env,
     )
 
 
@@ -217,6 +225,8 @@ def _registry_integrity_problems(
     governance_root: Path,
     git_root: Path,
     registry: dict[str, Any] | None,
+    *,
+    required_paths: set[str] | None = None,
 ) -> list[str]:
     if registry is None:
         return []
@@ -257,7 +267,7 @@ def _registry_integrity_problems(
             problems.append("repository-unit-module-invalid")
         if path not in indexed:
             problems.append("repository-unit-registration-orphan")
-    missing = set(indexed) - registered
+    missing = (set(indexed) if required_paths is None else required_paths) - registered
     if missing:
         problems.append("repository-unit-registration-missing")
     return sorted(set(problems))
@@ -447,7 +457,7 @@ def _child_state(parent: Path, path: str) -> tuple[Path, str | None, list[str], 
         return child, None, problems, []
     if not child.is_dir():
         return child, None, ["repository-unit-directory-missing"], []
-    top = run_git(child, "rev-parse", "--show-toplevel")
+    top = run_git(child, "rev-parse", "--show-toplevel", foreign_repository=True)
     if top.returncode != 0:
         return child, None, ["repository-unit-not-git"], []
     try:
@@ -455,12 +465,12 @@ def _child_state(parent: Path, path: str) -> tuple[Path, str | None, list[str], 
             problems.append("repository-unit-root-mismatch")
     except OSError:
         problems.append("repository-unit-root-unreadable")
-    head_result = run_git(child, "rev-parse", "HEAD")
+    head_result = run_git(child, "rev-parse", "HEAD", foreign_repository=True)
     head = head_result.stdout.strip() if head_result.returncode == 0 else None
     if not head or not HEX_OBJECT.fullmatch(head):
         problems.append("child-head-unavailable")
         head = None
-    dirty_result = run_git(child, "status", "--porcelain=v1", "--untracked-files=all")
+    dirty_result = run_git(child, "status", "--porcelain=v1", "--untracked-files=all", foreign_repository=True)
     if dirty_result.returncode != 0:
         problems.append("repository-unit-status-unavailable")
     dirty = [line for line in dirty_result.stdout.splitlines() if line.strip()][:MAX_DIRTY_PATHS]
@@ -470,9 +480,9 @@ def _child_state(parent: Path, path: str) -> tuple[Path, str | None, list[str], 
 def _target_reachable(child: Path, target: str | None, head: str | None) -> bool | None:
     if not target or not child.is_dir() or not head:
         return None
-    if run_git(child, "cat-file", "-e", f"{target}^{{commit}}").returncode != 0:
+    if run_git(child, "cat-file", "-e", f"{target}^{{commit}}", foreign_repository=True).returncode != 0:
         return False
-    return run_git(child, "merge-base", "--is-ancestor", target, head).returncode == 0
+    return run_git(child, "merge-base", "--is-ancestor", target, head, foreign_repository=True).returncode == 0
 
 
 def _validate_change(governance_root: Path, git_root: Path, change: dict[str, Any]) -> dict[str, Any]:
@@ -536,7 +546,10 @@ def repository_units_check(governance_root: Path, git_root: Path) -> dict[str, A
     evidence_root = governance_root if governance_root.resolve() == git_root.resolve() else git_root
     registry, registry_problems, registry_present = _load_registry(evidence_root)
     if registry_present and not registry_problems:
-        registry_problems = _registry_integrity_problems(evidence_root, git_root, registry)
+        registry_problems = _registry_integrity_problems(
+            evidence_root, git_root, registry,
+            required_paths={str(item["gitlink_path"]) for item in changes},
+        )
     if not changes and not index_conflicts and not registry_problems:
         return {
             "name": "repository-units",
@@ -738,7 +751,9 @@ def register_repository_unit(args: argparse.Namespace) -> dict[str, Any]:
                 return _registration_failure(registry_problems, "The repository-unit registry is invalid or redirected.")
             current = registry or {"version": REGISTRY_VERSION, "units": []}
             if registry_present:
-                integrity_problems = _registry_integrity_problems(root, root, current)
+                # Missing registrations are the reason to register/repair;
+                # reject malformed entries, not incremental registration.
+                integrity_problems = _registry_integrity_problems(root, root, current, required_paths=set())
                 if integrity_problems:
                     return _registration_failure(
                         integrity_problems,

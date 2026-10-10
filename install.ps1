@@ -1,5 +1,7 @@
 ﻿param(
   [string]$ZipUrl = $env:TENETORA_ZIP_URL,
+  [string]$ReleaseIndexBase = $env:TENETORA_RELEASE_INDEX_BASE,
+  [ValidateSet("stable", "preview")][string]$Channel = $(if ($env:TENETORA_CHANNEL) { $env:TENETORA_CHANNEL } else { "stable" }),
   [string]$ZipFile = $env:TENETORA_ZIP_FILE,
   [string]$Sha256 = $env:TENETORA_SHA256,
   [Alias("Home")][string]$TenetoraHome = $env:TENETORA_HOME,
@@ -25,14 +27,18 @@
 
 $ErrorActionPreference = "Stop"
 $MinimumPython = [version]"3.9"
-$DefaultZipUrl = "https://github.com/lcgyl/Tenetora/releases/latest/download/tenetora-latest.zip"
-$DefaultManifestUrl = "https://github.com/lcgyl/Tenetora/releases/latest/download/manifest.json"
+$DefaultZipUrl = "https://r2.lcgylupup.workers.dev/stable/0.3.40/tenetora-0.3.40.zip"
+$DefaultManifestUrl = "https://r2.lcgylupup.workers.dev/stable/0.3.40/manifest.json"
+$DefaultPreviewZipUrl = "https://r2.lcgylupup.workers.dev/preview/0.3.40.009-preview/tenetora-0.3.40.009-preview.zip"
+$DefaultPreviewManifestUrl = "https://r2.lcgylupup.workers.dev/preview/0.3.40.009-preview/manifest.json"
 $DefaultSourceZipUrl = "https://github.com/lcgyl/Tenetora/archive/refs/heads/main.zip"
+$DefaultReleaseIndexBase = "https://r2.lcgylupup.workers.dev"
 $IsWindowsHost = ($env:OS -eq "Windows_NT") -or ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT)
 $SourceWasExplicitDirectory = [bool]$SourceDir
 $ZipUrlWasExplicit = [bool]$env:TENETORA_ZIP_URL -or $PSBoundParameters.ContainsKey("ZipUrl")
 $ZipFileWasExplicit = [bool]$env:TENETORA_ZIP_FILE -or $PSBoundParameters.ContainsKey("ZipFile")
 $Sha256WasExplicit = [bool]$env:TENETORA_SHA256 -or $PSBoundParameters.ContainsKey("Sha256")
+$ReleaseIndexWasExplicit = [bool]$env:TENETORA_RELEASE_INDEX_BASE -or $PSBoundParameters.ContainsKey("ReleaseIndexBase")
 $LanguageWasExplicit = $PSBoundParameters.ContainsKey("Lang")
 $LanguageWasConfigured = [bool]$env:TENETORA_LANG
 $EffectiveProgress = if ($NoProgress) { "never" } else { $Progress }
@@ -125,9 +131,47 @@ function Write-InstallerStage([string]$English, [string]$Chinese) {
 }
 
 function Assert-PackageSourceSelection {
+  if ($ReleaseIndexBase -and ($SourceWasExplicitDirectory -or $ZipFileWasExplicit -or
+      $ZipUrlWasExplicit -or $Sha256WasExplicit)) {
+    throw (Get-Text "Release index cannot be combined with another package source." "版本索引不能与其他安装包来源同时使用。")
+  }
   if (($SourceWasExplicitDirectory -and ($ZipFileWasExplicit -or $ZipUrlWasExplicit -or $Sha256WasExplicit)) -or
       ($ZipFileWasExplicit -and $ZipUrlWasExplicit)) {
     throw (Get-Text "Package source options are mutually exclusive: -SourceDir cannot be combined with -ZipFile, an explicit -ZipUrl, or -Sha256; -ZipFile cannot be combined with an explicit -ZipUrl." "安装包来源选项互斥：-SourceDir 不能与 -ZipFile、显式 -ZipUrl 或 -Sha256 同时使用；-ZipFile 不能与显式 -ZipUrl 同时使用。")
+  }
+}
+
+function Resolve-ReleasePointer([string]$Base, [string]$SelectedChannel) {
+  $uri = $null
+  if (-not [Uri]::TryCreate($Base, [UriKind]::Absolute, [ref]$uri) -or
+      $uri.Scheme -ne "https" -or -not $uri.Host -or $uri.UserInfo -or
+      $uri.Query -or $uri.Fragment -or $uri.AbsolutePath -match '(^|/)\.\.(/|$)') {
+    throw (Get-Text "Release index base must be an HTTPS URL without credentials, query, or fragment." "版本索引必须是无凭据、查询和片段的 HTTPS 地址。")
+  }
+  $baseUri = [Uri]($Base.TrimEnd('/') + '/')
+  $pointerUri = [Uri]::new($baseUri, "$SelectedChannel/latest.json")
+  $pointer = Invoke-RestMethod -UseBasicParsing -Uri $pointerUri.AbsoluteUri -ErrorAction Stop
+  if (-not $pointer -or [string]$pointer.schema -ne "1" -or
+      [string]$pointer.channel -cne $SelectedChannel) {
+    throw (Get-Text "Release pointer schema or channel is invalid." "版本指针的格式或渠道无效。")
+  }
+  $version = [string]$pointer.version
+  $pattern = if ($SelectedChannel -eq "preview") { '^\d+\.\d+\.\d+\.\d{3}-preview$' } else { '^\d+\.\d+\.\d+$' }
+  if ($version -cnotmatch $pattern) {
+    throw (Get-Text "Release pointer version is invalid." "版本指针中的版本号无效。")
+  }
+  $prefix = "$SelectedChannel/$version"
+  if ([string]$pointer.zip_key -cne "$prefix/tenetora-$version.zip" -or
+      [string]$pointer.manifest_key -cne "$prefix/manifest.json" -or
+      [string]$pointer.sha256 -cnotmatch '^[0-9a-f]{64}$') {
+    throw (Get-Text "Release pointer object identity is invalid." "版本指针中的对象身份无效。")
+  }
+  return @{
+    version = $version
+    channel = $SelectedChannel
+    sha256 = [string]$pointer.sha256
+    zip_url = ([Uri]::new($baseUri, [string]$pointer.zip_key)).AbsoluteUri
+    manifest_url = ([Uri]::new($baseUri, [string]$pointer.manifest_key)).AbsoluteUri
   }
 }
 
@@ -215,14 +259,33 @@ function Test-ReleaseManifest([object]$External, [string]$EmbeddedPath, [string]
   }
   $embedded = Get-Content -LiteralPath $EmbeddedPath -Raw | ConvertFrom-Json
   $version = [string]$External.version
-  $allowedArtifacts = @("tenetora-$version.zip", "tenetora-latest.zip")
+  $channel = if ($External.channel) { [string]$External.channel } else { "stable" }
+  $stableVersion = [string]$External.stable_version
+  $previewSequence = [string]$External.preview_sequence
+  $adapterVersion = [string]$External.adapter_version
+  $stableIdentity = $version -match '^\d+\.\d+\.\d+$' -and
+    ([string]::IsNullOrEmpty($stableVersion) -or $stableVersion -eq $version) -and [string]::IsNullOrEmpty($previewSequence) -and
+    ([string]::IsNullOrEmpty($adapterVersion) -or $adapterVersion -eq $version)
+  $previewIdentity = $false
+  if ($version -match '^(\d+\.\d+\.\d+)\.(\d{3})-preview$') {
+    $expectedAdapter = "$($Matches[1])-preview.$([int]$Matches[2])"
+    $previewIdentity = $channel -eq "preview" -and $stableVersion -match '^\d+\.\d+\.\d+$' -and
+      $previewSequence -match '^[0-9]{3}$' -and [int]$previewSequence -gt 0 -and
+      $adapterVersion -eq $expectedAdapter
+  }
+  $validVersion = ($channel -eq "stable" -and $stableIdentity) -or ($channel -eq "preview" -and $previewIdentity)
+  $allowedArtifacts = if ($channel -eq "preview") {
+    @("tenetora-$version.zip", "tenetora-preview.zip")
+  } else {
+    @("tenetora-$version.zip", "tenetora-latest.zip")
+  }
   if ($External.name -ne "tenetora" -or $External.format -ne "tenetora-release-zip-v1" -or
-      $External.zip_root -ne "tenetora" -or $version -notmatch '^\d+\.\d+\.\d+$' -or
+      $External.zip_root -ne "tenetora" -or -not $validVersion -or
       $allowedArtifacts -notcontains [string]$External.artifact -or
       ([string]$External.sha256).ToLowerInvariant() -ne $ActualSha256.ToLowerInvariant()) {
     throw (Get-Text "The external release manifest identity is invalid." "外部 release manifest 身份无效。")
   }
-  $fields = @("name", "version", "commit", "format", "installer_protocol", "bridge_protocol",
+  $fields = @("name", "version", "channel", "stable_version", "preview_sequence", "adapter_version", "commit", "format", "installer_protocol", "bridge_protocol",
     "minimum_bridge_version", "upgrade_entrypoint", "state_schemas", "zip_root", "files", "file_sha256")
   foreach ($field in $fields) {
     $externalValue = $External.$field | ConvertTo-Json -Depth 20 -Compress
@@ -606,7 +669,13 @@ $pythonInfo = Resolve-Python
 $python = $pythonInfo[0]
 $pythonArg = $pythonInfo[1]
 $pythonVersion = $pythonInfo[2]
-if (-not $ZipUrl) { $ZipUrl = $DefaultZipUrl }
+if (-not $ZipUrl) {
+  $ZipUrl = if ($Channel -eq "preview") { $DefaultPreviewZipUrl } else { $DefaultZipUrl }
+}
+if (-not $ReleaseIndexWasExplicit -and -not $SourceWasExplicitDirectory -and
+    -not $ZipFileWasExplicit -and -not $ZipUrlWasExplicit -and -not $Sha256WasExplicit) {
+  $ReleaseIndexBase = $DefaultReleaseIndexBase
+}
 Assert-PackageSourceSelection
 $temporary = $null
 $releaseDir = $null
@@ -621,6 +690,8 @@ $currentPointerInstalled = $false
 $sourcePointerInstalled = $false
 $preserveSourcePointer = $false
 $releaseManifest = $null
+$releasePointer = $null
+$r2IndexActive = $false
 $fallbackUsed = $false
 $hookRollbackJournal = Join-Path ([IO.Path]::GetTempPath()) ("tenetora-hook-rollback-" + [guid]::NewGuid().ToString("N"))
 $hookRollbackReady = $false
@@ -653,14 +724,28 @@ try {
       New-Item -ItemType Directory -Force -Path $temporary | Out-Null
       $ZipFile = Join-Path $temporary "tenetora.zip"
       Write-Host (Get-Text "Downloading Tenetora package..." "正在下载 Tenetora 安装包……")
-      $defaultLatest = ($ZipUrl -eq $DefaultZipUrl -and -not $ZipUrlWasExplicit -and -not $Sha256WasExplicit)
+      if ($ReleaseIndexBase) {
+        $releasePointer = Resolve-ReleasePointer $ReleaseIndexBase $Channel
+        $ZipUrl = $releasePointer.zip_url
+        $r2IndexActive = $true
+      }
+      $defaultLatest = $r2IndexActive -or (-not $ZipUrlWasExplicit -and -not $Sha256WasExplicit -and
+        (($Channel -eq "stable" -and $ZipUrl -eq $DefaultZipUrl) -or
+         ($Channel -eq "preview" -and $ZipUrl -eq $DefaultPreviewZipUrl)))
       if (-not $Sha256) {
         if (-not $defaultLatest) {
           throw (Get-Text "An explicit ZIP URL requires -Sha256." "显式 ZIP URL 必须同时提供 -Sha256。")
         }
         try {
-          $releaseManifest = Invoke-RestMethod -UseBasicParsing -Uri $DefaultManifestUrl -ErrorAction Stop
+          $manifestUrl = if ($r2IndexActive) { $releasePointer.manifest_url } elseif ($Channel -eq "preview") { $DefaultPreviewManifestUrl } else { $DefaultManifestUrl }
+          $releaseManifest = Invoke-RestMethod -UseBasicParsing -Uri $manifestUrl -ErrorAction Stop
         } catch {
+          if ($r2IndexActive) {
+            throw (Get-Text "The R2 release manifest was unavailable; refusing an unauthenticated package." "R2 release manifest 不可用，拒绝安装未经认证的安装包。")
+          }
+          if ($Channel -eq "preview") {
+            throw (Get-Text "The preview release manifest was unavailable; refusing an unauthenticated preview package." "预览版 release manifest 不可用，拒绝安装未经认证的预览包。")
+          }
           $fallbackUsed = Download-SourceFallback $ZipFile `
             "The latest release manifest was unavailable" `
             "latest release manifest 不可用"
@@ -668,13 +753,20 @@ try {
         if (-not $fallbackUsed) {
           $Sha256 = [string]$releaseManifest.sha256
           if ($Sha256 -notmatch '^[0-9a-fA-F]{64}$') { throw (Get-Text "Release manifest has no valid SHA256." "Release manifest 没有有效 SHA256。") }
+          if ($r2IndexActive -and
+              ([string]$releaseManifest.version -cne $releasePointer.version -or
+               [string]$releaseManifest.channel -cne $releasePointer.channel -or
+               [string]$releaseManifest.artifact -cne "tenetora-$($releasePointer.version).zip" -or
+               $Sha256.ToLowerInvariant() -cne $releasePointer.sha256)) {
+            throw (Get-Text "Release manifest does not match its R2 channel pointer." "Release manifest 与 R2 渠道指针不匹配。")
+          }
         }
       }
       if (-not $fallbackUsed) {
         try {
           Invoke-WebRequest -UseBasicParsing -Uri $ZipUrl -OutFile $ZipFile -ErrorAction Stop
         } catch {
-          if (-not $defaultLatest) { throw }
+          if ($r2IndexActive -or -not $defaultLatest -or $Channel -ne "stable") { throw }
           $fallbackUsed = Download-SourceFallback $ZipFile `
             "The latest release ZIP was unavailable" `
             "latest release ZIP 不可用"
@@ -708,7 +800,7 @@ try {
     }
     $missingPackagePaths = @(Get-PackageContractMissing $sourceRoot)
     $packageProtocol = Get-PackageInstallerProtocol $sourceRoot
-    if (($missingPackagePaths.Count -gt 0 -or $packageProtocol -lt 3) -and $defaultLatest -and -not $fallbackUsed) {
+    if (($missingPackagePaths.Count -gt 0 -or $packageProtocol -lt 3) -and $defaultLatest -and -not $r2IndexActive -and -not $fallbackUsed -and $Channel -eq "stable") {
       if ($missingPackagePaths.Count -gt 0) {
         $fallbackUsed = Download-SourceFallback $ZipFile `
           "The latest release package is incomplete" `
@@ -740,7 +832,7 @@ try {
   }
 
   $version = (Get-Content -LiteralPath (Join-Path $sourceRoot "skills\tenetora\VERSION") -Raw).Trim()
-  if ($version -notmatch '^\d+\.\d+\.\d+$') { throw (Get-Text "Tenetora package version is invalid." "Tenetora 安装包版本无效。") }
+  if ($version -notmatch '^\d+\.\d+\.\d+$' -and $version -notmatch '^\d+\.\d+\.\d+\.\d{3}-preview$') { throw (Get-Text "Tenetora package version is invalid." "Tenetora 安装包版本无效。") }
   if ($effectiveUpdate) {
     Write-InstallerStage "Operation: upgrade existing installations" "操作：升级现有安装"
   } else {
@@ -770,7 +862,7 @@ try {
     if (Test-Path -LiteralPath $currentVersion -PathType Leaf) { $sourceVersion = (Get-Content -LiteralPath $currentVersion -Raw).Trim() }
     $bridgeArgs = @($worker, "--bootstrap-bridge", "--bridge-source-version", $sourceVersion,
       "--path", $Path, "--tools", $Tools, "--mode", "copy", "--codex-hooks", $CodexHooks,
-      "--progress", $EffectiveProgress, "--configure-path")
+      "--progress", $EffectiveProgress, "--channel", $Channel, "--configure-path")
     $logDirectory = Join-Path $TenetoraHome "logs"
     New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
     $logStamp = [DateTime]::UtcNow.ToString("yyyyMMdd-HHmmss") + "-" + $PID
