@@ -2,7 +2,7 @@
 
 **English** | [简体中文](https://gitee.com/lcgyl/tenetora)
 
-Tenetora is a governance runtime for AI-agent software engineering. It keeps project rules, decisions, evidence, and action boundaries in `.tenetora/`, then connects that record to Claude Code, Codex, Cursor, OpenCode, Pi, ZCode, and Generic Agents.
+Tenetora is a governance runtime for AI-agent software engineering. It keeps project rules, decisions, evidence, and action boundaries in `.tenetora/`, then connects that record to Claude Code, Codex, Cursor, OpenCode, Pi, ZCode, DeepSeek Harness, and Generic Agents.
 
 The problem is not that an agent cannot write code. It is that rules, verification, and responsibility boundaries can disappear while tools, models, conversations, and project state change. Nine lifecycle skills guide model work; the CLI, plugins, and hooks enforce repeatable checks. Installing the package does not initialize a project.
 
@@ -67,6 +67,7 @@ tenetora installations --json prune --expired
 | OpenCode | Lifecycle skills and a JS plugin | `active-partial` |
 | Pi | Lifecycle skills and an auto-loaded TypeScript extension | `active-partial` |
 | ZCode | User-scoped registered plugin and process hooks | `active` |
+| DeepSeek Harness (DSH) | Profile-scoped Cordis bundle, installed through the Harness CLI or a managed patch row | `active-partial` |
 | Generic Agents | Lifecycle skills and CLI | `skills-only` |
 
 `active` means the configuration satisfies the platform contract. It does not mean a host that has not been restarted has already executed an event. Use `tenetora status` and `tenetora doctor` to inspect effective sources, versions, trust, and recent runtime observations. `skills-only` is an honest capability boundary, not an installation failure.
@@ -171,7 +172,7 @@ The bare `tenetora` command may show a locally cached update hint. The hint is r
 
 Before downloading an archive, `tenetora upgrade` reads and authenticates the remote `manifest.json`. If its version matches the installed CLI, the command reports `already latest`, skips the ZIP download and installation transaction, and exits successfully. Use `tenetora upgrade --force` only when the same version must repair or re-converge existing installation surfaces.
 
-Online upgrades use the canonical R2 Worker over HTTPS by default. In a network that requires a proxy, set the standard `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, or `NO_PROXY` variables (lowercase spellings are accepted by the underlying clients); Tenetora uses them for the current acquisition only and never writes them to update state. An enterprise mirror can expose the legacy ZIP/manifest directory layout and be selected with a base URL:
+Online upgrades use the canonical R2 endpoint `https://r2.lcgylfamily.cn` over HTTPS by default. In a network that requires a proxy, set the standard `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, or `NO_PROXY` variables (lowercase spellings are accepted by the underlying clients); Tenetora uses them for the current acquisition only and never writes them to update state. An enterprise mirror can expose the legacy ZIP/manifest directory layout and be selected with a base URL:
 
 ```bash
 TENETORA_RELEASE_MIRROR=https://mirror.example/tenetora/stable tenetora upgrade --check
@@ -180,7 +181,7 @@ tenetora upgrade --mirror-url https://mirror.example/tenetora/stable
 
 The mirror directory must contain `manifest.json` and `tenetora-latest.zip`. Both files are still checked as one release contract. Advanced direct endpoints may be supplied as the pair `TENETORA_RELEASE_MANIFEST_URL` and `TENETORA_RELEASE_ZIP_URL`, or with both `--manifest-url` and `--zip-url`. Release URLs must be HTTPS, must not contain credentials, query strings, or fragments, and a mirror cannot be combined with direct endpoints. A malformed or partial configuration fails closed before writes; a failed acquisition preserves the last valid update hint.
 
-The public installer and upgrader use the operator-managed R2 Worker by default. They read one `stable/latest.json` or `preview/latest.json` pointer and then download only the exact versioned ZIP and manifest named by that pointer. The pointer and manifest must agree; the installer never lists the bucket or silently falls back between channels. Set `TENETORA_RELEASE_INDEX_BASE=https://<worker-host>` only when using another compatible Worker. Historical GitLab and public release attachments remain available for older clients, but new releases publish one R2 artifact.
+The public installer and upgrader use the operator-managed R2 endpoint `https://r2.lcgylfamily.cn` by default. They read one `stable/latest.json` or `preview/latest.json` pointer and then download only the exact versioned ZIP and manifest named by that pointer. The pointer and manifest must agree; the installer never lists the bucket or silently falls back between channels. Set `TENETORA_RELEASE_INDEX_BASE=https://<worker-host>` only when using another compatible Worker. Historical GitLab and public release attachments remain available for older clients, but new releases publish one R2 artifact.
 
 `tenetora upgrade --apply` is a 0.3.x compatibility alias for the same release acquisition and transaction engine.
 

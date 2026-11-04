@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Tenetora 治理",
+    "description": "加载 .tenetora 项目规则，为 git commit 与 push 提供门禁，保护已登记的本地环境路径，并发布 Tenetora 生命周期 skill。"
+  }
+}

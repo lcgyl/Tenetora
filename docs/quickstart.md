@@ -4,6 +4,17 @@
 
 This path goes from software installation to the first AI conversation that initializes a project. Installing the lifecycle skill package does not create `.tenetora/`; initialization needs the AI skill's model capability to understand project rules and decisions.
 
+## Five-minute path
+
+For a first governed change, use the smallest useful path:
+
+1. Initialize or update the project harness and keep only the project-specific rules you need.
+2. Run the repository's declared verification command.
+3. Run `tenetora run-all --runner python --path .` for the harness guardrails.
+4. Record the matching `partial-verification` claim for routine work, or a `completion` claim only after a confirmed alignment handoff.
+
+Use alignment, impact, delegation, loop, and audit when the change crosses shared contracts or needs stronger evidence. They are progressive controls, not prerequisites for trying the first path.
+
 ## 1. Install the Package Once
 
 Run the remote bootstrap once on a new machine:
@@ -46,6 +57,15 @@ The CLI initialization flags are an advanced automation entry. Ordinary users sh
 ```bash
 tenetora init --write --tools auto --mode auto --defaults missing
 ```
+
+For a first trial, use minimal: it keeps required safety contracts, omits optional maintenance defaults, and provides `rules -> claim -> run-all`:
+
+```bash
+tenetora init --write --profile minimal --tools auto --mode auto --gitignore yes --migrate plan
+```
+
+Refresh preserves the selected profile; `--profile full` adds missing full defaults. Selecting minimal never deletes rules or user files.
+The separate advanced `--defaults off` option omits all defaults and may not pass validation.
 
 ## 4. Validate the Baseline
 
@@ -124,16 +144,28 @@ tenetora guard --action commit --commit-message-file /path/to/commit-message.txt
   --require-message --path .
 ```
 
-Completion claims bind a real verification command to the current identity:
+Record verification against a real command. Without an aligned goal, the
+default passed claim is partial verification:
 
 ```bash
-tenetora guard --action claim --claim-kind completion \
+tenetora guard --action claim \
   --verification-command "tenetora run-all --path ." --verification-status passed
+```
+
+For a formal completion claim, use a confirmed or risk-accepted alignment
+handoff and bind its current identity:
+
+```bash
 tenetora guard --action claim --claim-kind completion \
   --session-id <session-id> --owner-id <owner-id> \
   --conversation-id <conversation-id> --tool <tool> \
   --verification-command "<full verification command>" --verification-status passed
 ```
+
+Use `--claim-kind completion` only when the task has a confirmed or
+risk-accepted alignment handoff. Without one, record
+`--claim-kind partial-verification` and report that the proof covers the
+verification, not formal task completion.
 
 Claim proof, alignment proof, commit permission, and push permission are independent. No skill grants commit, push, deploy, or release permission.
 

@@ -19,15 +19,12 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from governance_trail import sanitize_local_paths  # noqa: E402
 from path_security import is_redirected_path, validate_existing_project_path  # noqa: E402
+from security_patterns import CONTENT_SECRET_PATTERN  # noqa: E402
 
 
 INDEX_REL = ".tenetora/state/modules/index.json"
 CLAIM_REFERENCE = re.compile(r"^ah-(?:claim|align)-[0-9a-f]{32}$")
-SECRET_PATTERN = re.compile(
-    r"(?:glpat-[A-Za-z0-9._-]{16,}|ghp_[A-Za-z0-9_]{20,}|"
-    r"\b(?:TOKEN|SECRET|PASSWORD)\b\s*[:=]\s*['\"]?\S{12,})",
-    re.IGNORECASE,
-)
+SECRET_PATTERN = CONTENT_SECRET_PATTERN
 ABSOLUTE_PATH_TEXT = re.compile(r"(?<![A-Za-z0-9_.-])(?:/|[A-Za-z]:[\\/])")
 MODULE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 RELATION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")

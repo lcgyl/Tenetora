@@ -26,6 +26,7 @@ import alignment_state
 import loop_state
 import review_subject
 from path_security import harness_missing_message, validate_existing_project_path
+from security_patterns import GENERAL_SECRET_PATTERN
 
 
 STATE_REL = ".tenetora/state/delegation-state.json"
@@ -37,6 +38,7 @@ MAX_DISPATCHES = 50
 MAX_REPORT_BYTES = 64 * 1024
 MAX_ASSIGNMENT_CHARS = 2000
 MAX_ROLE_CONTRACT_BYTES = 32 * 1024
+MAX_REVIEW_DEBT_RESOLUTIONS = 20
 MAX_REPORTS = 20
 REPORT_RETENTION_DAYS = 7
 FEEDBACK_OUTCOMES = ("confirmed", "not-confirmed", "unclear", "not-applicable", "not-recorded")
@@ -46,10 +48,7 @@ OBSERVATION_ID_RE = re.compile(r"^ah-observation-[0-9a-f]{20}$")
 TRANSITION_LOCK_TIMEOUT_SECONDS = 5.0
 TRANSITION_LOCK_RETRY_SECONDS = 0.01
 TRANSITION_LOCK_STALE_SECONDS = 30.0
-SECRET_RE = re.compile(
-    r"(?i)(?:glpat-[A-Za-z0-9._-]+|ghp_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|"
-    r"BEGIN [A-Z ]*PRIVATE KEY|\b[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PRIVATE_KEY|ACCESS_KEY)\b\s*[:=]\s*[^\s$<{]+)"
-)
+SECRET_RE = GENERAL_SECRET_PATTERN
 RESOLUTION_MODES = ("dedicated", "builtin-role-injection", "unspecified")
 ISOLATION_LEVELS = ("hard", "inherited", "prompt-only", "unknown")
 HOST_TOOLS = ("codex", "claude", "zcode", "opencode", "cursor", "agents", "unknown")
@@ -486,6 +485,7 @@ def compact_event(dispatch: dict[str, Any]) -> dict[str, Any]:
         "review_scope_fingerprint": dispatch.get("review_scope_fingerprint"),
         "review_subject_entries_fingerprint": dispatch.get("review_subject_entries_fingerprint"),
         "rebind_from_dispatch_id": dispatch.get("rebind_from_dispatch_id"),
+        "resolved_review_debt": dispatch.get("resolved_review_debt", []),
         "review_delta_paths": dispatch.get("review_delta_paths", []),
         "association": dispatch.get("association", "general"),
         "observation_id": dispatch.get("observation_id"),
@@ -1096,6 +1096,44 @@ def append_review_report(review: dict[str, Any], dispatch: dict[str, Any]) -> No
     review["reports"] = reports[-MAX_REPORTS:]
 
 
+def review_debt_context_matches(debt: dict[str, Any], replacement: dict[str, Any]) -> bool:
+    """Match an immutable unavailable obligation to a later reviewer context."""
+    keys = ('owner_id', 'session_id', 'conversation_id', 'goal_hash', 'subject_git_path', 'role_contract_hash')
+    if (debt.get('dispatch_id') == replacement.get('dispatch_id')
+            or debt.get('status') != 'unavailable' or debt.get('role') != 'code-reviewer'
+            or debt.get('association') != 'review-cycle'
+            or replacement.get('role') != 'code-reviewer' or replacement.get('association') != 'review-cycle'
+            or any(not debt.get(key) or debt.get(key) != replacement.get(key) for key in keys)
+            or not isinstance(debt.get('subject_fingerprint'), str)
+            or not re.fullmatch(r'[0-9a-f]{64}', debt['subject_fingerprint'])
+            or not isinstance(replacement.get('subject_fingerprint'), str)
+            or not re.fullmatch(r'[0-9a-f]{64}', replacement['subject_fingerprint'])):
+        return False
+    try:
+        completed = dt.datetime.fromisoformat(str(debt['completed_at']).replace('Z', '+00:00'))
+        started = dt.datetime.fromisoformat(str(replacement['started_at']).replace('Z', '+00:00'))
+        return completed.utcoffset() is not None and started.utcoffset() is not None and completed <= started
+    except (KeyError, ValueError, TypeError):
+        return False
+
+
+def review_debt_record(root: Path, state: dict[str, Any], item_id: str) -> dict[str, Any]:
+    """Read a debt beyond the smaller dispatch-state retention window."""
+    if not DISPATCH_ID_RE.fullmatch(item_id):
+        raise DelegationError('dispatch id has an invalid format')
+    from governance_trail import load_retained_trail
+    trail = load_retained_trail(root)
+    if trail.get('invalid') or trail.get('conflicts'):
+        raise DelegationError('review debt trail is unreadable or divergent')
+    for item in reversed(state['dispatches']):
+        if item.get('dispatch_id') == item_id:
+            return item
+    for event in reversed(trail['events']):
+        if event.get('type') == 'subagent-dispatch' and event.get('dispatch_id') == item_id:
+            return event
+    raise DelegationError(f'dispatch not found: {item_id}')
+
+
 def review_result(
     root: Path,
     state: dict[str, Any],
@@ -1109,6 +1147,7 @@ def review_result(
     verification_status: str = "not-recorded",
     verification_command: str | None = None,
     identity: dict[str, str] | None = None,
+    resolve_review_debt: list[str] | None = None,
 ) -> dict[str, Any]:
     dispatch = find_dispatch(state, item_id)
     ensure_dispatch_access(
@@ -1128,6 +1167,27 @@ def review_result(
         raise DelegationError("dispatch is not the active review")
     if result == "blocker" and not blocker:
         raise DelegationError("blocker result requires --blocker")
+    resolution_ids = list(dict.fromkeys(resolve_review_debt or []))
+    if len(resolution_ids) > MAX_REVIEW_DEBT_RESOLUTIONS:
+        raise DelegationError(f'explicit review debt resolution is limited to {MAX_REVIEW_DEBT_RESOLUTIONS} IDs')
+    resolutions = []
+    resolution_report = ''
+    if resolution_ids:
+        resolution_report = (relative_input_path(root, report_file).read_text(encoding='utf-8', errors='replace')
+                             if report_file is not None else report_text or '')
+        if not resolution_report.strip():
+            raise DelegationError('explicit debt resolution requires a report covering the debt and reviewed subject delta')
+    for debt_id in resolution_ids:
+        if result != 'passed' or dispatch.get('review_scope_bound'):
+            raise DelegationError('explicit debt resolution requires a passed full-subject review')
+        debt = review_debt_record(root, state, debt_id)
+        if not review_debt_context_matches(debt, dispatch):
+            raise DelegationError('review debt must identify an earlier bound unavailable review of this owner, goal and repository')
+        if any(str(value) not in resolution_report for value in
+               (debt_id, debt['subject_fingerprint'], dispatch['subject_fingerprint'])):
+            raise DelegationError('debt resolution report must identify each debt ID, original subject and reviewed current subject')
+        resolutions.append({'dispatch_id': debt_id, 'subject_fingerprint': debt['subject_fingerprint']})
+    dispatch['resolved_review_debt'] = resolutions
     finish_dispatch(
         root,
         dispatch,
@@ -1460,6 +1520,8 @@ def parser() -> argparse.ArgumentParser:
         help="Selected Git-worktree-relative path scope reviewed by --review-start. Repeat for multiple paths.",
     )
     command.add_argument("--result", choices=("passed", "blocker", "failed"), help="Review, fix, or general result.")
+    command.add_argument('--resolve-review-debt', action='append', default=[],
+                         help='With a passed full-subject --review-result, explicitly cover an earlier unavailable review ID and its subject delta; repeatable.')
     command.add_argument("--blocker", help="Stable blocker summary used for repeated-blocker detection.")
     command.add_argument(
         "--finding-outcome",
@@ -1513,6 +1575,8 @@ def loop_for_request(root: Path, args: argparse.Namespace, *, safe: bool) -> dic
 def execute(args: argparse.Namespace) -> dict[str, Any]:
     root: Path = args.path
     identity = loop_state.requested_identity(args)
+    if args.resolve_review_debt and not (args.review_result and args.result == 'passed'):
+        raise DelegationError('--resolve-review-debt is allowed only with a passed --review-result')
     if args.list_roles:
         return {
             "version": STATE_VERSION,
@@ -1640,6 +1704,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 args.verification_status,
                 args.verification_command,
                 identity=identity,
+                resolve_review_debt=args.resolve_review_debt,
             )
         elif args.fix_start:
             item = fix_start(

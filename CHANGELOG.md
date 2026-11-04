@@ -1,23 +1,33 @@
-# Tenetora 0.3.40.009-preview
+# Tenetora 0.3.40.017-preview
 
 English preview notes | [简体中文](https://gitee.com/lcgyl/tenetora/blob/main/CHANGELOG.md)
 
 ## About this preview
 
-This is a **preview build** (`0.3.40.009-preview`, sequence 009) on top of the stable 0.3.40 line. Preview builds ship work-in-progress changes for early testing. They are not recommended for production use.
+This preview follows 0.3.40.016-preview on the 0.3.40 stable line and moves public release downloads to the dedicated R2 domain.
 
-## Changes in this preview
+## Changes
 
-- Release delivery reliability: artifact publishing now reports each delivery stage and its outcome, so an upload problem is distinguishable from a readback or validation problem.
-- Immutable artifacts are detected and reused instead of being uploaded twice.
-- Delivery remains fail-closed: validation failures stop the release before the channel pointer moves.
+- Installers and the upgrader now use `https://r2.lcgylfamily.cn` by default for both stable and preview channels.
+- Explicit release-index and mirror settings remain supported. HTTPS verification, channel isolation and complete release-hash checks remain required.
+- Published installation links use the dedicated domain. URL handling preserves valid quoted, plain and Markdown addresses and their formatting while keeping other hosts and credentials distinct.
 
-## Upgrade the preview
+## Upgrade
 
-Installed preview users can run:
+Existing clients that can reach their configured endpoint can run:
 
 ```bash
 tenetora upgrade --channel preview
 ```
 
-New users: install the preview build with `--channel preview`. The stable download entry keeps resolving to the stable release.
+If an older client's test-domain endpoint cannot be reached, a POSIX shell can select the new domain for this command only:
+
+```bash
+TENETORA_RELEASE_INDEX_BASE=https://r2.lcgylfamily.cn tenetora upgrade --channel preview
+```
+
+After the upgrade, the installed client's default is the dedicated domain. Existing explicit overrides continue to take precedence.
+
+## Compatibility
+
+Python 3.9 or newer is required. This preview does not change project governance rules or grant new host permissions. Network failures remain possible and do not establish that a preview was retired.

@@ -1,7 +1,7 @@
 {
   "schema": "tenetora.plugin-adapters.v1",
   "name": "tenetora",
-  "version": "0.3.40-preview.9",
+  "version": "0.3.40-preview.17",
   "displayName": "Tenetora",
   "description": "Tenetora shared engineering-agent governance with decision alignment, qualified built-in subagent role fallback, and cross-tool runtime adapters.",
   "skills": "./skills/",
@@ -53,6 +53,14 @@
       "skills": "./skills/",
       "hooks": "./hooks/hooks-zcode.json",
       "notes": "ZCode uses a dedicated process-hook manifest with ZCODE_PLUGIN_ROOT, observes recognized host subagent lifecycle events without spawning them, and is installed through its registered plugin cache."
+    },
+    {
+      "tool": "dsh",
+      "status": "cordis-bundle",
+      "manifest": "dsh/package.json",
+      "skills": "./skills/",
+      "runtime": "active-partial",
+      "notes": "DeepSeek Harness composes plugins through Cordis bundles, so the adapter is the host-only bundle in dsh/. It is installed into a profile by the Harness CLI (`dsh plugin --profile <name> add`) or, while the application is running, by a reviewable row in the user patch layer. The bundle contributes a governance system-prompt section, a tools/pre-execute guard, and the lifecycle skills; capability stays active-partial because the prompt section, fiber disposal, and uninstall paths are not yet observed end to end."
     },
     {
       "tool": "generic-agents",

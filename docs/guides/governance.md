@@ -69,6 +69,8 @@ Evidence-derived facts require source paths. Inferences remain labeled. Unknown 
 
 ## Project Update
 
+Use `tenetora refresh --preview --path . --json` for a read-only defaults diff; it creates no candidates and changes no rules or review state. The existing `refresh --strategy diff` path writes review artifacts. `benchmark --hooks` reports replay launcher p50/p95, failures and soft-budget overruns without payloads; native-host samples use the separate timing wrapper. `insights --investment-month` reports a read-only commit mix with unknown/multi labels; commits do not measure effort or value. First-use observations remain pending until real participants exist; use the repository observation template when they do.
+
 User-facing invocation stays simple:
 
 ```text
@@ -79,12 +81,25 @@ The lifecycle owns repair, validate, audit, refresh, review, guardrail, and reca
 
 ## Audit and Acceptance
 
+`insights --days 7 --json` separates commit-guard decisions, unique proof consumption and actual feature check runs. Read-only queries create no observations; duplicate or contradictory run IDs are excluded. Missing owner, duration and provider data remain explicit; no saved time or billing is inferred.
+
 ```bash
 tenetora validate --path .
 tenetora run-all --path .
 tenetora audit --strict --path .
 tenetora recap --write --path .
 ```
+
+Read-only pre-release summary: `tenetora release-readiness --path . --json`. It aggregates worktree, verification, version/changelog, current-state consistency, and review-debt signals; it never changes release state.
+
+CI or release workflows that require evidence to block may pass
+`tenetora guard --action commit --strict-evidence`. It requires a fresh covering
+claim for every verification-impacting staged path (a scoped claim is enough;
+the full suite is not required when the affected boundary is narrower).
+Documentation, release metadata, and other non-verification paths still pass
+with their targeted checks, so a documentation-only commit is never forced
+through the full suite. Ordinary commits retain the warning behavior for
+uncovered evidence.
 
 Before reporting completion:
 
@@ -100,17 +115,9 @@ tenetora guard \
   --verification-status passed \
   --path .
 ```
-Use `--claim-kind partial-verification` for a scoped check; it cannot satisfy the completion gate. Use
-`blocked` or `failed` when verification does not pass. Completion proof lookup must repeat the exact command
-with `--expected-verification-command`; it also rejects a changed Git worktree and any newer failed verification.
-Completion additionally requires a confirmed or risk-accepted handoff with an audited `user-message` record;
-active, expired, legacy, or bare-CLI-confirmed state is insufficient. It binds event, actor, revision, goal,
-continuity, and handoff hash as audit provenance, not cryptographic proof of a human actor.
-Include the returned claim proof in the final report. A claim proof records verification evidence; it does not grant permission for commit, push, deploy, or release.
+Use `--claim-kind partial-verification` for a scoped check; it cannot satisfy the completion gate. Use `blocked` or `failed` when verification does not pass. Completion proof lookup must repeat the exact command with `--expected-verification-command`; it also rejects a changed Git worktree and any newer failed verification. Completion additionally requires a confirmed or risk-accepted handoff with an audited `user-message` record; active, expired, legacy, or bare-CLI-confirmed state is insufficient. It binds event, actor, revision, goal, continuity, and handoff hash as audit provenance, not cryptographic proof of a human actor. Include the returned claim proof in the final report. A claim proof records verification evidence; it does not grant permission for commit, push, deploy, or release.
 
-`status` text is compact by default so multiple tools can be scanned quickly. Use `--verbose` when you
-need effective-source details, shadowed candidates, or full findings; `--json` remains the stable machine-readable
-contract regardless of this text-output option:
+`status` text is compact by default so multiple tools can be scanned quickly. Use `--verbose` when you need effective-source details, shadowed candidates, or full findings; `--json` remains the stable machine-readable contract regardless of this text-output option:
 
 ```bash
 tenetora status --path .
@@ -120,28 +127,18 @@ tenetora status --path . --json
 
 ### Governance Insights
 
-`insights` is a read-only summary of the governance trail. It uses a bounded UTC window (90 days by default),
-does not append an event, and never prints session IDs, commands, paths, or raw error text:
+`insights` is a read-only summary of the governance trail. It uses a bounded UTC window (90 days by default), does not append an event, and never prints session IDs, commands, paths, or raw error text:
 
 ```bash
 tenetora insights --path . --days 90
 tenetora insights --path . --days 90 --json
 ```
 
-The report separates trends, failure patterns, and recorded intervention counts. Empty or short history is
-reported as `insufficient-data`; missing or corrupt trail data is reported explicitly. Claim delay is not
-estimated because the current trail has no verification start timestamp.
+The report separates trends, failure patterns, and recorded intervention counts. Empty or short history is reported as `insufficient-data`; missing or corrupt trail data is reported explicitly. Claim delay is not estimated because the current trail has no verification start timestamp.
 
-The JSON report also contains bounded rule-health metrics. A rule key is counted when a `rules-context` event
-records that relative rule file as loaded; the report includes hit count, last hit date, zero-hit keys, and
-statistical high-frequency alerts. These are review signals, not proof that a rule was enforced or caused a
-task result. Zero-hit rules can be new or optional, so they require review rather than automatic removal.
+`state/current.json` is a derived view; use `tenetora state check --path .` to detect stale or missing state and `tenetora state rebuild --path .` to refresh it. The source files remain authoritative. The JSON report also contains bounded rule-health metrics. A rule key is counted when a `rules-context` event records that relative rule file as loaded; the report includes hit count, last hit date, zero-hit keys, and statistical high-frequency alerts. These are review signals, not proof that a rule was enforced or caused a task result. Zero-hit rules can be new or optional, so they require review rather than automatic removal.
 
-For repeated prompts, the `UserPromptSubmit` hook injects the full rule context once for a matching rule
-fingerprint, then emits a compact reference while that fingerprint remains unchanged. A rule-file change,
-missing cache, legacy cache entry, or cache write failure falls back to full injection so stale guidance is
-not reused. `insights --json` reports the number of reference reuses and an estimated character reduction;
-the token figure is only `characters / 4`, not provider billing or an exact tokenizer measurement.
+For repeated prompts, the `UserPromptSubmit` hook injects the full rule context once for a matching rule fingerprint, then emits a compact reference while that fingerprint remains unchanged. A rule-file change, missing cache, legacy cache entry, or cache write failure falls back to full injection so stale guidance is not reused. `insights --json` reports the number of reference reuses and an estimated character reduction; the token figure is only `characters / 4`, not provider billing or an exact tokenizer measurement.
 
 ### Continuing in Another Conversation
 
@@ -215,7 +212,6 @@ Match roles by responsibility: `code-reviewer`, `security-auditor`, `codebase-sc
 
 The CLI never spawns the agent. Before fallback, the model inspects the current host's visible and deferred/discoverable dispatch tools; missing Hook evidence is not dispatch-unavailability evidence. A governed code review is bound to the canonical Git tree and expected parent commit set, and becomes stale after the reviewed index or intervening history changes. Successful `SubagentStop` proves process completion only; the model must inspect the report and explicitly record `passed` or `blocker`. Security reviewers and implementers require real permission isolation; prompt-only boundaries are insufficient.
 
-Review and fix results can also record bounded follow-up metadata: whether a finding was confirmed, whether
-the repair regressed, and the verification status. `--verification-command` stores only a hash and length in
-governance metadata; keep the readable command and report details in the controlled report cache. A completed
-host process is not treated as a passed review without an explicit result.
+Review/fix feedback records confirmed findings, regressions and verification status. `--verification-command` stores only a hash and length; keep readable commands in the controlled report cache. A completed host process needs an explicit semantic result to count as a passed review.
+
+For scoped implementation reports and actual check receipts, use [Feature Delivery](feature-delivery.md).

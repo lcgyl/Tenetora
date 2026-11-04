@@ -22,8 +22,10 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import alignment_state
 import delegation_state
+from governance_trail import load_trail
 from harness_io import atomic_write_text
 from path_security import harness_missing_message, validate_existing_project_path
+from security_patterns import GENERAL_SECRET_PATTERNS
 
 
 ENGINEERING_CATEGORIES = ("stability", "reliability", "control", "content_density", "governance_effectiveness")
@@ -128,13 +130,7 @@ CRITICAL_REQUIRED = {
     "AGENTS.md",
 }
 
-SECRET_PATTERNS = [
-    re.compile(r"glpat-[A-Za-z0-9._-]+"),
-    re.compile(r"(ghp|github_pat)_[A-Za-z0-9_]+"),
-    re.compile(r"BEGIN [A-Z ]*PRIVATE KEY"),
-    re.compile(r"\b[A-Z0-9_]*(TOKEN|SECRET|PASSWORD)\b\s*[:=]\s*['\"]?[^'\"\s${}]+", re.I),
-    re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
-]
+SECRET_PATTERNS = GENERAL_SECRET_PATTERNS
 
 STALE_PATTERNS = [
     re.compile(r"<card|</span>|</p>|h[e]rness|READ[E]ME"),
@@ -1366,20 +1362,9 @@ def audit_changes_runtime_noise(root: Path, warnings: list[dict[str, str]]) -> N
 
 
 def load_governance_trail(root: Path) -> dict[str, object] | None:
-    path = root / GOVERNANCE_TRAIL_REL
-    if not path.is_file():
+    if not (root / GOVERNANCE_TRAIL_REL).is_file():
         return None
-    try:
-        payload = json.loads(read_text(path))
-    except json.JSONDecodeError:
-        return {"version": 1, "events": [], "invalid": True}
-    if not isinstance(payload, dict):
-        return {"version": 1, "events": [], "invalid": True}
-    events = payload.get("events")
-    if not isinstance(events, list):
-        payload["events"] = []
-        payload["invalid"] = True
-    return payload
+    return load_trail(root)
 
 
 def configured_tenetora_git_hooks(root: Path) -> set[str]:

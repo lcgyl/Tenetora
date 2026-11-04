@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
-import shutil
 import sys
 from pathlib import Path
 
@@ -14,9 +14,75 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from path_security import is_redirected_path, remove_unredirected_entry, validate_unredirected_path  # noqa: E402
-from release_store import ReleaseStoreError, managed_release, read_release_manifest  # noqa: E402
-from release_version import version_key  # noqa: E402
+from path_security import (
+    is_redirected_path,
+    remove_unredirected_entry,
+    validate_unredirected_path,
+)
+from release_store import (
+    ReleaseStoreError,
+    managed_release,
+    read_release_manifest,
+)
+from release_version import version_key
+
+
+def load_installer_module():
+    """Load the packaged installer to reuse its profile helpers verbatim."""
+
+    path = SCRIPT_DIR / "install-skill.py"
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("tenetora_maintenance_installer", path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:  # noqa: BLE001 - maintenance must not fail on an optional helper
+        return None
+    return module
+
+
+def dsh_cleanup_plan(home: Path) -> list[dict[str, object]]:
+    """Profiles whose bundle points into the managed home being removed."""
+
+    installer = load_installer_module()
+    if installer is None:
+        return []
+    profiles_root = Path(os.environ.get("DSH_HOME", Path.home() / ".dsh")).expanduser() / "profiles"
+    if not profiles_root.is_dir():
+        return []
+    plans: list[dict[str, object]] = []
+    for profile in sorted(profiles_root.iterdir()):
+        if not profile.is_dir():
+            continue
+        try:
+            if not installer.dsh_profile_references_home(profile, home):
+                continue
+            plans.append(installer.remove_cordis_bundle(profile.name, dry_run=True))
+        except (OSError, RuntimeError, ValueError) as exc:
+            plans.append({"profile": str(profile), "status": "error", "actions": [], "warnings": [str(exc)]})
+    return plans
+
+
+def apply_dsh_cleanup(plans: list[dict[str, object]]) -> list[dict[str, object]]:
+    installer = load_installer_module()
+    if installer is None:
+        return plans
+    applied: list[dict[str, object]] = []
+    for plan in plans:
+        profile = Path(str(plan.get("profile", "")))
+        if not profile.name:
+            applied.append(plan)
+            continue
+        try:
+            applied.append(installer.remove_cordis_bundle(profile.name, dry_run=False))
+        except (OSError, RuntimeError, ValueError) as exc:
+            applied.append({"profile": str(profile), "status": "error", "actions": [], "warnings": [str(exc)]})
+    return applied
+
 
 
 def language_is_zh() -> bool:
@@ -109,11 +175,18 @@ def uninstall_plan(home: Path, *, purge: bool) -> dict[str, object]:
         if unexpected:
             raise ReleaseStoreError(f"refusing purge with unrecognized home entries: {', '.join(sorted(unexpected))}")
         targets = [home]
-    return {"home": str(home), "purge": purge, "remove": sorted(str(path) for path in targets), "cleanup": cleanup}
+    return {
+        "home": str(home),
+        "purge": purge,
+        "remove": sorted(str(path) for path in targets),
+        "cleanup": cleanup,
+        "dsh": dsh_cleanup_plan(home),
+    }
 
 
 def apply_uninstall(plan: dict[str, object]) -> list[str]:
     removed: list[str] = []
+    plan["dsh"] = apply_dsh_cleanup(list(plan.get("dsh") or []))
     for raw in plan.get("remove", []):
         path = Path(str(raw))
         if path.exists() or is_redirected_path(path):
@@ -160,6 +233,17 @@ def main(argv: list[str] | None = None) -> int:
         print(text(f"{args.operation} plan for {home}", f"{args.operation} 计划：{home}"))
         for path in payload.get("remove", []):
             print(text(f"  {'removed' if args.apply else 'would remove'} {path}", f"  {'已删除' if args.apply else '将删除'} {path}"))
+        for entry in payload.get("dsh", []):
+            print(
+                text(
+                    f"  DSH profile {entry.get('profile')}: {entry.get('status')}",
+                    f"  DSH profile {entry.get('profile')}：{entry.get('status')}",
+                )
+            )
+            for action in entry.get("actions", []):
+                print(f"    {action}")
+            for warning in entry.get("warnings", []):
+                print(text(f"    warning: {warning}", f"    警告：{warning}"))
     return 0
 
 

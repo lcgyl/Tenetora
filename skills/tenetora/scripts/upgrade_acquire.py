@@ -29,22 +29,22 @@ from path_security import is_redirected_path, validate_existing_project_path
 
 
 DEFAULT_MANIFEST_URL = (
-    "https://r2.lcgylupup.workers.dev/stable/0.3.40/manifest.json"
+    "https://r2.lcgylfamily.cn/stable/0.3.40/manifest.json"
 )
 DEFAULT_ZIP_URL = (
-    "https://r2.lcgylupup.workers.dev/stable/0.3.40/tenetora-0.3.40.zip"
+    "https://r2.lcgylfamily.cn/stable/0.3.40/tenetora-0.3.40.zip"
 )
 PREVIEW_MANIFEST_URL = (
-    "https://r2.lcgylupup.workers.dev/preview/0.3.40.009-preview/manifest.json"
+    "https://r2.lcgylfamily.cn/preview/0.3.40.017-preview/manifest.json"
 )
 PREVIEW_ZIP_URL = (
-    "https://r2.lcgylupup.workers.dev/preview/0.3.40.009-preview/tenetora-0.3.40.009-preview.zip"
+    "https://r2.lcgylfamily.cn/preview/0.3.40.017-preview/tenetora-0.3.40.017-preview.zip"
 )
 RELEASE_MIRROR_ENV = "TENETORA_RELEASE_MIRROR"
 RELEASE_MANIFEST_ENV = "TENETORA_RELEASE_MANIFEST_URL"
 RELEASE_ZIP_ENV = "TENETORA_RELEASE_ZIP_URL"
 RELEASE_INDEX_BASE_ENV = "TENETORA_RELEASE_INDEX_BASE"
-DEFAULT_RELEASE_INDEX_BASE = "https://r2.lcgylupup.workers.dev"
+DEFAULT_RELEASE_INDEX_BASE = "https://r2.lcgylfamily.cn"
 MAX_RELEASE_URL_LENGTH = 4096
 MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
@@ -57,6 +57,18 @@ IS_WINDOWS = os.name == "nt"
 
 class UpgradeAcquireError(RuntimeError):
     """Raised when an upgrade source cannot be authenticated or extracted."""
+
+
+class ReleaseDownloadError(UpgradeAcquireError):
+    """A failed transfer with an HTTP status only when it was observed."""
+
+    def __init__(self, http_status: int | None = None):
+        super().__init__("release download failed")
+        self.http_status = http_status
+
+
+class PreviewUnavailableError(UpgradeAcquireError):
+    """The channel pointer, rather than a release object, is absent."""
 
 
 def _configured_value(environment: Mapping[str, str], name: str) -> str | None:
@@ -191,7 +203,12 @@ def _release_pointer_urls(
     base = _validate_release_url(base, label="release index base URL").rstrip("/") + "/"
     pointer_path = workdir / "release-pointer.json"
     if not pointer_path.is_file():
-        _download(urllib.parse.urljoin(base, f"{channel}/latest.json"), pointer_path, 4096)
+        try:
+            _download(urllib.parse.urljoin(base, f"{channel}/latest.json"), pointer_path, 4096)
+        except ReleaseDownloadError as exc:
+            if channel == "preview" and exc.http_status in {404, 410}:
+                raise PreviewUnavailableError("preview channel pointer is unavailable") from exc
+            raise
     try:
         pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -257,14 +274,25 @@ def _download_with_command(command: list[str], destination: Path, maximum: int) 
         try:
             result = subprocess.run(
                 command,
-                stdout=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 check=False,
                 timeout=EXTERNAL_DOWNLOAD_TIMEOUT,
             )
         except (OSError, subprocess.TimeoutExpired):
             return False
-        if result.returncode != 0 or not temporary.is_file():
+        if result.returncode != 0:
+            if result.returncode == 22 and "--write-out" in command:
+                status = getattr(result, "stdout", b"") or b""
+                if isinstance(status, bytes):
+                    try:
+                        status = status.decode("ascii")
+                    except UnicodeDecodeError:
+                        return False
+                if isinstance(status, str) and re.fullmatch(r"[45][0-9]{2}", status.strip()):
+                    raise ReleaseDownloadError(int(status.strip()))
+            return False
+        if not temporary.is_file():
             return False
         try:
             if not stat.S_ISREG(temporary.lstat().st_mode):
@@ -304,6 +332,8 @@ def _external_download_commands(url: str, destination: Path) -> list[list[str]]:
                 str(EXTERNAL_DOWNLOAD_TIMEOUT),
                 "--user-agent",
                 "Tenetora-Upgrader/1",
+                "--write-out",
+                "%{http_code}",
                 "--output",
                 EXTERNAL_OUTPUT_PLACEHOLDER,
                 url,
@@ -364,11 +394,19 @@ def _download(url: str, destination: Path, maximum: int) -> None:
         except OSError:
             pass
 
+    http_status = python_error.code if isinstance(python_error, urllib.error.HTTPError) else None
     for command in _external_download_commands(url, destination):
-        if _download_with_command(command, destination, maximum):
-            return
+        try:
+            if _download_with_command(command, destination, maximum):
+                return
+        except ReleaseDownloadError as exc:
+            http_status = exc.http_status
+        else:
+            # A later transfer failed without an HTTP response: an earlier
+            # 404 is insufficient to declare that a preview is still absent.
+            http_status = None
 
-    raise UpgradeAcquireError("release download failed") from python_error
+    raise ReleaseDownloadError(http_status) from python_error
 
 
 def read_manifest(path: Path, *, require_artifact: bool) -> dict[str, Any]:

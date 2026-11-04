@@ -72,6 +72,7 @@ KNOWN_TOP_LEVEL = {
     "guardrails",
     "local",
     "manifest.json",
+    "profile.json",
     "rules",
     "skills",
     "state",
@@ -139,6 +140,7 @@ class MigrationResult:
     applied: bool = False
     backup: str | None = None
     changed_adapters: list[str] = field(default_factory=list)
+    rewrite_report: list[dict[str, Any]] = field(default_factory=list)
     preserved_legacy: bool = False
     message: str = ""
 
@@ -628,7 +630,46 @@ def append_journal(entry: dict[str, Any]) -> None:
     write_json_atomic(path, payload)
 
 
-def replace_self_references(text: str) -> str:
+def replace_self_references_with_report(text: str) -> tuple[str, list[dict[str, Any]]]:
+    def replacement_category(old: str) -> str:
+        if old == "Agent Harness":
+            return "brand-text"
+        if any(
+            token in old
+            for token in (
+                "Path.home",
+                "${HOME}",
+                "$HOME",
+                "%USERPROFILE%",
+                "~/",
+                ".harness",
+                "/agent-harness",
+                "skills/agent-harness",
+            )
+        ):
+            return "path-reference"
+        if old.startswith(("use ", "skill:", "--skill ", "# ", "[agent-harness]", "for command_name", "for skill_name")):
+            return "instruction-reference"
+        if any(token in old for token in ("owner", "managed", "default")):
+            return "metadata-reference"
+        return "identifier-reference"
+
+    def line_numbers(source: str, needle: str) -> list[int]:
+        return [
+            number
+            for number, line in enumerate(source.splitlines(), start=1)
+            if needle in line
+        ]
+
+    def record(source: str, old: str, new: str, count: int) -> dict[str, Any]:
+        return {
+            "from": old,
+            "to": new,
+            "count": count,
+            "category": replacement_category(old),
+            "lines": line_numbers(source, old),
+        }
+
     replacements = (
         ('Path.home() / ".agent-harness"', 'Path.home() / ".tenetora"'),
         ("Path.home() / '.agent-harness'", "Path.home() / '.tenetora'"),
@@ -676,9 +717,21 @@ def replace_self_references(text: str) -> str:
         ("Agent Harness", "Tenetora"),
         (LEGACY_DIR_NAME, CANONICAL_DIR_NAME),
     )
+    report: list[dict[str, Any]] = []
     for old, new in replacements:
+        count = text.count(old)
+        if count:
+            report.append(record(text, old, new, count))
         text = text.replace(old, new)
-    text = re.sub(r"(?<![.A-Za-z0-9_-])agent-harness/", "tenetora/", text)
+    regex = r"(?<![.A-Za-z0-9_-])agent-harness/"
+    regex_lines = [
+        number for number, line in enumerate(text.splitlines(), start=1) if re.search(regex, line)
+    ]
+    text, count = re.subn(regex, "tenetora/", text)
+    if count:
+        entry = record(text, "agent-harness/", "tenetora/", count)
+        entry["lines"] = regex_lines
+        report.append(entry)
     command_names = (
         "alignment",
         "audit-configs",
@@ -714,8 +767,18 @@ def replace_self_references(text: str) -> str:
         "version",
     )
     for command in command_names:
+        old = f"agent-harness {command}"
+        count = text.count(old)
+        if count:
+            report.append(record(text, old, f"tenetora {command}", count))
         text = text.replace(f"agent-harness {command}", f"tenetora {command}")
-    return text
+    return text, report
+
+
+def replace_self_references(text: str) -> str:
+    """Compatibility wrapper for callers that only need transformed text."""
+
+    return replace_self_references_with_report(text)[0]
 
 
 PRESERVED_PROVENANCE_STATE = {
@@ -786,7 +849,7 @@ def preserves_historical_semantics(relative_path: Path) -> bool:
     return relative_path.suffix.lower() == ".md" or "migration-plan" in relative_path.name
 
 
-def rewrite_tree(directory: Path) -> list[str]:
+def rewrite_tree(directory: Path, rewrite_report: list[dict[str, Any]] | None = None) -> list[str]:
     unsafe = unsafe_governance_entries(directory)
     if unsafe:
         raise RuntimeError(f"governance tree contains an unsafe symbolic link or unreadable entry: {unsafe[0]}")
@@ -804,10 +867,12 @@ def rewrite_tree(directory: Path) -> list[str]:
         text = safe_read(path, 64_000_000)
         if not text:
             continue
-        updated = replace_self_references(text)
+        updated, replacements = replace_self_references_with_report(text)
         if updated != text:
             atomic_write_text(path, updated)
             changed.append(relative_path.as_posix())
+            if rewrite_report is not None:
+                rewrite_report.append({"path": relative_path.as_posix(), "replacements": replacements})
     skills_dir = directory / "skills"
     if skills_dir.is_dir():
         for path in sorted(skills_dir.glob("agent-harness*.md")):
@@ -831,13 +896,14 @@ def rewrite_adapters(
     backup_root: Path,
     *,
     backups: list[tuple[Path, Path]] | None = None,
+    rewrite_report: list[dict[str, Any]] | None = None,
 ) -> tuple[list[str], list[tuple[Path, Path]]]:
     changed: list[str] = []
     backup_log = backups if backups is not None else []
     adapter_backup = backup_root.parent / "adapters"
     for path in adapter_candidates(root):
         text = safe_read(path, 512_000)
-        updated = replace_self_references(text)
+        updated, replacements = replace_self_references_with_report(text)
         if updated == text:
             continue
         rel = path.relative_to(root)
@@ -846,6 +912,8 @@ def rewrite_adapters(
         backup_log.append((path, backup))
         atomic_write_text(path, updated)
         changed.append(rel.as_posix())
+        if rewrite_report is not None:
+            rewrite_report.append({"path": rel.as_posix(), "replacements": replacements})
     return changed, backup_log
 
 
@@ -972,13 +1040,15 @@ def apply_migration(root: Path, classification: Classification, *, allow_mixed: 
     except RuntimeError as exc:
         return MigrationResult("blocked", classification, message=str(exc))
     if classification.status in {"canonical", "canonical-with-foreign", "canonical-with-preserved-legacy"}:
-        changed = rewrite_tree(canonical_dir(root))
+        rewrite_report: list[dict[str, Any]] = []
+        changed = rewrite_tree(canonical_dir(root), rewrite_report)
         if changed:
             return MigrationResult(
                 "repaired",
                 classification,
                 applied=True,
                 changed_adapters=changed,
+                rewrite_report=rewrite_report,
                 message="canonical .tenetora operational references were normalized",
             )
         return MigrationResult("current", classification, message=".tenetora is already canonical")
@@ -1000,6 +1070,7 @@ def apply_migration(root: Path, classification: Classification, *, allow_mixed: 
     lock = root / f"{CANONICAL_DIR_NAME}.migration.lock"
     adapters: list[tuple[Path, Path]] = []
     changed_adapters: list[str] = []
+    rewrite_report: list[dict[str, Any]] = []
     published = False
     lock_acquired = False
     tracked_source = source_is_tracked(root)
@@ -1017,7 +1088,7 @@ def apply_migration(root: Path, classification: Classification, *, allow_mixed: 
         validate_unredirected_path(backup, label="governance migration backup")
         shutil.copytree(source, backup, symlinks=True)
         copy_source(source, staging, classification, allow_mixed)
-        rewrite_tree(staging)
+        rewrite_tree(staging, rewrite_report)
         ensure_manifest(
             staging,
             version=package_version(SCRIPTS_DIR),
@@ -1033,7 +1104,7 @@ def apply_migration(root: Path, classification: Classification, *, allow_mixed: 
         os.replace(staging, destination)
         published = True
         preserved = classification.status != "legacy-owned"
-        changed_adapters, _ = rewrite_adapters(root, backup, backups=adapters)
+        changed_adapters, _ = rewrite_adapters(root, backup, backups=adapters, rewrite_report=rewrite_report)
         ignore_changes, _ = rewrite_ignore_policy(
             root,
             backup,
@@ -1053,6 +1124,7 @@ def apply_migration(root: Path, classification: Classification, *, allow_mixed: 
             "destination_layout": CANONICAL_DIR_NAME,
             "source_fingerprint": classification.source_fingerprint,
             "backup": str(backup),
+            "rewrite_report": rewrite_report,
             "completed_at": utc_now(),
         }
         journal_warning = ""
@@ -1066,6 +1138,7 @@ def apply_migration(root: Path, classification: Classification, *, allow_mixed: 
             applied=True,
             backup=str(backup),
             changed_adapters=changed_adapters,
+            rewrite_report=rewrite_report,
             preserved_legacy=preserved,
             message="legacy project governance migrated to .tenetora" + journal_warning,
         )
@@ -1176,6 +1249,21 @@ def render_text(
         lines.append(f"{'备份' if chinese else 'Backup'}: {result.backup}")
     if result and result.changed_adapters:
         lines.append(("已更新适配器: " if chinese else "Updated adapters: ") + ", ".join(result.changed_adapters))
+    if result and result.rewrite_report:
+        lines.append("改写明细：" if chinese else "Rewrite details:")
+        for item in result.rewrite_report:
+            replacements = item.get("replacements", [])
+            count = sum(int(entry.get("count", 0)) for entry in replacements if isinstance(entry, dict))
+            lines.append(f"- {item.get('path')}: {count} deterministic self-reference replacements")
+            for entry in replacements:
+                if not isinstance(entry, dict):
+                    continue
+                category = entry.get("category", "unknown")
+                locations = ", ".join(str(value) for value in entry.get("lines", [])) or "unknown"
+                lines.append(
+                    f"  - [{category}] {entry.get('from')} -> {entry.get('to')}; "
+                    f"count={entry.get('count', 0)}; lines={locations}"
+                )
     if result and result.preserved_legacy:
         lines.append("由于来源混合或存在歧义，旧 .harness 已保留。" if chinese else "Legacy .harness was preserved because the source was mixed or ambiguous.")
     if plan:

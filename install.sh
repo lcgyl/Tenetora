@@ -6,12 +6,12 @@ MINIMUM_PYTHON_MINOR=9
 REQUIRED_INSTALLER_PROTOCOL=3
 MAX_ARCHIVE_BYTES=$((128*1024*1024))
 DEFAULT_RAW_URL="https://raw.githubusercontent.com/lcgyl/Tenetora/main/install.sh"
-DEFAULT_ZIP_URL="https://r2.lcgylupup.workers.dev/stable/0.3.40/tenetora-0.3.40.zip"
-DEFAULT_MANIFEST_URL="https://r2.lcgylupup.workers.dev/stable/0.3.40/manifest.json"
-DEFAULT_PREVIEW_ZIP_URL="https://r2.lcgylupup.workers.dev/preview/0.3.40.009-preview/tenetora-0.3.40.009-preview.zip"
-DEFAULT_PREVIEW_MANIFEST_URL="https://r2.lcgylupup.workers.dev/preview/0.3.40.009-preview/manifest.json"
+DEFAULT_ZIP_URL="https://r2.lcgylfamily.cn/stable/0.3.40/tenetora-0.3.40.zip"
+DEFAULT_MANIFEST_URL="https://r2.lcgylfamily.cn/stable/0.3.40/manifest.json"
+DEFAULT_PREVIEW_ZIP_URL="https://r2.lcgylfamily.cn/preview/0.3.40.017-preview/tenetora-0.3.40.017-preview.zip"
+DEFAULT_PREVIEW_MANIFEST_URL="https://r2.lcgylfamily.cn/preview/0.3.40.017-preview/manifest.json"
 DEFAULT_SOURCE_ZIP_URL="https://github.com/lcgyl/Tenetora/archive/refs/heads/main.zip"
-DEFAULT_RELEASE_INDEX_BASE="https://r2.lcgylupup.workers.dev"
+DEFAULT_RELEASE_INDEX_BASE="https://r2.lcgylfamily.cn"
 
 ZIP_URL="${TENETORA_ZIP_URL:-$DEFAULT_ZIP_URL}"
 ZIP_URL_EXPLICIT=0
@@ -30,6 +30,7 @@ external_manifest_sha=""
 HARNESS_HOME="${TENETORA_HOME:-}"
 USER_HOME="${HOME:-}"
 SOURCE_DIR="${TENETORA_SOURCE_DIR:-}"
+TARGET_SOURCE_RESOLVED=0
 TOOLS="${TENETORA_TOOLS:-auto}"
 SCOPE="${TENETORA_SCOPE:-global}"
 SCOPE_EXPLICIT=0
@@ -321,7 +322,7 @@ Tenetora 在线安装器
 安装选项：
   --home <dir>           Tenetora 主目录。默认：~/.tenetora。
                           Codex --codex-hooks project 需要使用这个默认稳定目录。
-  -t, --tools <tools>    auto、all 或工具列表：agents,codex,claude,cursor,opencode,pi,zcode。
+  -t, --tools <tools>    auto、all 或工具列表：agents,codex,claude,cursor,opencode,pi,zcode,dsh。
   -g, --global           首次安装到用户级目录；升级时只筛选已有全局安装。安装默认值。
   -i, --in-project       首次安装到 --path 项目；升级时只筛选已有项目安装。
   -b, --both             首次安装两个范围；升级时筛选两个范围中的已有安装。
@@ -395,7 +396,7 @@ Package source:
 Install options:
   --home <dir>            Tenetora home. Default: ~/.tenetora.
                           Codex --codex-hooks project requires this default stable home.
-  -t, --tools <tools>     auto, all, or comma-separated tools: agents,codex,claude,cursor,opencode,pi,zcode.
+  -t, --tools <tools>     auto, all, or comma-separated tools: agents,codex,claude,cursor,opencode,pi,zcode,dsh.
   -g, --global            Fresh install to user-level directories; upgrade only existing global surfaces. Install default.
   -i, --in-project        Fresh install under --path; upgrade only existing project surfaces.
   -b, --both              Fresh install both scopes; upgrade existing surfaces from both scopes.
@@ -660,6 +661,78 @@ payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 value = payload.get("bridge_protocol", 0)
 print(value if isinstance(value, int) else 0)
 PY
+}
+
+source_bridge_worker_channel() {
+  local dir="$1"
+  if [[ ! -f "${dir}/manifest.json" ]]; then
+    echo 0
+    return 0
+  fi
+  "$PYTHON_BIN" - "${dir}/manifest.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+value = payload.get("bridge_worker_channel", 0)
+print(value if isinstance(value, int) else 0)
+PY
+}
+
+source_release_channel() {
+  local dir="$1"
+  if [[ ! -f "${dir}/manifest.json" ]]; then
+    echo ""
+    return 0
+  fi
+  "$PYTHON_BIN" - "${dir}/manifest.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    channel = payload.get("channel") or "stable"
+except Exception:
+    channel = "invalid"
+print(channel if isinstance(channel, str) and channel in {"stable", "preview"} else "invalid")
+PY
+}
+
+validate_requested_package_channel() {
+  local package_channel
+  package_channel="$(source_release_channel "$SOURCE_DIR")"
+  if [[ -z "$package_channel" ]]; then
+    if [[ "$CHANNEL" == "preview" ]]; then
+      die "$(i18n_text "Preview installation requires a release manifest with preview channel identity." "预览安装需要带有 preview 渠道身份的 release manifest。")"
+    fi
+    return 0
+  fi
+  if [[ "$package_channel" == "invalid" || "$package_channel" != "$CHANNEL" ]]; then
+    die "$(i18n_text "Package channel does not match the requested channel (package=${package_channel}, requested=${CHANNEL})." "安装包渠道与请求渠道不匹配（安装包=${package_channel}，请求=${CHANNEL}）。")"
+  fi
+}
+
+validate_legacy_stable_direction() {
+  [[ -z "$BEFORE_VERSION" ]] && return 0
+  # Legacy stable workers compare against their own version, not the active
+  # release. Preserve the installed preview's no-downgrade boundary here.
+  if ! "$PYTHON_BIN" - "$(source_version "$SOURCE_DIR")" "$BEFORE_VERSION" <<'PY'
+import re
+import sys
+
+target = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", sys.argv[1])
+current = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:\.(\d{3})-preview)?", sys.argv[2])
+if target is None or current is None:
+    raise SystemExit(1)
+target_key = tuple(map(int, target.groups())) + (0, 0)
+current_key = tuple(map(int, current.groups()[:3])) + (int(current[4] is not None), int(current[4] or 0))
+raise SystemExit(0 if target_key >= current_key else 1)
+PY
+  then
+    die "$(i18n_text "Release version is older than the installed version or its direction cannot be verified." "Release 版本早于已安装版本，或无法验证升级方向。")"
+  fi
 }
 
 package_contract_missing() {
@@ -985,7 +1058,9 @@ if not zipfile.is_zipfile(zip_path):
 
 with zipfile.ZipFile(zip_path) as archive:
     all_infos = archive.infolist()
-    infos = [info for info in all_infos if not info.is_dir()]
+    # Older Python versions index filename[-1] in is_dir(); validate empty
+    # filenames below before calling that method.
+    infos = [info for info in all_infos if not info.filename.endswith("/")]
     names = [info.filename for info in infos]
     if not names:
         raise SystemExit("Zip package is empty." if os.environ.get("TENETORA_LANG") != "zh" else "Zip 安装包为空。")
@@ -1399,6 +1474,7 @@ if [[ -n "$SOURCE_DIR" ]]; then
     die "$(i18n_text "Source directory contains a symbolic link, junction, or non-regular file: $SOURCE_DIR" "源码目录包含符号链接、junction 或非普通文件：$SOURCE_DIR")"
   fi
   SOURCE_DIR="$(canonical_dir "$SOURCE_DIR")"
+  TARGET_SOURCE_RESOLVED=1
 else
   say "[1/6] Resolving package from zip..." "[1/6] 正在从 zip 解析安装包..."
 
@@ -1599,7 +1675,14 @@ ${missing_package_paths}"
         "安装包协议 ${package_protocol} 与所需协议 ${REQUIRED_INSTALLER_PROTOCOL} 不兼容；请使用匹配或更新的 Tenetora 安装包。")"
     fi
     stamp_manifest_sha "$SOURCE_DIR" "$actual_sha"
+    TARGET_SOURCE_RESOLVED=1
   fi
+fi
+
+# A remote/ZIP dry-run has not acquired the target; current is only a planning
+# fallback and must not be mistaken for the requested package.
+if [[ "$TARGET_SOURCE_RESOLVED" == "1" ]]; then
+  validate_requested_package_channel
 fi
 
 if [[ "$DRY_RUN" != "1" && ! -f "${SOURCE_DIR}/skills/tenetora/SKILL.md" && ! -f "${SOURCE_DIR}/skills/agent-harness/SKILL.md" ]]; then
@@ -1691,7 +1774,12 @@ fi
 # the versioned Python worker. The shell remains only the acquisition/bootstrap
 # boundary; source checkouts without a release manifest keep the developer path.
 BRIDGE_PROTOCOL="$(source_bridge_protocol "$SOURCE_DIR")"
+BRIDGE_WORKER_CHANNEL="$(source_bridge_worker_channel "$SOURCE_DIR")"
+PACKAGE_CHANNEL="$(source_release_channel "$SOURCE_DIR")"
 if [[ "$BRIDGE_PROTOCOL" -ge 1 ]]; then
+  if [[ "$DRY_RUN" != "1" && "$BRIDGE_WORKER_CHANNEL" -lt 1 && "$PACKAGE_CHANNEL" == "stable" ]]; then
+    validate_legacy_stable_direction
+  fi
   BRIDGE_WORKER="${SOURCE_DIR}/skills/tenetora/scripts/upgrade_skill.py"
   if [[ ! -f "$BRIDGE_WORKER" ]]; then
     die "$(i18n_text "Bridge-capable package is missing its upgrade worker." "支持 bridge 的安装包缺少升级 worker。")"
@@ -1705,11 +1793,16 @@ if [[ "$BRIDGE_PROTOCOL" -ge 1 ]]; then
     "--mode" "$MODE"
     "--codex-hooks" "$CODEX_HOOKS"
     "--progress" "$PROGRESS_MODE"
-    "--channel" "$CHANNEL"
     "--configure-path"
     "--log-file" "$LOG_FILE"
     "--events-jsonl" "$EVENT_FILE"
   )
+  # New stable packages declare channel support explicitly. Legacy preview
+  # packages predate that capability field but their worker already accepts
+  # --channel, so their manifest identity is also a safe forwarding signal.
+  if [[ "$BRIDGE_WORKER_CHANNEL" -ge 1 || "$PACKAGE_CHANNEL" == "preview" ]]; then
+    BRIDGE_ARGS+=("--channel" "$CHANNEL")
+  fi
   if [[ "$OPERATION" != "upgrade" ]]; then
     BRIDGE_ARGS+=("--bootstrap-install")
   fi

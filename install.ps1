@@ -26,13 +26,27 @@
 )
 
 $ErrorActionPreference = "Stop"
+# Windows PowerShell 5.1 inherits PSModulePath from its parent. When that parent
+# is PowerShell 7 (or a host that copied its module roots), 5.1 cannot auto-load
+# its own built-in modules and Get-FileHash / Expand-Archive disappear. Prepend
+# this host's module root so the core cmdlets resolve again.
+$HostModuleRoot = Join-Path $PSHOME "Modules"
+if ($HostModuleRoot) {
+  # Order matters: a PowerShell 7 module root earlier in the list shadows 5.1's
+  # own Microsoft.PowerShell.Utility, so this host's root must come first.
+  $moduleRoots = @(
+    $env:PSModulePath -split ";" |
+      Where-Object { $_ -and $_.TrimEnd("\") -ine $HostModuleRoot.TrimEnd("\") }
+  )
+  $env:PSModulePath = (@($HostModuleRoot) + $moduleRoots) -join ";"
+}
 $MinimumPython = [version]"3.9"
-$DefaultZipUrl = "https://r2.lcgylupup.workers.dev/stable/0.3.40/tenetora-0.3.40.zip"
-$DefaultManifestUrl = "https://r2.lcgylupup.workers.dev/stable/0.3.40/manifest.json"
-$DefaultPreviewZipUrl = "https://r2.lcgylupup.workers.dev/preview/0.3.40.009-preview/tenetora-0.3.40.009-preview.zip"
-$DefaultPreviewManifestUrl = "https://r2.lcgylupup.workers.dev/preview/0.3.40.009-preview/manifest.json"
+$DefaultZipUrl = "https://r2.lcgylfamily.cn/stable/0.3.40/tenetora-0.3.40.zip"
+$DefaultManifestUrl = "https://r2.lcgylfamily.cn/stable/0.3.40/manifest.json"
+$DefaultPreviewZipUrl = "https://r2.lcgylfamily.cn/preview/0.3.40.017-preview/tenetora-0.3.40.017-preview.zip"
+$DefaultPreviewManifestUrl = "https://r2.lcgylfamily.cn/preview/0.3.40.017-preview/manifest.json"
 $DefaultSourceZipUrl = "https://github.com/lcgyl/Tenetora/archive/refs/heads/main.zip"
-$DefaultReleaseIndexBase = "https://r2.lcgylupup.workers.dev"
+$DefaultReleaseIndexBase = "https://r2.lcgylfamily.cn"
 $IsWindowsHost = ($env:OS -eq "Windows_NT") -or ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT)
 $SourceWasExplicitDirectory = [bool]$SourceDir
 $ZipUrlWasExplicit = [bool]$env:TENETORA_ZIP_URL -or $PSBoundParameters.ContainsKey("ZipUrl")
@@ -179,7 +193,7 @@ function Resolve-Python {
   $candidates = @()
   if ($env:TENETORA_PYTHON) { $candidates += ,@($env:TENETORA_PYTHON, "") }
   $candidates += @(
-    @("py", "-3.13"), @("py", "-3.12"), @("py", "-3.11"), @("py", "-3.10"), @("py", "-3.9"),
+    @("py", "-3.13"), @("py", "-3.12"), @("py", "-3.11"), @("py", "-3.10"), @("py", "-3.9"), @("py", ""),
     @("python", ""), @("python3", "")
   )
   foreach ($candidate in $candidates) {
@@ -187,7 +201,15 @@ function Resolve-Python {
     if (-not $command) { continue }
     $args = @()
     if ($candidate[1]) { $args += $candidate[1] }
-    $versionText = & $command.Source @args -c "import sys; print('.'.join(map(str, sys.version_info[:3])))" 2>$null
+    # A failing launcher probe (for example `py -3.13` while the launcher cannot
+    # see a per-user interpreter) must be a silent miss under
+    # $ErrorActionPreference = "Stop", not a terminating NativeCommandError.
+    $versionText = $null
+    try {
+      $versionText = & $command.Source @args -c "import sys; print('.'.join(map(str, sys.version_info[:3])))" 2>$null
+    } catch {
+      $versionText = $null
+    }
     if (-not $versionText) { continue }
     try { $version = [version]$versionText.Trim() } catch { continue }
     if ($version -ge $MinimumPython) { return @($command.Source, $candidate[1], $versionText.Trim()) }
@@ -210,7 +232,8 @@ if os.path.getsize(path) > 128 * 1024 * 1024:
     raise SystemExit("ZIP package exceeds the bounded archive size limit.")
 with zipfile.ZipFile(path) as archive:
     all_infos = archive.infolist()
-    infos = [item for item in all_infos if not item.is_dir()]
+    # Validate empty filenames before older Python's is_dir() can index them.
+    infos = [item for item in all_infos if not item.filename.endswith("/")]
     if not infos:
         raise SystemExit("ZIP package is empty.")
     if len(all_infos) > 4096 or sum(int(item.file_size) for item in infos) > 256 * 1024 * 1024:
@@ -323,6 +346,38 @@ function Test-ReleaseManifest([object]$External, [string]$EmbeddedPath, [string]
     if ($files -notcontains $property.Name -or [string]$property.Value -notmatch '^[0-9a-f]{64}$') {
       throw (Get-Text "The external release manifest file hashes are invalid." "外部 release manifest 的文件哈希无效。")
     }
+  }
+}
+
+function Test-RequestedPackageChannel([string]$SourceRoot, [string]$RequestedChannel) {
+  $manifestPath = Join-Path $SourceRoot "manifest.json"
+  if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+    if ($RequestedChannel -eq "preview") {
+      throw (Get-Text "Preview installation requires a release manifest with preview channel identity." "预览安装需要带有 preview 渠道身份的 release manifest。")
+    }
+    return
+  }
+  try {
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    if ($null -eq $manifest -or $manifest -isnot [PSCustomObject]) { throw "Invalid manifest object" }
+    $packageChannel = if ($manifest.channel) { [string]$manifest.channel } else { "stable" }
+  } catch {
+    throw (Get-Text "The embedded release manifest channel is invalid." "内嵌 release manifest 的渠道无效。")
+  }
+  if ($packageChannel -notin @("stable", "preview") -or $packageChannel -cne $RequestedChannel) {
+    throw (Get-Text "Package channel does not match the requested channel (package=$packageChannel, requested=$RequestedChannel)." "安装包渠道与请求渠道不匹配（安装包=$packageChannel，请求=$RequestedChannel）。")
+  }
+}
+
+function Test-LegacyStableDirection([string]$TargetVersion, [string]$InstalledVersion) {
+  if ($InstalledVersion -notmatch '^(\d+\.\d+\.\d+)(?:\.(\d{3})-preview)?$') {
+    throw (Get-Text "The installed release version cannot be verified." "无法验证已安装 release 的版本。")
+  }
+  $installedBase = [version]$Matches[1]
+  $installedPreview = [bool]$Matches[2]
+  $targetBase = [version]$TargetVersion
+  if ($targetBase -lt $installedBase -or ($targetBase -eq $installedBase -and $installedPreview)) {
+    throw (Get-Text "Release version is older than the installed version." "Release 版本早于已安装版本。")
   }
 }
 
@@ -831,6 +886,8 @@ try {
     }
   }
 
+  Test-RequestedPackageChannel $sourceRoot $Channel
+
   $version = (Get-Content -LiteralPath (Join-Path $sourceRoot "skills\tenetora\VERSION") -Raw).Trim()
   if ($version -notmatch '^\d+\.\d+\.\d+$' -and $version -notmatch '^\d+\.\d+\.\d+\.\d{3}-preview$') { throw (Get-Text "Tenetora package version is invalid." "Tenetora 安装包版本无效。") }
   if ($effectiveUpdate) {
@@ -846,9 +903,11 @@ try {
   $install = Join-Path $sourceRoot "scripts\install-skill.py"
   $runtimeTransaction = Join-Path $sourceRoot "skills\tenetora\scripts\runtime_transaction.py"
   $bridgeProtocol = 0
+  $bridgeWorkerChannel = 0
   $packageManifestPath = Join-Path $sourceRoot "manifest.json"
   if (Test-Path -LiteralPath $packageManifestPath -PathType Leaf) {
     try { $bridgeProtocol = [int](((Get-Content -LiteralPath $packageManifestPath -Raw) | ConvertFrom-Json).bridge_protocol) } catch { $bridgeProtocol = 0 }
+    try { $bridgeWorkerChannel = [int](((Get-Content -LiteralPath $packageManifestPath -Raw) | ConvertFrom-Json).bridge_worker_channel) } catch { $bridgeWorkerChannel = 0 }
   }
   # The bridge worker delegates the mutating phase to a nested process that
   # requires proof of this outer transaction lock. Acquire it before either
@@ -860,9 +919,16 @@ try {
     $sourceVersion = "0.0.0"
     $currentVersion = Join-Path $TenetoraHome "current\skills\tenetora\VERSION"
     if (Test-Path -LiteralPath $currentVersion -PathType Leaf) { $sourceVersion = (Get-Content -LiteralPath $currentVersion -Raw).Trim() }
+    if (-not $DryRun -and $bridgeWorkerChannel -lt 1 -and $Channel -eq "stable") {
+      Test-LegacyStableDirection $version $sourceVersion
+    }
     $bridgeArgs = @($worker, "--bootstrap-bridge", "--bridge-source-version", $sourceVersion,
       "--path", $Path, "--tools", $Tools, "--mode", "copy", "--codex-hooks", $CodexHooks,
-      "--progress", $EffectiveProgress, "--channel", $Channel, "--configure-path")
+      "--progress", $EffectiveProgress, "--configure-path")
+    # New stable packages declare channel support explicitly. Legacy preview
+    # packages predate that capability field but their worker already accepts
+    # --channel, so their manifest identity is also a safe forwarding signal.
+    if ($bridgeWorkerChannel -ge 1 -or $Channel -eq "preview") { $bridgeArgs += @("--channel", $Channel) }
     $logDirectory = Join-Path $TenetoraHome "logs"
     New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
     $logStamp = [DateTime]::UtcNow.ToString("yyyyMMdd-HHmmss") + "-" + $PID

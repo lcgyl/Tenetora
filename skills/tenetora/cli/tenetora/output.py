@@ -462,6 +462,29 @@ def render_status_text(status: EnvironmentStatus, include_diagnostics: bool) -> 
                 )
     lines.append("")
 
+    timing = status.hook_timing or {}
+    if timing:
+        timing_preview = "; ".join(
+            f"{item.get('platform', '?')}/{item.get('mode', '?')}/{item.get('cache_state', '?')}: p50={item.get('p50_ms')}ms,p95={item.get('p95_ms')}ms"
+            for item in timing.get("summary", [])[:3]
+            if isinstance(item, dict)
+        ) or "none"
+        if use_chinese():
+            lines.extend([
+                "Hook 耗时：",
+                f"  状态={timing.get('status', 'unknown')}；样本={timing.get('samples', 0)}；超软预算={timing.get('over_soft_budget', 0)}；失败={timing.get('failed', 0)}",
+                f"  分组={len(timing.get('summary', []))}；小样本分组={timing.get('small_sample_groups', 0)}；无效样本={timing.get('invalid_samples', 0)}",
+                f"  分位数={timing_preview}",
+            ])
+        else:
+            lines.extend([
+                "Hook timing:",
+                f"  status={timing.get('status', 'unknown')}; samples={timing.get('samples', 0)}; over-soft-budget={timing.get('over_soft_budget', 0)}; failed={timing.get('failed', 0)}",
+                f"  groups={len(timing.get('summary', []))}; small-sample-groups={timing.get('small_sample_groups', 0)}; invalid-samples={timing.get('invalid_samples', 0)}",
+                f"  quantiles={timing_preview}",
+            ])
+        lines.append("")
+
     if include_diagnostics and status.findings:
         lines.append(findings_title)
         for finding in status.findings:

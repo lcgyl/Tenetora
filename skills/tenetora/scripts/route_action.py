@@ -687,7 +687,7 @@ def route_message(message: str) -> dict[str, Any]:
         commands.append("tenetora guard --action external-input --file <untrusted-file>")
     if "harness" in contexts:
         commands.append("tenetora guard --action rules")
-    commands.append('tenetora guard --action claim --claim-kind completion --verification-command "<full-command>" --verification-status passed')
+    commands.append('tenetora guard --action claim --verification-command "<full-command>" --verification-status passed')
     return {
         "version": 2,
         "status": "pass",

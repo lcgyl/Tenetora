@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Tenetora Governance",
+    "description": "Loads .tenetora project rules, guards git commit and push, protects registered local environment paths, and publishes the Tenetora lifecycle skills."
+  }
+}

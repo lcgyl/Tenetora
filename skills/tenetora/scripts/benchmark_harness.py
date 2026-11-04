@@ -6,8 +6,11 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -18,7 +21,6 @@ if str(SCRIPT_DIR) not in sys.path:
 import alignment_state  # noqa: E402
 from harness_io import atomic_write_text  # noqa: E402
 from path_security import harness_missing_message, validate_existing_project_path  # noqa: E402
-
 
 BENCHMARK_HISTORY_REL = ".tenetora/state/benchmark-history.json"
 
@@ -46,6 +48,10 @@ def parser() -> argparse.ArgumentParser:
         help="Project directory to benchmark. Defaults to the current directory.",
     )
     command_parser.add_argument("-j", "--json", action="store_true", help="Print JSON instead of Markdown.")
+    command_parser.add_argument('--hooks', action='store_true', help='Measure actual launchers using replay payloads in isolated project snapshots.')
+    command_parser.add_argument('--samples', type=int, default=10, help='Cold/warm pairs per event for --hooks (1..100).')
+    command_parser.add_argument('--hook-platform', choices=('claude', 'codex'), default='codex')
+    command_parser.add_argument('--soft-budget-ms', type=float, default=1000)
     command_parser.add_argument(
         "--include-refresh",
         action="store_true",
@@ -66,6 +72,44 @@ def parser() -> argparse.ArgumentParser:
 
 def script_dir() -> Path:
     return Path(__file__).resolve().parent
+
+
+def benchmark_hooks(root: Path, args: argparse.Namespace) -> dict[str, object]:
+    governance = root / '.tenetora'
+    if governance.is_symlink() or not (governance / 'README.md').is_file():
+        raise ValueError('Hook benchmark requires an existing unredirected .tenetora/README.md.')
+    hooks = SCRIPT_DIR.parents[2] / 'hooks'
+    if str(hooks) not in sys.path:
+        sys.path.insert(0, str(hooks))
+    from hook_timing import run_hook_measurement, timing_summary
+
+    samples = []
+    for mode, event_name in (('session-start', 'SessionStart'), ('user-prompt-submit', 'UserPromptSubmit'), ('stop', 'Stop')):
+        for _ in range(args.samples):
+            with tempfile.TemporaryDirectory(prefix='tenetora-hook-benchmark-') as raw:
+                snapshot = Path(raw)
+                for name in ('README.md', 'INDEX.md', 'rules', 'workflows', 'agents', 'wiki', 'manifest.json', 'profile.json'):
+                    source = root / '.tenetora' / name
+                    target = snapshot / '.tenetora' / name
+                    if source.is_symlink() or (source.is_dir() and any(path.is_symlink() for path in source.rglob('*'))):
+                        raise ValueError('Hook benchmark requires unredirected governance snapshot inputs.')
+                    if source.is_dir():
+                        shutil.copytree(source, target, symlinks=True)
+                    elif source.is_file():
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(source, target)
+                environment = {**os.environ, 'TENETORA_HOME': str(snapshot / 'machine-home'), 'TENETORA_PYTHON': sys.executable}
+                payload = json.dumps({'hook_event_name': event_name, 'cwd': str(snapshot),
+                    'session_id': 'latency-observation', 'prompt': 'Explain the existing project'}).encode()
+                for phase in ('cold', 'warm'):
+                    sample, _, _ = run_hook_measurement(snapshot, mode, payload, platform=args.hook_platform,
+                        cache_state=phase, origin='replay', budget_ms=args.soft_budget_ms, environment=environment)
+                    samples.append(sample)
+    return {'version': 1, 'status': 'pass' if all(sample['returncode'] == 0 for sample in samples) else 'fail',
+        'boundary': 'launcher-subprocess-wall-time', 'origin': 'replay',
+        'cache_definition': 'cold: first event in fresh governance snapshot; warm: consecutive event in same snapshot. Both use fresh processes; OS disk caches are uncontrolled.',
+        'limitations': 'Replay exercises the real launcher/handler; it does not prove native host dispatch, host queue latency, or model latency. Quantiles include all outcomes.',
+        'samples': samples, 'summary': timing_summary(samples)}
 
 
 def benchmark_steps(root: Path, include_refresh: bool) -> list[tuple[str, list[str]]]:
@@ -175,6 +219,18 @@ def print_markdown(result: dict[str, object]) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     root: Path = args.path
+    if args.hooks:
+        if not 1 <= args.samples <= 100:
+            parser().error('--samples must be in 1..100')
+        try:
+            result = benchmark_hooks(root, args)
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        if args.write:
+            write_history(root, result)
+        print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else json.dumps(result, ensure_ascii=False))
+        return 0 if result['status'] == 'pass' else 1
     started = time.perf_counter()
     steps: list[dict[str, object]] = []
     status = "pass"

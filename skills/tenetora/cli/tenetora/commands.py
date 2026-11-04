@@ -782,7 +782,9 @@ def handle_install_or_update(action: str, args: argparse.Namespace) -> int:
 
 
 def handle_setup(args: argparse.Namespace) -> int:
-    if not sys.stdin.isatty():
+    # An interactive setup needs a real session on both ends; captured or
+    # redirected streams cannot answer its prompts.
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
         print(
             "setup requires an interactive terminal; use tenetora status, install, update, and init for non-interactive use.",
             file=sys.stderr,
