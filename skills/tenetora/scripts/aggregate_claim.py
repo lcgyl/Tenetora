@@ -20,6 +20,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from harness_io import atomic_write_text  # noqa: E402
 import alignment_state  # noqa: E402
+from governance_trail import load_trail  # noqa: E402
 import repository_units  # noqa: E402
 from path_security import is_redirected_path, validate_existing_project_path  # noqa: E402
 from worktree_fingerprint import (  # noqa: E402
@@ -220,13 +221,10 @@ def proof_event(child: Path, proof: str) -> tuple[dict[str, Any] | None, str | N
     problem = path_problem(child, relative)
     if problem:
         return None, "child-proof-trail-" + problem.removeprefix("child-path-")
-    try:
-        payload = json.loads((child / relative).read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    payload = load_trail(child)
+    if payload.get("invalid"):
         return None, "child-proof-trail-invalid"
-    events = payload.get("events") if isinstance(payload, dict) else None
-    if not isinstance(events, list):
-        return None, "child-proof-trail-invalid"
+    events = payload["events"]
     matching_index: int | None = None
     matching_event: dict[str, Any] | None = None
     for index, item in enumerate(events):

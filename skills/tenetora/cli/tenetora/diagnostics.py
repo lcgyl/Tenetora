@@ -184,6 +184,38 @@ def _compact_activity(activity: object) -> dict[str, object]:
     }
 
 
+def _compact_hook_timing(timing: object) -> dict[str, object]:
+    if not isinstance(timing, dict):
+        return {"status": "not-observed", "samples": 0, "summary": []}
+    summary = timing.get("summary") if isinstance(timing.get("summary"), list) else []
+    compact_summary = []
+    for item in summary:
+        if not isinstance(item, dict):
+            continue
+        row = {
+            key: _safe_string(item.get(key))
+            for key in ("platform", "mode", "origin", "cache_state")
+            if isinstance(item.get(key), str)
+        }
+        for key in ("samples", "p50_ms", "p95_ms", "failed", "over_soft_budget"):
+            value = item.get(key)
+            if type(value) in (int, float) and value >= 0:
+                row[key] = value
+        if isinstance(item.get("small_sample"), bool):
+            row["small_sample"] = item["small_sample"]
+        compact_summary.append(row)
+    return {
+        "status": _safe_string(timing.get("status")),
+        "window_days": _safe_count(timing.get("window_days")),
+        "samples": _safe_count(timing.get("samples")),
+        "invalid_samples": _safe_count(timing.get("invalid_samples")),
+        "over_soft_budget": _safe_count(timing.get("over_soft_budget")),
+        "failed": _safe_count(timing.get("failed")),
+        "small_sample_groups": _safe_count(timing.get("small_sample_groups")),
+        "summary": compact_summary,
+    }
+
+
 def _read_upgrade_state() -> dict[str, object]:
     try:
         state_path = machine_home() / "state" / "upgrade-transaction.json"
@@ -259,6 +291,7 @@ def _fallback_payload(error_code: str) -> dict[str, object]:
         "health": {"status": "BLOCKED", "actionable_findings": 1},
         "findings": [],
         "activity": {"status": "not-observed", "counts": {}, "recent": []},
+        "hook_timing": {"status": "not-observed", "samples": 0, "summary": []},
         "upgrade": _read_upgrade_state(),
         "redaction": {"mode": "strict", "omitted": ["credentials", "local paths", "URLs", "project content", "raw state"]},
     }
@@ -289,6 +322,7 @@ def build_diagnostics(root: Path, tools: list[str], scope: str) -> dict[str, obj
         "health": health,
         "findings": [_compact_finding(item) for item in status.findings],
         "activity": activity,
+        "hook_timing": _compact_hook_timing(status.hook_timing),
         "upgrade": upgrade,
         "redaction": {
             "mode": "strict",

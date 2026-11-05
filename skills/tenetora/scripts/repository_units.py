@@ -20,6 +20,7 @@ if str(SCRIPT_DIRECTORY) not in sys.path:
 from path_security import harness_missing_message, is_redirected_path  # noqa: E402
 from alignment_state import state_lock  # noqa: E402
 from harness_io import atomic_write_text  # noqa: E402
+from governance_trail import load_trail  # noqa: E402
 from worktree_fingerprint import (  # noqa: E402
     WORKTREE_FINGERPRINT_VERSION,
     git_state_fingerprint,
@@ -280,12 +281,10 @@ def _read_claim_events(child: Path) -> list[dict[str, Any]] | None:
     path = child / relative
     if not path.is_file():
         return None
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    payload = load_trail(child)
+    if payload.get("invalid"):
         return None
-    events = payload.get("events") if isinstance(payload, dict) else None
-    return [item for item in events if isinstance(item, dict)] if isinstance(events, list) else None
+    return payload["events"]
 
 
 def _claim_proof_problems(child: Path, proof: str) -> list[str]:

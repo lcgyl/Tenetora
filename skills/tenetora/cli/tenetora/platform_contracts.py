@@ -26,7 +26,7 @@ REQUIRED_PLATFORM_FIELDS = {
 }
 VALID_CAPABILITIES = {"SKILLS_ONLY", "ACTIVE", "ACTIVE_PARTIAL"}
 VALID_SCOPES = {"global", "project"}
-VALID_INSTALLERS = {"skills", "native-marketplace", "runtime-adapter", "zcode-native"}
+VALID_INSTALLERS = {"skills", "native-marketplace", "runtime-adapter", "zcode-native", "cordis-bundle"}
 VALID_PATH_ASSUMPTIONS = {"host-dependent", "standard", "restricted"}
 VALID_DELEGATION_SUPPORT = {"supported", "limited", "unknown", "unsupported"}
 EXECUTION_IDENTITY_FIELDS = {"session", "conversation", "continuity", "owner", "provider", "model", "attempt"}

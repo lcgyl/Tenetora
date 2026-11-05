@@ -1,5 +1,5 @@
 @echo off
-setlocal EnableExtensions DisableDelayedExpansion
+setlocal EnableExtensions EnableDelayedExpansion
 set "PYTHONDONTWRITEBYTECODE=1"
 
 set "MINIMUM_PYTHON_MAJOR=3"
@@ -17,10 +17,10 @@ if defined EXPLICIT_PYTHON (
   )
   if "%~1"=="--check" (
     "%EXPLICIT_PYTHON%" "%HOOK_SCRIPT%" --runtime-check
-    exit /b
+    exit /b !ERRORLEVEL!
   )
   "%EXPLICIT_PYTHON%" "%HOOK_SCRIPT%" %*
-  exit /b
+  exit /b !ERRORLEVEL!
 )
 
 set "HARNESS_HOME=%TENETORA_HOME%"
@@ -34,10 +34,10 @@ if defined RUNTIME_PYTHON (
   if not errorlevel 1 (
     if "%~1"=="--check" (
       "%RUNTIME_PYTHON%" "%HOOK_SCRIPT%" --runtime-check
-      exit /b
+      exit /b !ERRORLEVEL!
     )
     "%RUNTIME_PYTHON%" "%HOOK_SCRIPT%" %*
-    exit /b
+    exit /b !ERRORLEVEL!
   )
 )
 
@@ -47,10 +47,10 @@ for %%P in ("%LocalAppData%\Programs\Python\Python313\python.exe" "%LocalAppData
     if not errorlevel 1 (
       if "%~1"=="--check" (
         "%%~P" "%HOOK_SCRIPT%" --runtime-check
-        exit /b
+        exit /b !ERRORLEVEL!
       )
       "%%~P" "%HOOK_SCRIPT%" %*
-      exit /b
+      exit /b !ERRORLEVEL!
     )
   )
 )
@@ -63,10 +63,10 @@ if exist "%WHERE_EXE%" (
       if not errorlevel 1 (
         if "%~1"=="--check" (
           "%%I" -%%V "%HOOK_SCRIPT%" --runtime-check
-          exit /b
+          exit /b !ERRORLEVEL!
         )
         "%%I" -%%V "%HOOK_SCRIPT%" %*
-        exit /b
+        exit /b !ERRORLEVEL!
       )
     )
   )
@@ -77,10 +77,10 @@ if exist "%WHERE_EXE%" (
       if not errorlevel 1 (
         if "%~1"=="--check" (
           "%%I" "%HOOK_SCRIPT%" --runtime-check
-          exit /b
+          exit /b !ERRORLEVEL!
         )
         "%%I" "%HOOK_SCRIPT%" %*
-        exit /b
+        exit /b !ERRORLEVEL!
       )
     )
   )

@@ -17,6 +17,7 @@ if str(SCRIPT_DIR) not in sys.path:
 import alignment_state
 import delegation_state
 from path_security import validate_existing_project_path
+from security_patterns import GENERAL_SECRET_PATTERNS
 
 
 def use_chinese() -> bool:
@@ -71,11 +72,7 @@ REQUIRED = [
     "AGENTS.md",
 ]
 
-SECRET_PATTERNS = [
-    re.compile(r"glpat-[A-Za-z0-9._-]+"),
-    re.compile(r"BEGIN [A-Z ]*PRIVATE KEY"),
-    re.compile(r"\b[A-Z0-9_]*(TOKEN|SECRET|PASSWORD)\b\s*[:=]\s*['\"]?[^'\"\s${}]+", re.I),
-]
+SECRET_PATTERNS = GENERAL_SECRET_PATTERNS
 STALE_PATTERNS = [
     re.compile(r"<card|</span>|</p>|h[e]rness|READ[E]ME"),
     re.compile(r"(?im)^\s*(?:[-*]\s*)?(?:TODO|TBD)(?:\s*:|\s*$)"),
@@ -311,10 +308,17 @@ def main() -> int:
 
     for directory in [root / ".tenetora"]:
         if directory.exists():
-            for path in directory.rglob("*"):
-                if path.is_file():
-                    for finding in scan_text(path):
-                        failures.append(f"{finding} {path.relative_to(root).as_posix()}")
+            for current, directories, filenames in os.walk(directory):
+                # Runtime evidence and reproduction inputs are not project
+                # instructions. Prune only the reserved root cache; nested
+                # .cache names in persistent docs/rules remain in scope.
+                if Path(current) == directory and ".cache" in directories:
+                    directories.remove(".cache")
+                for filename in filenames:
+                    path = Path(current) / filename
+                    if path.is_file():
+                        for finding in scan_text(path):
+                            failures.append(f"{finding} {path.relative_to(root).as_posix()}")
 
     agents = root / "AGENTS.md"
     if agents.exists() and ".tenetora/README.md" not in agents.read_text(encoding="utf-8", errors="ignore"):

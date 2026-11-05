@@ -265,6 +265,39 @@
         "model": ["model", "model_name", "modelName"],
         "attempt": ["execution_attempt_id", "executionAttemptId", "attempt_id", "attemptId"]
       }
+    },
+    "dsh": {
+      "adapter_id": "dsh",
+      "maximum_capability": "ACTIVE_PARTIAL",
+      "default_scope": "global",
+      "both_runtime_preference": "global",
+      "installer": "cordis-bundle",
+      "runtime_kind": "cordis-plugin",
+      "path_assumption": "host-dependent",
+      "locator_environment": ["DSH_PROFILE_DIR", "DSH_HOME", "DSH_PROFILE"],
+      "discovery_order": ["profile-dependency", "profile-bundle", "profile-patch"],
+      "trust_mechanism": "profile-bundle-selection",
+      "version_sources": ["profile-dependency", "bundle/package.json", "skill/VERSION"],
+      "observation": false,
+      "delegation": {
+        "platform_support": "limited",
+        "support_basis": "native-service-contract",
+        "dispatch_label": "ctx.subagents",
+        "modes": ["native-provider"],
+        "builtin_agents": [],
+        "builtin_role_candidates": {},
+        "isolation_contract": "host-service"
+      },
+      "events": {},
+      "execution_identity": {
+        "session": ["session_id", "sessionId"],
+        "conversation": ["conversation_id", "conversationId"],
+        "continuity": ["conversation_continuity_id", "conversationContinuityId", "conversation_id", "conversationId"],
+        "owner": ["owner_id", "ownerId", "conversation_id", "conversationId"],
+        "provider": ["provider", "model_provider", "modelProvider"],
+        "model": ["model", "model_name", "modelName"],
+        "attempt": ["execution_attempt_id", "executionAttemptId", "attempt_id", "attemptId"]
+      }
     }
   }
 }

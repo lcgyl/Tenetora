@@ -168,7 +168,13 @@ def resolve_repository_scope(
             )
         print(scope_help(targets))
         while True:
-            answer = input_fn("Select scope [1] parent [2] all [3] specific submodule: ").strip().lower()
+            try:
+                answer = input_fn("Select scope [1] parent [2] all [3] specific submodule: ").strip().lower()
+            except EOFError as exc:
+                raise RepositoryScopeRequired(
+                    scope_help(targets)
+                    + "\nNon-interactive lifecycle writes require --repository-scope parent|all|<submodule-path>."
+                ) from exc
             if answer in {"1", "parent", "root", "."}:
                 normalized = "parent"
                 break
@@ -176,7 +182,13 @@ def resolve_repository_scope(
                 normalized = "all"
                 break
             if answer in {"3", "submodule", "specific"}:
-                selected = input_fn("Enter comma-separated submodule paths: ").strip()
+                try:
+                    selected = input_fn("Enter comma-separated submodule paths: ").strip()
+                except EOFError as exc:
+                    raise RepositoryScopeRequired(
+                        scope_help(targets)
+                        + "\nNon-interactive lifecycle writes require --repository-scope parent|all|<submodule-path>."
+                    ) from exc
                 normalized = _normalize_requested(selected)
                 if normalized not in {"ask", "parent", "all"}:
                     break

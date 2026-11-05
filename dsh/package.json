@@ -1,0 +1,26 @@
+{
+  "name": "@lcgyl/tenetora-dsh",
+  "version": "0.3.40-preview.18",
+  "private": true,
+  "type": "module",
+  "description": "Tenetora governance runtime for the DeepSeek Harness (Cordis) host.",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "lib/*.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "types/index.d.ts",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

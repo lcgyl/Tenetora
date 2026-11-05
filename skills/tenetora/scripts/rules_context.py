@@ -242,6 +242,21 @@ def error_payload(message: str) -> dict[str, Any]:
     }
 
 
+def load_contexts(root: Path, contexts: list[str], *, record: bool = True) -> dict[str, Any]:
+    """Shared fresh-read API for CLI and Hook; no persistent content cache."""
+    if not contexts or any(context not in CONTEXTS for context in contexts):
+        raise ValueError('Unknown rule context')
+    if not (root / '.tenetora').is_dir():
+        raise ValueError('Project governance is missing')
+    payload = context_payloads(root, contexts)
+    if record:
+        append_event(root, {'type': 'rules-context', 'context': payload['context'],
+            'contexts': contexts, 'status': payload['status'],
+            'files': [item['path'] for item in payload['files'] if item['exists']],
+            'missing': payload['missing'], 'source': 'tenetora rules'})
+    return payload
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     contexts = [item.strip().lower() for item in str(args.context).split(",") if item.strip()]
@@ -264,20 +279,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(payload["message"], file=sys.stderr)
         return 2
-    payload = context_payloads(root, contexts)
-    if not args.no_record:
-        append_event(
-            root,
-            {
-                "type": "rules-context",
-                "context": payload["context"],
-                "contexts": contexts,
-                "status": payload["status"],
-                "files": [item["path"] for item in payload["files"] if item["exists"]],
-                "missing": payload["missing"],
-                "source": "tenetora rules",
-            },
-        )
+    payload = load_contexts(root, contexts, record=not args.no_record)
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:

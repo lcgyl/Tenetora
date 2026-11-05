@@ -17,6 +17,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from path_security import validate_existing_project_path
+from security_patterns import GENERAL_SECRET_PATTERN
 
 EXCLUDED_DIRS = {
     ".git",
@@ -48,11 +49,7 @@ SHAREABLE_HARNESS_DIRS = (
     "wiki",
     "workflows",
 )
-SECRET_PATTERN = re.compile(
-    r"(glpat-[A-Za-z0-9._-]+|ghp_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|BEGIN [A-Z ]*PRIVATE KEY|"
-    r"\b[A-Z0-9_]*(TOKEN|SECRET|PASSWORD)\b\s*[:=]\s*['\"]?[^'\"\s${}]+)",
-    re.I,
-)
+SECRET_PATTERN = GENERAL_SECRET_PATTERN
 LOCAL_PATH_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_.-])(/Users/[^\s\"']+|/home/[^\s\"']+|[A-Za-z]:\\Users\\[^\s\"']+)"
 )
@@ -91,6 +88,13 @@ def parser() -> argparse.ArgumentParser:
         choices=("auto", "shell", "python"),
         default="auto",
         help="Guardrail runner. auto prefers generated shell checks when bash is available, otherwise uses Python.",
+    )
+    command_parser.add_argument(
+        "--only",
+        action="append",
+        choices=("secret", "local-path", "stale-doc", "test-framework", "dependency-version"),
+        default=[],
+        help="Run only the selected baseline check; repeatable.",
     )
     return command_parser
 
@@ -341,7 +345,7 @@ def run_custom_hooks(root: Path) -> int:
     return 0
 
 
-def run_python_checks(root: Path) -> int:
+def run_python_checks(root: Path, only: list[str] | None = None) -> int:
     if not (root / ".tenetora").is_dir():
         print(
             ".tenetora/guardrails/checks/run-all.sh is missing. "
@@ -350,13 +354,18 @@ def run_python_checks(root: Path) -> int:
         )
         return 2
     evidence = current_evidence(root)
-    checks = [
-        check_secret_scan(root),
-        check_local_path_scan(root),
-        check_stale_doc_scan(root),
-        check_test_framework_drift(root, evidence),
-        check_dependency_version_drift(root, evidence),
-    ]
+    selected = set(only or ("secret", "local-path", "stale-doc", "test-framework", "dependency-version"))
+    checks = []
+    if "secret" in selected:
+        checks.append(check_secret_scan(root))
+    if "local-path" in selected:
+        checks.append(check_local_path_scan(root))
+    if "stale-doc" in selected:
+        checks.append(check_stale_doc_scan(root))
+    if "test-framework" in selected:
+        checks.append(check_test_framework_drift(root, evidence))
+    if "dependency-version" in selected:
+        checks.append(check_dependency_version_drift(root, evidence))
     if not all(checks):
         return 1
     custom_result = run_custom_hooks(root)
@@ -366,7 +375,7 @@ def run_python_checks(root: Path) -> int:
     return 0
 
 
-def run_shell_checks(root: Path) -> int:
+def run_shell_checks(root: Path, only: list[str] | None = None) -> int:
     run_all = root / ".tenetora" / "guardrails" / "checks" / "run-all.sh"
     if not run_all.exists():
         print(
@@ -382,7 +391,10 @@ def run_shell_checks(root: Path) -> int:
     if not bash:
         print("bash is not available; use --runner python for cross-platform guardrails.", file=sys.stderr)
         return 2
-    completed = subprocess.run([bash, str(run_all)], cwd=root, check=False)
+    command = [bash, str(run_all)]
+    for check in only or []:
+        command.extend(("--only", check))
+    completed = subprocess.run(command, cwd=root, check=False)
     return int(completed.returncode)
 
 
@@ -390,12 +402,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     root: Path = args.path
     if args.runner == "python":
-        return run_python_checks(root)
+        return run_python_checks(root, args.only)
     if args.runner == "shell":
-        return run_shell_checks(root)
+        return run_shell_checks(root, args.only)
     if shutil.which("bash") and (root / ".tenetora" / "guardrails" / "checks" / "run-all.sh").is_file():
-        return run_shell_checks(root)
-    return run_python_checks(root)
+        return run_shell_checks(root, args.only)
+    return run_python_checks(root, args.only)
 
 
 if __name__ == "__main__":

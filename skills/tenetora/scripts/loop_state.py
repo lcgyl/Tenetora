@@ -18,6 +18,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from harness_io import atomic_write_text
 import alignment_state
+from governance_trail import latest_event
 from path_security import harness_missing_message, validate_existing_project_path
 
 
@@ -416,25 +417,14 @@ def write_state(root: Path, state: dict[str, object]) -> None:
 
 
 def latest_alignment_guard(root: Path, proof: str) -> dict[str, object] | None:
-    path = root / ".tenetora" / "state" / "governance-trail.json"
-    if not path.is_file():
-        return None
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    events = payload.get("events")
-    if not isinstance(events, list):
-        return None
-    for event in reversed(events):
-        if (
-            isinstance(event, dict)
-            and event.get("type") == "alignment-guard"
+    return latest_event(
+        root,
+        lambda event: (
+            event.get("type") == "alignment-guard"
             and event.get("status") == "pass"
             and event.get("alignment_proof") == proof
-        ):
-            return event
-    return None
+        ),
+    )
 
 
 def consume_alignment(root: Path, state: dict[str, object], proof: str) -> None:

@@ -12,6 +12,8 @@ import shlex
 import shutil
 import subprocess
 import sys
+import urllib.parse
+import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -157,14 +159,83 @@ def discover_source_paths() -> tuple[Path, Path]:
             return candidate, packaged_skill
     for candidate in Path(__file__).resolve().parents:
         if candidate.name == SKILL_NAME and (candidate / "SKILL.md").is_file():
-            return candidate, candidate
+            return candidate.parents[1], candidate
     fallback = Path(__file__).resolve().parents[2]
     return fallback, fallback / "skills" / SKILL_NAME
 
 
 REPO_ROOT, SKILL_SOURCE = discover_source_paths()
+_GOVERNANCE_TRAIL_MODULE = None
+_HOOK_TIMING_MODULE = None
 
 
+def governance_trail_module():
+    """Load the canonical trail reader from the active skill package."""
+
+    global _GOVERNANCE_TRAIL_MODULE
+    if _GOVERNANCE_TRAIL_MODULE is not None:
+        return _GOVERNANCE_TRAIL_MODULE
+    script = SKILL_SOURCE / "scripts" / "governance_trail.py"
+    if not script.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("tenetora_environment_governance_trail", script)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    script_dir = str(script.parent)
+    added = script_dir not in sys.path
+    if added:
+        sys.path.insert(0, script_dir)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if added:
+            sys.path.remove(script_dir)
+    _GOVERNANCE_TRAIL_MODULE = module
+    return module
+
+
+def hook_timing_module():
+    """Load the redacted Hook timing reader from the active package."""
+    global _HOOK_TIMING_MODULE
+    if _HOOK_TIMING_MODULE is not None:
+        return _HOOK_TIMING_MODULE
+    script = REPO_ROOT / "hooks" / "hook_timing.py"
+    if not script.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("tenetora_environment_hook_timing", script)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    script_dir = str(script.parent)
+    skill_scripts = str(SKILL_SOURCE / "scripts")
+    added = [item for item in (script_dir, skill_scripts) if item not in sys.path]
+    sys.path[0:0] = added
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        for item in added:
+            try:
+                sys.path.remove(item)
+            except ValueError:
+                pass
+    _HOOK_TIMING_MODULE = module
+    return module
+
+
+def hook_timing_snapshot(project_root: Path) -> dict[str, object]:
+    module = hook_timing_module()
+    if module is None:
+        return {"version": 1, "status": "unavailable", "window_days": 30,
+            "samples": 0, "invalid_samples": 0, "summary": [],
+            "over_soft_budget": 0, "failed": 0, "small_sample_groups": 0}
+    try:
+        return dict(module.load_timing_snapshot(project_root, days=30))
+    except Exception as exc:
+        return {"version": 1, "status": "invalid", "window_days": 30,
+            "samples": 0, "invalid_samples": 1, "summary": [],
+            "over_soft_budget": 0, "failed": 0, "small_sample_groups": 0,
+            "reason": type(exc).__name__}
 def local_environment_snapshot(project_root: Path) -> dict[str, object]:
     """Report registered local-environment paths without reading their contents."""
 
@@ -270,6 +341,7 @@ class EnvironmentStatus:
     activity: dict[str, object]
     acknowledgement_action: dict[str, object] | None = None
     acknowledgement_state: dict[str, object] | None = None
+    hook_timing: dict[str, object] | None = None
 
 
 def command_exists(name: str) -> bool:
@@ -319,6 +391,8 @@ def parse_tools(raw: str) -> list[str]:
         tools.append("pi")
     if zcode_detected(home):
         tools.append("zcode")
+    if dsh_detected():
+        tools.append("dsh")
     return tools
 
 
@@ -330,6 +404,8 @@ def selected_scopes(raw: str) -> list[str]:
 
 def tool_base(tool: str, scope: str, project_root: Path) -> Path:
     home = Path.home()
+    if tool == "dsh":
+        return dsh_profile_dir() if scope == "global" else project_root / ".dsh"
     if scope == "project":
         return project_root / f".{tool}" / "skills"
 
@@ -962,6 +1038,7 @@ def tool_delegation_capabilities(
         "cursor": "unverified",
         "agents": "host-dependent",
         "pi": "host-dependent",
+        "dsh": "host-dependent",
     }[tool]
     isolation_contract = str(delegation["isolation_contract"])
     observable = tool in {"codex", "claude", "zcode", "pi"} and hooks_state == "present"
@@ -1108,6 +1185,12 @@ def normalized_version(raw: str | None) -> str | None:
     if not isinstance(raw, str):
         return None
     value = raw.strip()
+    # Native plugin manifests use SemVer; release VERSION files use the
+    # canonical three-digit sequence. Only the shipped 001..999 identities
+    # are equivalent, never a stable release or another prerelease suffix.
+    preview = re.fullmatch(r"([0-9]+\.[0-9]+\.[0-9]+)-preview\.([1-9][0-9]{0,2})", value)
+    if preview is not None:
+        return f"{preview.group(1)}.{int(preview.group(2)):03d}-preview"
     if re.fullmatch(r"\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z.-]+)?", value):
         return value
     return None
@@ -1116,7 +1199,8 @@ def normalized_version(raw: str | None) -> str | None:
 def version_state(version: str | None) -> str | None:
     if version is None:
         return None
-    if version != __version__:
+    observed = normalized_version(version)
+    if observed is None or observed != normalized_version(__version__):
         return "stale"
     return "ok"
 
@@ -1383,6 +1467,165 @@ def zcode_plugin_info(scope: str, project_root: Path) -> dict[str, str | None]:
         "hooks": hooks,
         "activation": zcode_activation_state(scope, project_root),
         "registration": registration_state,
+    }
+
+
+DSH_BUNDLE_PACKAGE = "@lcgyl/tenetora-dsh"
+DSH_PATCH_START = "# --- tenetora-dsh managed (do not edit) ---"
+DSH_PATCH_END = "# --- end tenetora-dsh managed ---"
+DSH_PATCH_ROW_ID = "tenetora-dsh"
+
+
+def dsh_home() -> Path:
+    configured = os.environ.get("DSH_HOME")
+    return Path(configured).expanduser() if configured else Path.home() / ".dsh"
+
+
+def dsh_profile_dir() -> Path:
+    explicit = os.environ.get("DSH_PROFILE_DIR")
+    if explicit:
+        return Path(explicit).expanduser()
+    name = os.environ.get("DSH_PROFILE") or "desktop"
+    return dsh_home() / "profiles" / name
+
+
+def dsh_detected() -> bool:
+    home = dsh_home()
+    if (home / "profiles").is_dir():
+        return True
+    return (home / "profiles" / "desktop" / "package.json").is_file()
+
+
+def dsh_cli_command() -> str | None:
+    for name in ("dsh", "dsh.cmd"):
+        resolved = shutil.which(name)
+        if resolved:
+            return resolved
+    return None
+
+
+def dsh_patch_row_present(profile: Path) -> bool:
+    try:
+        text = (profile / "cordis.patch.yml").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return DSH_PATCH_START in text or f"id: {DSH_PATCH_ROW_ID}" in text
+
+
+def dsh_bundle_path(profile: Path, spec: str | None) -> Path | None:
+    if isinstance(spec, str) and spec.startswith(("link:", "file:")):
+        raw = spec.split(":", 1)[1].strip()
+        if raw:
+            candidate = Path(raw).expanduser()
+            return candidate if candidate.is_absolute() else (profile / candidate).resolve(strict=False)
+    installed = profile / "node_modules" / "@lcgyl" / "tenetora-dsh"
+    return installed if installed.exists() else None
+
+
+def dsh_patch_bundle_path(profile: Path) -> Path | None:
+    """Resolve the ``name`` the managed patch block points at."""
+
+    try:
+        text = (profile / "cordis.patch.yml").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    start = text.find(DSH_PATCH_START)
+    if start == -1:
+        return None
+    end = text.find(DSH_PATCH_END, start)
+    block = text[start:] if end == -1 else text[start:end]
+    for line in block.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("name:"):
+            continue
+        raw = stripped.split(":", 1)[1].strip().strip("'\"")
+        if raw.startswith("file://"):
+            parsed = urllib.parse.urlparse(raw)
+            path = urllib.request.url2pathname(parsed.path)
+            if os.name == "nt" and path.startswith(("/", "\\")):
+                path = path[1:]
+            return Path(path)
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = (profile / candidate).resolve(strict=False)
+        return candidate
+    return None
+
+
+def describe_dsh_install(scope: str, project_root: Path) -> dict[str, object]:
+    """Report the profile bundle or side-loaded row without writing anything."""
+
+    profile = dsh_profile_dir()
+    try:
+        manifest = json.loads((profile / "package.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        manifest = None
+    if not isinstance(manifest, dict):
+        return {
+            "path": None,
+            "state": "missing",
+            "version": None,
+            "hooks": None,
+            "activation": "unknown",
+            "registration": "profile-missing",
+            "runtime": "inactive",
+            "profile": str(profile),
+        }
+
+    dependency_spec: str | None = None
+    dependencies = manifest.get("dependencies")
+    if isinstance(dependencies, dict) and isinstance(dependencies.get(DSH_BUNDLE_PACKAGE), str):
+        dependency_spec = str(dependencies[DSH_BUNDLE_PACKAGE])
+    bundles: list[str] = []
+    profile_block = manifest.get("dsh")
+    if isinstance(profile_block, dict):
+        inner = profile_block.get("profile")
+        if isinstance(inner, dict) and isinstance(inner.get("bundles"), list):
+            bundles = [item for item in inner["bundles"] if isinstance(item, str)]
+    listed = DSH_BUNDLE_PACKAGE in bundles
+    side_loaded = dsh_patch_row_present(profile)
+
+    path = dsh_bundle_path(profile, dependency_spec)
+    if path is None:
+        path = dsh_patch_bundle_path(profile)
+    version: str | None = None
+    if path is not None:
+        try:
+            package = json.loads((path / "package.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            package = None
+        if isinstance(package, dict) and isinstance(package.get("version"), str):
+            version = str(package["version"])
+
+    if version is None:
+        state = "missing"
+    else:
+        state = version_state(version) or "ok"
+    if listed and path is None:
+        state, registration = "missing", "dependency-missing"
+    elif listed:
+        registration = "profile-bundle"
+    elif side_loaded and path is not None:
+        registration = "profile-patch"
+    elif side_loaded:
+        state, registration = "missing", "profile-patch"
+    elif dependency_spec is not None:
+        state, registration = "disabled", "profile-dependency"
+    else:
+        state, registration = "missing", "missing"
+
+    active = registration in {"profile-bundle", "profile-patch"} and state in {"ok", "stale"}
+    return {
+        "path": str(path) if path else None,
+        "state": state,
+        "version": version,
+        "hooks": "present" if active else "missing",
+        "activation": "enabled" if active else "disabled",
+        "registration": registration,
+        "runtime": "active-partial" if active else "inactive",
+        "profile": str(profile),
+        "listed": listed,
+        "side_loaded": side_loaded,
     }
 
 
@@ -1746,6 +1989,27 @@ def describe_install(tool: str, scope: str, project_root: Path) -> ToolInstall:
             ),
         )
 
+    if tool == "dsh":
+        bundle = describe_dsh_install(scope, project_root)
+        bundle_path = Path(str(bundle["path"])) if bundle.get("path") else install_root
+        return tool_install(
+            tool,
+            scope,
+            install_root,
+            bundle_path,
+            str(bundle["state"]),
+            "cordis-bundle",
+            str(bundle["path"]) if bundle.get("path") else None,
+            [],
+            plugin_root=bundle_path,
+            plugin_state=str(bundle["state"]),
+            hooks_state=str(bundle["hooks"]),
+            activation_state=str(bundle["activation"]),
+            registration_state=str(bundle["registration"]),
+            runtime_state=str(bundle["runtime"]),
+            hook_mode="cordis-bundle",
+        )
+
     if tool == "zcode" and scope == "global":
         plugin = zcode_plugin_info(scope, project_root)
         plugin_state = plugin["state"]
@@ -1914,6 +2178,36 @@ def skill_source_summary(
     project_root: Path,
     inventory: dict[tuple[str, str], ToolInstall],
 ) -> dict[str, object]:
+    if tool == "dsh":
+        install = inventory.get((tool, "global"))
+        bundle = Path(install.plugin_root) if install and install.plugin_root else None
+        candidates: list[dict[str, object]] = []
+        if bundle is not None:
+            release_root = bundle.parent
+            skills_root = release_root / "skills"
+            if (skills_root / SKILL_NAME / "SKILL.md").is_file():
+                candidates.append(
+                    source_candidate(
+                        layer="skill",
+                        kind="dsh-bundle-skills",
+                        scope="global",
+                        path=skills_root,
+                        version=read_skill_version(release_root),
+                        state="ok",
+                        basis="config-verified",
+                        configured=True,
+                        enabled=True,
+                    )
+                )
+        effective = candidates[0] if candidates else None
+        return {
+            "status": "resolved" if effective else "missing",
+            "effective": effective,
+            "candidates": candidates,
+            "shadowed": [],
+            "basis": "config-verified" if effective else "unknown",
+            "remediation": None,
+        }
     ordered: list[tuple[Path, str, str, str]] = []
     if tool == "zcode":
         ordered.extend(
@@ -1968,6 +2262,44 @@ def plugin_source_summary(
     project_root: Path,
     inventory: dict[tuple[str, str], ToolInstall],
 ) -> dict[str, object]:
+    if tool == "dsh":
+        install = inventory.get((tool, "global"))
+        path = Path(install.plugin_root) if install and install.plugin_root else None
+        if path is None or not path.exists():
+            return {
+                "status": "missing",
+                "effective": None,
+                "candidates": [],
+                "shadowed": [],
+                "basis": "config-verified",
+                "remediation": f"tenetora install --tools {tool} --global",
+            }
+        version = None
+        try:
+            payload = json.loads((path / "package.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict) and payload.get("version"):
+            version = str(payload["version"])
+        candidate = source_candidate(
+            layer="plugin",
+            kind="dsh-cordis-bundle",
+            scope="global",
+            path=path,
+            version=version,
+            state=install.plugin_state or "ok",
+            basis="config-verified",
+            configured=True,
+            enabled=install.activation_state == "enabled",
+        )
+        return {
+            "status": "resolved",
+            "effective": candidate,
+            "candidates": [candidate],
+            "shadowed": [],
+            "basis": "config-verified",
+            "remediation": None,
+        }
     if tool not in {"codex", "claude", "zcode"}:
         return {
             "status": "not-applicable",
@@ -2846,9 +3178,8 @@ def governance_activity_snapshot(root: Path, event_limit: int = 50) -> dict[str,
             "recent": [],
             "message": "No governance activity has been observed yet.",
         }
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    trail = governance_trail_module()
+    if trail is None:
         return {
             "status": "invalid",
             "events_considered": 0,
@@ -2856,8 +3187,8 @@ def governance_activity_snapshot(root: Path, event_limit: int = 50) -> dict[str,
             "recent": [],
             "message": "Governance activity state is unreadable.",
         }
-    events = payload.get("events") if isinstance(payload, dict) else None
-    if not isinstance(events, list):
+    payload = trail.load_trail(root)
+    if payload.get("invalid"):
         return {
             "status": "invalid",
             "events_considered": 0,
@@ -2865,7 +3196,7 @@ def governance_activity_snapshot(root: Path, event_limit: int = 50) -> dict[str,
             "recent": [],
             "message": "Governance activity state has an invalid events collection.",
         }
-    bounded = [item for item in events[-event_limit:] if isinstance(item, dict)]
+    bounded = list(payload["events"][-event_limit:])
     counts = {
         "rules_loaded": sum(item.get("type") == "rules-context" for item in bounded),
         "routes": sum(item.get("type") == "route" for item in bounded),
@@ -3675,6 +4006,7 @@ def collect_status(
         findings=[],
         health={},
         activity=governance_activity_snapshot(project_root),
+        hook_timing=hook_timing_snapshot(project_root),
     )
     if include_diagnostics:
         add_diagnostics(status)
@@ -3789,6 +4121,16 @@ def add_diagnostics(status: EnvironmentStatus) -> None:
                 status.recommendations.append("tenetora delegation --cleanup")
 
     add_commit_hook_diagnostics(status, root)
+
+    timing = status.hook_timing or {}
+    if timing.get("status") == "invalid":
+        status.issues.append("Hook timing samples are unreadable or invalid")
+        status.recommendations.append(f"tenetora insights --path {command_path_argument(project_root)} --json")
+    elif timing.get("status") == "observed" and int(timing.get("over_soft_budget", 0)) > 0:
+        status.issues.append(
+            f"Hook timing observed {timing.get('over_soft_budget', 0)} sample(s) over the soft budget"
+        )
+        status.recommendations.append(f"tenetora insights --path {command_path_argument(project_root)} --json")
 
     for tool in status.tools:
         effective = tool.effective_sources or {}
@@ -4062,6 +4404,7 @@ def to_jsonable(status: EnvironmentStatus) -> dict[str, object]:
         "findings": status.findings,
         "health": status.health,
         "activity": status.activity,
+        "hook_timing": status.hook_timing,
         "acknowledgement_state": status.acknowledgement_state,
         "acknowledgement_action": status.acknowledgement_action,
     }

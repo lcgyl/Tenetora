@@ -19,7 +19,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from claim_evidence import VERIFICATION_COMMAND_HASH_VERSION
 from path_security import validate_existing_project_path  # noqa: E402
+from governance_trail import iter_events  # noqa: E402
 from worktree_fingerprint import (  # noqa: E402
     WORKTREE_ENTRIES_VERSION,
     WORKTREE_FINGERPRINT_VERSION,
@@ -42,6 +44,7 @@ RELEASE_METADATA_PATHS = frozenset(
         "tenetora.plugin.json",
     }
 )
+VERIFICATION_MANIFEST = ".tenetora/manifest.json"
 BEHAVIOR_CONTRACT_ROOTS = frozenset(
     {
         "AGENTS.md",
@@ -205,25 +208,31 @@ def _project_root_fingerprint(root: Path) -> str:
 
 
 def _load_claim_events(root: Path) -> list[dict[str, Any]]:
-    path = root / ".tenetora" / "state" / "governance-trail.json"
-    if not path.is_file():
-        return []
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return []
-    events = payload.get("events") if isinstance(payload, dict) else None
     project_fingerprint = _project_root_fingerprint(root)
     return (
         [
             item
-            for item in events
-            if isinstance(item, dict)
-            and item.get("project_root_fingerprint") == project_fingerprint
+            for item in iter_events(root)
+            if item.get("project_root_fingerprint") == project_fingerprint
         ]
-        if isinstance(events, list)
-        else []
     )
+
+
+def _claim_scope_summary(events: Sequence[dict[str, Any]]) -> dict[str, bool]:
+    """Describe whether passed evidence exists for the whole tree or a scope."""
+
+    passed = [
+        event
+        for event in events
+        if event.get("type") == "verification-claim"
+        and event.get("status") == "pass"
+        and event.get("verification_status") == "passed"
+    ]
+    scopes = [_event_scope(event) for event in passed]
+    return {
+        "has_full_tree": any(scope == () for scope in scopes),
+        "has_scoped": any(scope not in {None, ()} for scope in scopes),
+    }
 
 
 def _event_scope(event: dict[str, Any]) -> tuple[str, ...] | None:
@@ -287,6 +296,10 @@ def _claim_summary(
             "changed_after_claim_paths": [],
             "post_claim_paths_known": False,
         }
+    if event.get('verification_command_hash_version') != VERIFICATION_COMMAND_HASH_VERSION:
+        return {'eligible': False, 'reason': 'legacy command identity requires revalidation',
+            'claim_proof': event.get('claim_proof'), 'changed_after_claim_paths': [],
+            'post_claim_paths_known': False}
     event_scope = _event_scope(event) or ()
     recorded = event.get("git_state_fingerprint")
     version = event.get("git_state_fingerprint_version")
@@ -387,6 +400,35 @@ def _changelog_contract_command(worktree: Path) -> str | None:
     return f"python3 -m unittest {' '.join(f'tests.{name}' for name in modules)}" if modules else None
 
 
+def _release_metadata_contract_command(worktree: Path, changed_paths: Sequence[str]) -> str | None:
+    """Read an optional project-owned release check instead of guessing one."""
+
+    manifest = worktree / VERIFICATION_MANIFEST
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        contract = payload.get("verification", {}).get("release_metadata", {})
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return None
+    if not isinstance(contract, dict):
+        return None
+    command = contract.get("command")
+    raw_paths = contract.get("paths")
+    if not isinstance(command, str) or not command.strip() or not isinstance(raw_paths, list):
+        return None
+    configured: set[str] = set()
+    for raw_path in raw_paths:
+        if not isinstance(raw_path, str):
+            return None
+        value = raw_path.strip().replace("\\", "/")
+        candidate = Path(value)
+        if not value or candidate.is_absolute() or candidate.drive or ".." in candidate.parts:
+            return None
+        configured.add(value.lstrip("./"))
+    if not configured or not any(path in configured for path in changed_paths):
+        return None
+    return command
+
+
 def build_plan(
     root: Path,
     git_worktree: Path | None = None,
@@ -416,7 +458,9 @@ def build_plan(
             changed = raw_changed
     current_in_scope = [path for path in changed if _path_in_scope(path, normalized_scope)]
     external = [path for path in changed if path not in current_in_scope]
-    event, event_reason = latest_claim(project, normalized_scope)
+    events = _load_claim_events(project)
+    event, event_reason = _latest_claim_from_events(events, normalized_scope)
+    claim_scope_summary = _claim_scope_summary(events)
     claim = _claim_summary(
         project,
         event,
@@ -462,12 +506,17 @@ def build_plan(
         if categories[path] == "release-metadata" and not _is_changelog_path(path)
     ]
     if release_metadata_paths:
+        release_command = _release_metadata_contract_command(actual_git_root, release_metadata_paths)
         required_checks.append(
             {
                 "kind": "targeted",
                 "paths": release_metadata_paths,
-                "command": "python3 -m unittest tests.test_version_single_source tests.test_plugin_manifest tests.test_package_release",
-                "reason": "Version and package metadata need their focused contract checks.",
+                "command": release_command,
+                "reason": (
+                    "Version and package metadata need the repository's focused contract checks."
+                    if release_command
+                    else "No project-specific release metadata contract tests were found; run the project's declared metadata checks."
+                ),
             }
         )
     if impact:
@@ -482,6 +531,12 @@ def build_plan(
     if impact:
         decision = "rerun"
         message = "Verification-impacting paths changed; existing evidence cannot cover the current worktree."
+    elif not current_in_scope and not normalized_scope and claim_scope_summary["has_scoped"] and not claim_scope_summary["has_full_tree"]:
+        decision = "rerun"
+        message = (
+            "No current worktree delta is present, but only scoped claims exist; "
+            "record a whole-worktree verification claim before reusing this plan."
+        )
     elif not current_in_scope:
         decision = "reuse"
         message = "No current worktree changes require verification; reuse prior evidence or skip verification."
@@ -491,6 +546,18 @@ def build_plan(
     elif claim["eligible"]:
         decision = "targeted"
         message = "Only non-verification paths changed after the claim; reuse implementation evidence and run the listed targeted checks."
+    elif not impact and non_impact and event is None and claim_scope_summary["has_scoped"]:
+        decision = "targeted"
+        message = (
+            "Only non-verification paths changed; the worktree has scoped claims but no whole-worktree claim. "
+            "Run the listed targeted checks; do not rerun the full suite for this change."
+        )
+    elif not impact and non_impact and claim.get("freshness") == "stale":
+        decision = "targeted"
+        message = (
+            "Only non-verification paths changed; existing evidence is stale or lacks a supported snapshot. "
+            "Run the listed targeted checks; no full suite is required for these paths."
+        )
     elif event is None and event_reason == "no passed verification claim is recorded":
         decision = "targeted"
         message = "Only non-verification paths changed and no verification-impacting evidence is needed; run only the listed targeted checks."
@@ -611,12 +678,17 @@ def build_staged_plan(
         if categories.get(path) == "release-metadata" and not _is_changelog_path(path)
     ]
     if release_paths:
+        release_command = _release_metadata_contract_command(actual_git_root, release_paths)
         required_checks.append(
             {
                 "kind": "targeted",
                 "paths": release_paths,
-                "command": "python3 -m unittest tests.test_version_single_source tests.test_plugin_manifest tests.test_package_release",
-                "reason": "Version and package metadata need their focused contract checks.",
+                "command": release_command,
+                "reason": (
+                    "Version and package metadata need the repository's focused contract checks."
+                    if release_command
+                    else "No project-specific release metadata contract tests were found; run the project's declared metadata checks."
+                ),
             }
         )
     if rerun_paths:
@@ -671,6 +743,21 @@ def build_staged_plan(
         "claim_event_reason": None,
         "required_checks": required_checks,
     }
+
+
+def observation(root: Path, plan: dict[str, Any]) -> dict[str, Any] | None:
+    """Bounded telemetry for actual consumers; read-only queries stay read-only."""
+    decision = plan.get('decision')
+    if decision not in {'reuse', 'targeted', 'rerun'}:
+        return None
+    reuse = plan.get('claim_reuse', {})
+    proofs = reuse.get('claim_proofs', []) or [reuse.get('claim_proof')]
+    proofs = sorted({proof for proof in proofs if isinstance(proof, str) and CLAIM_PROOF_PATTERN.fullmatch(proof)})
+    subject = git_state_fingerprint(root, plan.get('scope') or plan.get('in_scope_paths') or ())
+    identity = json.dumps([decision, subject, proofs], separators=(',', ':'))
+    return {'decision': decision, 'plan_id': hashlib.sha256(identity.encode()).hexdigest(),
+        'subject_fingerprint': subject, 'claim_proofs': proofs,
+        'eligible': reuse.get('eligible') is True}
 
 
 def print_text(payload: dict[str, Any]) -> None:

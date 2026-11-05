@@ -8,6 +8,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -28,96 +29,36 @@ if str(SCRIPT_DIR) not in sys.path:
 from install_progress import redact, write_failure_artifacts  # noqa: E402
 from installation_registry import RegistryError, registered_projects  # noqa: E402
 from governance_paths import pending_defaults_review  # noqa: E402
+from governance_trail import sanitize_local_paths  # noqa: E402
+from upgrade_messages import MESSAGE_TEMPLATES, MESSAGE_TEMPLATES_BY_ENGLISH, MessageIssue, issue_code  # noqa: E402
+
+
+UPGRADE_LOCAL_PATH_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_.-])(?:/private/var/[^\s'\"]+|/var/folders/[^\s'\"]+|/tmp/[^\s'\"]+|/Users/[^\s'\"]+|/home/[^\s'\"]+|[A-Za-z]:[\\/][^\s'\"]+)"
+)
 
 
 def use_chinese() -> bool:
     return os.environ.get("TENETORA_LANG", "").strip().lower() in {"zh", "zh-cn", "zh-hans", "chinese", "中文"}
 
 
+def safe_issue_value(value: object) -> str:
+    text = str(sanitize_local_paths(redact(str(value))))
+    return UPGRADE_LOCAL_PATH_PATTERN.sub("<path>", text)
+
+
 def issue_text(issue: object) -> str:
-    text = str(issue)
+    text = safe_issue_value(issue)
+    if isinstance(issue, MessageIssue):
+        template = MESSAGE_TEMPLATES.get(issue.code)
+        if template is None:
+            return issue.fallback or issue.code
+        return template.chinese if use_chinese() else template.english
     if not use_chinese():
         return text
-    mappings = {
-        "machine-wide upgrade preflight is blocked": "机器级升级预检被阻断",
-        "release download failed": "发布包下载失败",
-        "release source options are mutually exclusive": "发布源选项互斥",
-        "release manifest and ZIP URLs must be supplied together": "发布清单地址和 ZIP 地址必须成对提供",
-        "release mirror URL is invalid": "发布镜像地址无效",
-        "release mirror URL must use an HTTPS URL": "发布镜像地址必须使用 HTTPS",
-        "release mirror URL must not contain credentials": "发布镜像地址不能包含凭证",
-        "release mirror URL must not contain a query or fragment": "发布镜像地址不能包含 query 或 fragment",
-        "release manifest URL is invalid": "发布清单地址无效",
-        "release manifest URL must use an HTTPS URL": "发布清单地址必须使用 HTTPS",
-        "release manifest URL must not contain credentials": "发布清单地址不能包含凭证",
-        "release manifest URL must not contain a query or fragment": "发布清单地址不能包含 query 或 fragment",
-        "release ZIP URL is invalid": "发布包 ZIP 地址无效",
-        "release ZIP URL must use an HTTPS URL": "发布包 ZIP 地址必须使用 HTTPS",
-        "release ZIP URL must not contain credentials": "发布包 ZIP 地址不能包含凭证",
-        "release ZIP URL must not contain a query or fragment": "发布包 ZIP 地址不能包含 query 或 fragment",
-        "release manifest exceeds the bounded size limit": "发布清单超过大小上限",
-        "release manifest must be a JSON object": "发布清单必须是 JSON 对象",
-        "release manifest identity or format is invalid": "发布清单身份或格式无效",
-        "release commit identity is invalid": "发布提交身份无效",
-        "release installer protocol is older than this upgrader supports": "发布包安装协议低于当前升级器支持范围",
-        "release bridge protocol is incompatible": "发布包桥接协议不兼容",
-        "release zip root is invalid": "发布包 ZIP 根目录无效",
-        "release upgrade entrypoint is invalid": "发布包升级入口无效",
-        "release file inventory is invalid": "发布包文件清单无效",
-        "release file inventory contains duplicates": "发布包文件清单含重复项",
-        "release file inventory must be sorted": "发布包文件清单未按稳定顺序排列",
-        "release file inventory contains an unsafe path": "发布包文件清单含不安全路径",
-        "release file SHA256 inventory does not match files": "发布包文件 SHA256 清单与文件列表不一致",
-        "release file SHA256 inventory is invalid": "发布包文件 SHA256 清单无效",
-        "release state schema contract is invalid": "发布包状态 schema 合同无效",
-        "release artifact name is invalid": "发布包产物名称无效",
-        "release SHA256 is invalid": "发布包 SHA256 无效",
-        "release ZIP has no valid embedded manifest": "发布包 ZIP 缺少有效的内嵌清单",
-        "release ZIP file count is invalid": "发布包 ZIP 文件数量无效",
-        "release ZIP contains an unsafe path": "发布包 ZIP 含不安全路径",
-        "release ZIP contains duplicate entries": "发布包 ZIP 含重复条目",
-        "release ZIP contains portable path collisions": "发布包 ZIP 含跨平台路径冲突",
-        "release ZIP contains a symbolic link": "发布包 ZIP 含符号链接",
-        "release ZIP contains a file and directory path collision": "发布包 ZIP 含文件与目录路径冲突",
-        "release ZIP expands beyond the bounded size limit": "发布包 ZIP 解压后超过大小上限",
-        "release ZIP extraction failed": "发布包 ZIP 解压失败",
-        "release ZIP root is invalid": "发布包 ZIP 根目录无效",
-        "developer source must not be a symbolic link": "开发源码目录不能是符号链接",
-        "developer source contains a symbolic link or special file": "开发源码含符号链接或特殊文件",
-        "release ZIP exceeds the bounded size limit": "发布包 ZIP 超过大小上限",
-        "offline release ZIP requires --sha256 or a sibling .sha256 file": "离线发布包 ZIP 需要 --sha256 或同名 .sha256 文件",
-        "release ZIP SHA256 mismatch": "发布包 ZIP SHA256 不匹配",
-        "release version is older than the installed version": "发布版本低于已安装版本",
-        "external and embedded release manifests disagree": "外部发布清单与 ZIP 内嵌清单不一致",
-        "release ZIP file inventory does not match its manifest": "发布包 ZIP 文件列表与清单不一致",
-        "release ZIP file contents do not match its manifest": "发布包 ZIP 文件内容与清单不一致",
-        "acquired release contents do not match its manifest": "获取到的 release 内容与清单不一致",
-        "acquired release does not match the selected manifest": "获取到的 release 与所选清单不一致",
-        "existing versioned release is not a valid managed release": "现有版本 release 不是有效的受管 release",
-        "versioned release is immutable and already contains different content": "版本化 release 不可变，但现有内容不同",
-        "versioned release contents do not match its manifest": "版本化 release 内容与清单不一致",
-        "cannot create the managed Windows release junction": "无法创建受管 Windows release junction",
-        "managed pointer replacement failed; the prior pointer was restored": "受管指针替换失败，旧指针已恢复",
-        "release activation requires a valid immutable managed release": "release 激活需要有效且不可变的受管 release",
-        "upgrade transaction journal is unreadable": "升级事务日志不可读",
-        "upgrade transaction journal schema is invalid": "升级事务日志 schema 无效",
-        "upgrade transaction revision is invalid": "升级事务 revision 无效",
-        "an unfinished upgrade transaction already exists": "已有未完成的升级事务",
-        "no unfinished upgrade transaction is available to resume": "没有可恢复的未完成升级事务",
-        "unfinished upgrade transaction targets another release": "未完成升级事务指向另一个 release",
-        "unfinished upgrade transaction plan no longer matches": "未完成升级事务的计划已不匹配",
-        "unfinished upgrade transaction still belongs to a live process": "未完成升级事务仍属于存活进程",
-        "upgrade transaction identity mismatch": "升级事务身份不匹配",
-        "upgrade transaction changed concurrently": "升级事务发生并发变更",
-        "shell profile contains duplicate or damaged Tenetora PATH markers": "Shell profile 含重复或损坏的 Tenetora PATH 标记",
-        "shell profile contains a damaged Tenetora PATH marker": "Shell profile 含损坏的 Tenetora PATH 标记",
-        "refusing to update a symbolic-link shell profile": "拒绝更新符号链接形式的 Shell profile",
-        "shell profile is not a regular file": "Shell profile 不是普通文件",
-        "shell profile is not owned by the current user": "Shell profile 不属于当前用户",
-        "shell profile is writable by group or others": "Shell profile 可被用户组或其他用户写入",
-    }
-    if text in mappings:
-        return mappings[text]
+    template = MESSAGE_TEMPLATES_BY_ENGLISH.get(text)
+    if template is not None:
+        return template.chinese if use_chinese() else template.english
     prefixes = (
         ("release manifest is missing required fields:", "发布清单缺少必需字段："),
         ("release manifest is invalid:", "发布清单无效："),
@@ -141,6 +82,19 @@ def issue_text(issue: object) -> str:
         )
         return f"已安装的 Tenetora {installed} 低于直接升级最低版本 {minimum}"
     return text
+
+
+def issue_record(issue: object) -> dict[str, str]:
+    """Return stable machine metadata while preserving the human message."""
+
+    if isinstance(issue, MessageIssue):
+        redacted: object = MessageIssue(issue.code, safe_issue_value(issue.fallback))
+    else:
+        redacted = safe_issue_value(issue)
+    return {
+        "code": issue_code(redacted),
+        "message": issue_text(redacted),
+    }
 
 from tenetora import __version__  # noqa: E402
 from tenetora.brand import (  # noqa: E402
@@ -166,6 +120,8 @@ from release_store import (  # noqa: E402
     stage_release,
 )
 from upgrade_acquire import (  # noqa: E402
+    PreviewUnavailableError,
+    ReleaseDownloadError,
     UpgradeAcquireError,
     acquire_release,
     inspect_release_manifest,
@@ -392,6 +348,7 @@ def persist_preflight_failure(args: argparse.Namespace, payload: object, message
     if not preflight_failure_artifacts_missing(args):
         return
     details = preflight_failure_details(payload)
+    details = [f"{item['code']}: {item['message']}" for item in (issue_record(detail) for detail in details)]
     try:
         write_failure_artifacts(
             Path(event_path) if event_path is not None else None,
@@ -499,6 +456,7 @@ def check_payload(args: argparse.Namespace, release_manifest: dict[str, object] 
         "source": str(SKILL_DIR),
         "tools": [asdict(tool) for tool in status.tools],
         "issues": issues,
+        "issue_details": [issue_record(issue) for issue in issues],
         "recommendations": status.recommendations,
         "machine": machine,
     }
@@ -1241,8 +1199,10 @@ def render_blocked_result(
     source_kind: str,
     error_code: str,
     exit_code: int = 1,
+    message: str | None = None,
+    message_code: str | None = None,
 ) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "status": "blocked",
         "action": "upgrade",
         "exit_code": exit_code,
@@ -1255,6 +1215,10 @@ def render_blocked_result(
         "transaction": None,
         "error_code": error_code,
     }
+    if message is not None:
+        payload["message"] = safe_issue_value(message)
+        payload["message_code"] = message_code or issue_code(message)
+    return payload
 
 
 def render_terminal_apply_summary(
@@ -1623,7 +1587,14 @@ def run_release_controller(args: argparse.Namespace) -> int:
                     ),
                 )
                 if args.json:
-                    print(render_json(render_blocked_result(manifest, source_kind, "preflight-failed", preflight.returncode)))
+                    failure_message = str((failure_payload.get("error") if isinstance(failure_payload, dict) else None) or "release worker preflight failed")
+                    print(render_json(render_blocked_result(
+                        manifest,
+                        source_kind,
+                        "preflight-failed",
+                        preflight.returncode,
+                        message=failure_message,
+                    )))
                 else:
                     if preflight.stdout:
                         print(preflight.stdout, end="")
@@ -1678,7 +1649,13 @@ def run_release_controller(args: argparse.Namespace) -> int:
                         machine,
                         str(machine.get("error") or "machine-wide upgrade preflight is blocked"),
                     )
-                    print(render_json(render_blocked_result(manifest, source_kind, "machine-plan-blocked")))
+                    machine_message = str(machine.get("error") or "machine-wide upgrade preflight is blocked")
+                    print(render_json(render_blocked_result(
+                        manifest,
+                        source_kind,
+                        "machine-plan-blocked",
+                        message=machine_message,
+                    )))
                 else:
                     print_preflight_failure(
                         args,
@@ -1749,16 +1726,17 @@ def run_release_controller(args: argparse.Namespace) -> int:
                 return result.returncode
     except (OSError, UpgradeAcquireError, UpgradeContractError, ReleaseStoreError) as exc:
         cache_update_failure(source_override, args.zip_file)
+        message_code = issue_code(redact(str(exc)))
         if args.json:
-            print(render_json(render_blocked_result(observed_manifest, observed_source_kind, "acquisition-or-contract-failed")))
+            print(render_json(render_blocked_result(
+                observed_manifest,
+                observed_source_kind,
+                "acquisition-or-contract-failed",
+                message=redact(str(exc)),
+                message_code=message_code,
+            )))
         else:
-            if (
-                args.channel == "preview"
-                and observed_manifest is None
-                and source_override is None
-                and args.zip_file is None
-                and not args.explicit_remote_source
-            ):
+            if isinstance(exc, PreviewUnavailableError):
                 message = (
                     "当前没有发行中的预览版；未对现有安装做任何更改。"
                     if use_chinese()
@@ -1766,6 +1744,8 @@ def run_release_controller(args: argparse.Namespace) -> int:
                 )
             else:
                 message = f"升级被阻断：{issue_text(exc)}" if use_chinese() else f"Upgrade blocked: {exc}"
+                if isinstance(exc, ReleaseDownloadError) and exc.http_status is not None:
+                    message += f" (HTTP {exc.http_status})"
             print(message, file=sys.stderr)
             print(
                 render_terminal_apply_summary(
