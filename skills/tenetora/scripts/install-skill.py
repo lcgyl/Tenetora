@@ -19,6 +19,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path, PurePath
 from typing import Callable
 
@@ -71,6 +73,7 @@ if str(SCRIPT_DIRECTORY) not in sys.path:
 from installation_registry import (  # noqa: E402
     AUTO_DISCOVERY_CANDIDATES,
     AUTO_DISCOVERY_DEPTH,
+    RegistryError,
     auto_discovery_roots,
     detect_project_surfaces,
     discover_project_candidates,
@@ -575,6 +578,13 @@ class InstallerSurfaceOperations:
         kwargs.pop("target", None)
         return install_zcode_plugin(**kwargs)
 
+    def install_cordis(self, **kwargs: object) -> InstallReport | None:
+        kwargs.pop("mode", None)
+        return install_cordis_bundle(**kwargs)
+
+    def status_cordis(self, **kwargs: object) -> InstallReport | None:
+        return status_cordis_bundle(**kwargs)
+
     def status_native(self, **kwargs: object) -> InstallReport | None:
         return status_native_cli_plugin(**kwargs)
 
@@ -1010,6 +1020,37 @@ def parse_tools(raw: str) -> list[str]:
 
 def remove_existing(path: Path) -> None:
     remove_unredirected_entry(path, label="managed install entry")
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    """Replace a text file through a sibling temporary and a reviewable backup."""
+
+    path = ensure_safe_file_path(path, label="text file")
+    ensure_unredirected_directory(path.parent, label="text file parent")
+    target_mode = 0o600
+    if path.is_file():
+        target_mode = path.stat().st_mode & 0o777
+        backup = ensure_safe_file_path(path.with_name(f"{path.name}.tenetora.bak"), label="text backup file")
+        with tempfile.NamedTemporaryFile("wb", dir=path.parent, delete=False) as handle:
+            backup_temporary = Path(handle.name)
+            handle.write(path.read_bytes())
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            backup_temporary.chmod(target_mode)
+            os.replace(backup_temporary, backup)
+        finally:
+            backup_temporary.unlink(missing_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="", dir=path.parent, delete=False) as handle:
+        temporary = Path(handle.name)
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        temporary.chmod(target_mode)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def read_json_object(path: Path, default: dict[str, object]) -> dict[str, object]:
@@ -2884,6 +2925,510 @@ def _install_native_cli_plugin(
     return report
 
 
+DSH_BUNDLE_PACKAGE = "@lcgyl/tenetora-dsh"
+DSH_BUNDLE_ROW_ID = "tenetora-dsh"
+DSH_PATCH_START = "# --- tenetora-dsh managed (do not edit) ---"
+DSH_PATCH_END = "# --- end tenetora-dsh managed ---"
+
+
+def dsh_home() -> Path:
+    configured = os.environ.get("DSH_HOME")
+    return Path(configured).expanduser() if configured else Path.home() / ".dsh"
+
+
+def dsh_profile_name() -> str:
+    explicit = os.environ.get("DSH_PROFILE_DIR")
+    if explicit:
+        return Path(explicit).name
+    return os.environ.get("DSH_PROFILE") or "desktop"
+
+
+def dsh_profile_path(profile: str | None = None) -> Path:
+    name = profile or dsh_profile_name()
+    explicit = os.environ.get("DSH_PROFILE_DIR")
+    if explicit and name == dsh_profile_name():
+        return Path(explicit).expanduser()
+    return dsh_home() / "profiles" / name
+
+
+def dsh_bundle_source() -> Path | None:
+    """The bundle shipped inside this Tenetora package, if present."""
+
+    if PACKAGE_ROOT is None:
+        return None
+    candidate = PACKAGE_ROOT / "dsh"
+    return candidate if (candidate / "package.json").is_file() else None
+
+
+def dsh_patch_path(profile_dir: Path) -> Path:
+    return profile_dir / "cordis.patch.yml"
+
+
+def dsh_relative_name(bundle_dir: Path, profile_dir: Path) -> str:
+    """A patch row name is resolved beside the patch file, so keep it relative.
+
+    A bundle outside the profile's drive cannot be expressed relatively; a
+    ``file://`` URL is an acceptable ESM specifier for that case.
+    """
+
+    # macOS commonly exposes /var as a symlink to /private/var.  Canonicalize
+    # both operands before relpath so the generated specifier never acquires
+    # a duplicated prefix such as /private/private/tmp.
+    bundle_dir = bundle_dir.resolve(strict=False)
+    profile_dir = profile_dir.resolve(strict=False)
+    try:
+        relative = os.path.relpath(bundle_dir, profile_dir).replace("\\", "/")
+    except ValueError:
+        return Path(bundle_dir).resolve().as_uri()
+    return relative if relative.startswith(".") else f"./{relative}"
+
+
+def dsh_patch_block(bundle_dir: Path, profile_dir: Path) -> str:
+    name = dsh_relative_name(bundle_dir, profile_dir)
+    return "\n".join(
+        [
+            DSH_PATCH_START,
+            "- insert:",
+            f"    - id: {DSH_BUNDLE_ROW_ID}",
+            f"      name: '{name}'",
+            "      config:",
+            "        cli: tenetora",
+            DSH_PATCH_END,
+            "",
+        ]
+    )
+
+
+def apply_dsh_patch_block(text: str, block: str) -> str | None:
+    """Replace or append the managed block; ``None`` means an unmanaged row exists."""
+
+    if DSH_BUNDLE_ROW_ID in text and DSH_PATCH_START not in text:
+        return None
+    if DSH_PATCH_START in text:
+        start = text.index(DSH_PATCH_START)
+        end = text.find(DSH_PATCH_END, start)
+        if end == -1:
+            return None
+        end += len(DSH_PATCH_END)
+        trailing = text[end:]
+        if trailing.startswith("\n"):
+            trailing = trailing[1:]
+        return text[:start] + block + trailing
+    stripped = text.strip()
+    if stripped in {"", "[]"}:
+        return block
+    return text.rstrip() + "\n" + block
+
+
+def dsh_cli_command() -> str | None:
+    for name in ("dsh", "dsh.cmd", "dsh.exe"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def dsh_in_live_host() -> bool:
+    """A profile-launched Host exports its own directory to every shell call."""
+
+    return bool(os.environ.get("DSH_PROFILE_DIR"))
+
+
+def dsh_profile_managed(profile_dir: Path) -> bool:
+    """True when the profile owns the bundle through package.json + bundles."""
+
+    try:
+        manifest = json.loads((profile_dir / "package.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(manifest, dict):
+        return False
+    dependencies = manifest.get("dependencies")
+    if not isinstance(dependencies, dict) or DSH_BUNDLE_PACKAGE not in dependencies:
+        return False
+    profile_block = manifest.get("dsh")
+    if not isinstance(profile_block, dict):
+        return False
+    inner = profile_block.get("profile")
+    if not isinstance(inner, dict):
+        return False
+    bundles = inner.get("bundles")
+    return isinstance(bundles, list) and DSH_BUNDLE_PACKAGE in bundles
+
+
+def remove_dsh_patch_block(text: str) -> str | None:
+    """Remove the managed block; ``None`` means it is unmanaged or truncated."""
+
+    if DSH_PATCH_START not in text:
+        return None
+    start = text.index(DSH_PATCH_START)
+    end = text.find(DSH_PATCH_END, start)
+    if end == -1:
+        return None
+    end += len(DSH_PATCH_END)
+    while end < len(text) and text[end] in "\r\n":
+        end += 1
+    head = text[:start].rstrip("\n")
+    tail = text[end:]
+    if not head and not tail.strip():
+        return ""
+    if not head:
+        return tail
+    if not tail:
+        return head + "\n"
+    return head + "\n" + tail
+
+
+def dsh_spec_bundle_path(profile_dir: Path, spec: str | None) -> Path | None:
+    """Resolve a profile dependency spec to the bundle directory."""
+
+    if isinstance(spec, str) and spec.startswith(("link:", "file:")):
+        raw = spec.split(":", 1)[1].strip()
+        if raw:
+            candidate = Path(raw).expanduser()
+            return candidate if candidate.is_absolute() else (profile_dir / candidate).resolve(strict=False)
+    installed = profile_dir / "node_modules" / "@lcgyl" / "tenetora-dsh"
+    return installed if installed.exists() else None
+
+
+def dsh_patch_bundle_path(profile_dir: Path) -> Path | None:
+    """Resolve the ``name`` recorded inside the managed patch block."""
+
+    try:
+        text = (profile_dir / "cordis.patch.yml").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    start = text.find(DSH_PATCH_START)
+    if start == -1:
+        return None
+    end = text.find(DSH_PATCH_END, start)
+    block = text[start:] if end == -1 else text[start:end]
+    for line in block.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("name:"):
+            continue
+        raw = stripped.split(":", 1)[1].strip().strip("'\"")
+        if raw.startswith("file://"):
+            parsed = urllib.parse.urlparse(raw)
+            path = urllib.request.url2pathname(parsed.path)
+            if os.name == "nt" and path.startswith(("/", "\\")):
+                path = path[1:]
+            return Path(path)
+        candidate = Path(raw)
+        return candidate if candidate.is_absolute() else (profile_dir / candidate).resolve(strict=False)
+    return None
+
+
+def dsh_bundle_dir(profile_dir: Path) -> Path | None:
+    """The bundle directory the profile actually mounts, if any."""
+
+    spec = None
+    try:
+        manifest = json.loads((profile_dir / "package.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        manifest = None
+    if isinstance(manifest, dict):
+        dependencies = manifest.get("dependencies")
+        if isinstance(dependencies, dict) and isinstance(dependencies.get(DSH_BUNDLE_PACKAGE), str):
+            spec = str(dependencies[DSH_BUNDLE_PACKAGE])
+    return dsh_spec_bundle_path(profile_dir, spec) or dsh_patch_bundle_path(profile_dir)
+
+
+def dsh_profile_references_home(profile_dir: Path, home: Path) -> bool:
+    """True when this profile's bundle points inside the managed home."""
+
+    references = []
+    manifest_spec = None
+    try:
+        manifest = json.loads((profile_dir / "package.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        manifest = None
+    if isinstance(manifest, dict):
+        dependencies = manifest.get("dependencies")
+        if isinstance(dependencies, dict) and isinstance(dependencies.get(DSH_BUNDLE_PACKAGE), str):
+            manifest_spec = str(dependencies[DSH_BUNDLE_PACKAGE])
+    if manifest_spec:
+        resolved = dsh_spec_bundle_path(profile_dir, manifest_spec)
+        if resolved is not None:
+            references.append(resolved)
+    patch = dsh_patch_path(profile_dir)
+    if patch.is_file():
+        try:
+            text = patch.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        if DSH_PATCH_START in text:
+            start = text.index(DSH_PATCH_START)
+            end = text.find(DSH_PATCH_END, start)
+            block = text[start:] if end == -1 else text[start:end]
+            for line in block.splitlines():
+                stripped = line.strip()
+                if not stripped.startswith("name:"):
+                    continue
+                raw = stripped.split(":", 1)[1].strip().strip("'\"")
+                if raw.startswith("file://"):
+                    parsed = urllib.parse.urlparse(raw)
+                    path = urllib.request.url2pathname(parsed.path)
+                    if os.name == "nt" and path.startswith(("/", "\\")):
+                        path = path[1:]
+                    references.append(Path(path))
+                else:
+                    candidate = Path(raw)
+                    references.append(candidate if candidate.is_absolute() else (profile_dir / candidate))
+                break
+    root = home.resolve(strict=False)
+    for reference in references:
+        try:
+            reference.resolve(strict=False).relative_to(root)
+        except (OSError, ValueError):
+            continue
+        return True
+    return False
+
+
+def remove_cordis_bundle(profile_name: str | None = None, dry_run: bool = True) -> dict[str, object]:
+    """Remove the DSH surface for one profile, leaving the profile otherwise intact."""
+
+    profile = dsh_profile_path(profile_name)
+    result: dict[str, object] = {"profile": str(profile), "status": "absent", "actions": [], "warnings": []}
+    actions: list[str] = result["actions"]  # type: ignore[assignment]
+    warnings: list[str] = result["warnings"]  # type: ignore[assignment]
+    if not (profile / "package.json").is_file():
+        result["status"] = "profile-missing"
+        return result
+    if dsh_profile_managed(profile):
+        cli = dsh_cli_command()
+        if cli is None:
+            result["status"] = "manual"
+            warnings.append(
+                f"the profile manages {DSH_BUNDLE_PACKAGE}; run "
+                f"`dsh plugin --profile {profile_name or dsh_profile_name()} remove {DSH_BUNDLE_PACKAGE}`"
+            )
+            return result
+        command = [cli, "plugin", "--profile", profile_name or dsh_profile_name(), "remove", DSH_BUNDLE_PACKAGE]
+        actions.append(" ".join(command))
+        if dry_run:
+            result["status"] = "planned"
+            return result
+        completed = subprocess.run(
+            command,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=300,
+            shell=os.name == "nt",
+        )
+        if completed.returncode != 0:
+            result["status"] = "failed"
+            warnings.append(str(completed.stdout or "").strip()[:800])
+            return result
+        result["status"] = "removed"
+    patch = dsh_patch_path(profile)
+    if patch.is_file():
+        existing = patch.read_text(encoding="utf-8")
+        merged = remove_dsh_patch_block(existing)
+        if merged is None and DSH_PATCH_START in existing:
+            result["status"] = "conflict"
+            warnings.append(f"{patch} has a truncated managed block; review it manually")
+            return result
+        if merged is not None and merged != existing:
+            actions.append(f"remove the managed row from {patch}")
+            if dry_run:
+                result["status"] = "planned"
+                return result
+            write_text_atomic(patch, merged)
+            result["status"] = "removed"
+    return result
+
+
+def dsh_surface_state(profile_dir: Path) -> str:
+    """Report how the profile carries the bundle: managed, side-loaded, or absent."""
+
+    if not (profile_dir / "package.json").is_file():
+        return "profile-missing"
+    if dsh_profile_managed(profile_dir):
+        return "profile-bundle"
+    patch = dsh_patch_path(profile_dir)
+    try:
+        text = patch.read_text(encoding="utf-8")
+    except OSError:
+        return "missing"
+    return "profile-patch" if DSH_PATCH_START in text else "missing"
+
+
+def status_cordis_bundle(target: str, scope: str, project_root: Path) -> InstallReport | None:
+    """Report the profile bundle exactly as the Harness sees it."""
+
+    if scope != "global":
+        return None
+    profile = dsh_profile_path()
+    state = dsh_surface_state(profile)
+    bundle = dsh_bundle_dir(profile)
+    version = None
+    if bundle is not None:
+        try:
+            payload = json.loads((bundle / "package.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict) and payload.get("version"):
+            version = str(payload["version"])
+    report = InstallReport(plugins=1)
+    if state in {"profile-bundle", "profile-patch"}:
+        report.lines.append(
+            status_line(
+                "CURRENT",
+                target,
+                scope,
+                "bundle",
+                f"{state} {bundle or '-'} version={version or 'unknown'}",
+            )
+        )
+        report.current += 1
+    elif state == "profile-missing":
+        report.lines.append(
+            status_line("MISSING", target, scope, "profile", f"DSH profile is not initialized at {profile}")
+        )
+        report.missing += 1
+    else:
+        report.lines.append(
+            status_line("MISSING", target, scope, "bundle", f"no managed bundle row in {profile}")
+        )
+        report.missing += 1
+    return report
+
+
+def install_cordis_bundle(
+    target: str,
+    scope: str,
+    project_root: Path,
+    force: bool,
+    dry_run: bool,
+    update: bool,
+    source_changed: bool,
+) -> InstallReport | None:
+    """Install the DSH bundle through the Harness CLI or a managed patch row."""
+
+    if scope != "global":
+        raise ValueError("DeepSeek Harness bundles are profile-scoped; use the global scope for a profile install")
+    report = InstallReport(plugins=1)
+    source = dsh_bundle_source()
+    if source is None:
+        report.lines.append(
+            status_line("MISSING", target, scope, "bundle", "this Tenetora package does not contain dsh/")
+        )
+        report.missing += 1
+        return report
+    profile = dsh_profile_path()
+    manifest = profile / "package.json"
+    if not manifest.is_file():
+        report.lines.append(
+            status_line(
+                "MISSING",
+                target,
+                scope,
+                "profile",
+                f"DSH profile is not initialized at {profile}; open DeepSeek Harness once, then rerun",
+            )
+        )
+        report.missing += 1
+        return report
+
+    cli = dsh_cli_command()
+    if dsh_profile_managed(profile):
+        report.lines.append(
+            status_line(
+                "CURRENT",
+                target,
+                scope,
+                "bundle",
+                f"{DSH_BUNDLE_PACKAGE} is managed by the profile; update or remove it with `dsh plugin --profile {dsh_profile_name()}`",
+            )
+        )
+        report.current += 1
+        return report
+    if cli is not None and not dsh_in_live_host():
+        command = [cli, "plugin", "--profile", dsh_profile_name(), "add", str(source)]
+        if dry_run:
+            report.lines.append(
+                status_line("ACTION", target, scope, "bundle", "would run " + " ".join(command))
+            )
+            report.installed += 1
+            return report
+        result = subprocess.run(
+            command,
+            cwd=project_root,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=300,
+            shell=os.name == "nt",
+        )
+        if result.returncode == 0:
+            status = "UPDATED" if update else "INSTALLED"
+            report.lines.append(
+                status_line(status, target, scope, "bundle", f"{DSH_BUNDLE_PACKAGE} via {cli} ({profile})")
+            )
+            report.updated += int(update)
+            report.installed += int(not update)
+            return report
+        report.lines.append(
+            status_line(
+                "WARN",
+                target,
+                scope,
+                "bundle",
+                f"dsh plugin failed ({result.returncode}); falling back to the managed patch row",
+            )
+        )
+
+    patch = dsh_patch_path(profile)
+    existing = patch.read_text(encoding="utf-8") if patch.is_file() else ""
+    block = dsh_patch_block(source, profile)
+    merged = apply_dsh_patch_block(existing, block)
+    if merged is None:
+        report.lines.append(
+            status_line(
+                "CONFLICT",
+                target,
+                scope,
+                "patch-row",
+                f"{patch} has an unmanaged {DSH_BUNDLE_ROW_ID} row or a truncated managed block; review it manually",
+            )
+        )
+        report.conflicts += 1
+        return report
+    unchanged = merged == existing or (existing.strip() and merged.strip() == existing.strip())
+    if unchanged:
+        report.lines.append(status_line("CURRENT", target, scope, "patch-row", f"{patch} already points at {source}"))
+        report.current += 1
+        return report
+    if dry_run:
+        report.lines.append(status_line("ACTION", target, scope, "patch-row", f"would write {patch}"))
+        report.installed += 1
+        return report
+    patch.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(patch, merged)
+    status = "UPDATED" if update else "INSTALLED"
+    report.lines.append(
+        status_line(
+            status,
+            target,
+            scope,
+            "patch-row",
+            f"{patch} now mounts {source}; restart DeepSeek Harness to load the bundle",
+        )
+    )
+    report.updated += int(update)
+    report.installed += int(not update)
+    return report
+
+
 def install_native_cli_plugin(
     target: str,
     scope: str,
@@ -4189,6 +4734,34 @@ def status_one(target: str, scope: str, project_root: Path) -> InstallReport:
     return report
 
 
+def tree_matches_source(dest: Path, source: Path) -> bool:
+    """True when an installed skill directory already holds exactly this payload."""
+
+    if not dest.is_dir() or path_is_redirected(dest):
+        return False
+
+    def payload(root: Path) -> dict[str, bytes] | None:
+        entries: dict[str, bytes] = {}
+        try:
+            items = sorted(root.rglob("*"))
+        except OSError:
+            return None
+        for item in items:
+            if "__pycache__" in item.parts or item.suffix in {".pyc", ".pyo"}:
+                continue
+            if item.is_symlink() or not item.is_file():
+                continue
+            try:
+                entries[item.relative_to(root).as_posix()] = item.read_bytes()
+            except OSError:
+                return None
+        return entries
+
+    installed = payload(dest)
+    expected = payload(source)
+    return bool(expected) and installed == expected
+
+
 def install_one(
     target: str,
     scope: str,
@@ -4238,6 +4811,12 @@ def install_one(
             continue
 
         if dest.exists() or path_is_redirected(dest):
+            if tree_matches_source(dest, source):
+                report.lines.append(
+                    status_line("CURRENT", target, scope, source_path.name, f"already installed with identical content {dest}")
+                )
+                report.current += 1
+                continue
             if not force:
                 raise FileExistsError(f"{scope}:{target}:{source_path.name}: refusing to overwrite existing {dest}; rerun with --force")
             if not dry_run:
@@ -5425,6 +6004,16 @@ def build_preflight(
                 check.planned = CAPABILITY_SKILLS_ONLY
                 check.blocker = "ZCode native plugins are user-scoped; project scope installs lifecycle skills only"
                 check.remediation = "Use --global for the ZCode native plugin and runtime hooks"
+            elif target == "dsh" and scope == "global":
+                # DSH is profile-scoped and cannot create a Harness profile from
+                # an installer smoke job.  An absent profile is an explicit
+                # skills-only fallback when the caller opts into it; it must not
+                # become a postflight BLOCKED result for an otherwise healthy
+                # all-tools installation.
+                if dsh_surface_state(dsh_profile_path()) in {"missing", "profile-missing"}:
+                    check.planned = CAPABILITY_SKILLS_ONLY
+                    check.blocker = "DSH profile is not initialized; bundle activation is deferred"
+                    check.remediation = "Open DeepSeek Harness and rerun the DSH install when a profile exists"
             elif target == "zcode":
                 if PACKAGE_ROOT is None:
                     check.planned = CAPABILITY_BLOCKED
@@ -5511,6 +6100,24 @@ def installed_surface_version(
         versions = [value for value in (registered_version, payload_version) if value]
         matches = bool(versions) and expected is not None and all(value == expected for value in versions)
         return registered_version or payload_version, "registered-zcode-plugin", matches, evidence
+
+    if target == "dsh" and scope == "global" and check.actual in {CAPABILITY_ACTIVE, CAPABILITY_ACTIVE_PARTIAL, CAPABILITY_SKILLS_ONLY}:
+        profile = dsh_profile_path()
+        bundle = dsh_bundle_dir(profile)
+        payload_version = None
+        if bundle is not None:
+            try:
+                payload = json.loads((bundle / "package.json").read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = None
+            if isinstance(payload, dict) and payload.get("version"):
+                payload_version = str(payload["version"])
+        state = dsh_surface_state(profile)
+        evidence = [f"state={state}"] + ([f"payload={payload_version}"] if payload_version else [])
+        if state in {"missing", "profile-missing"}:
+            return None, "cordis-bundle:missing", None, evidence
+        matches = payload_version == expected if expected is not None else None
+        return payload_version, f"cordis-bundle:{state}", matches, evidence
 
     actual = installed_skill_version(target, scope, project_root)
     evidence = [f"skill={actual}"] if actual else []
@@ -5638,6 +6245,13 @@ def actual_capability(check: CapabilityCheck, project_root: Path) -> str:
         if path and path.exists() and not plugin_payload_issues(path) and zcode_activation_state(project_root) == "enabled":
             return CAPABILITY_ACTIVE
         return CAPABILITY_BLOCKED
+    if target == "dsh" and scope == "global":
+        state = dsh_surface_state(dsh_profile_path())
+        if state in {"profile-bundle", "profile-patch"}:
+            return CAPABILITY_ACTIVE_PARTIAL
+        if state in {"missing", "profile-missing"}:
+            return CAPABILITY_SKILLS_ONLY
+        return CAPABILITY_BLOCKED
     if not lifecycle_skills_installed(target, scope, project_root):
         return CAPABILITY_BLOCKED
     if target == "cursor":
@@ -5673,6 +6287,16 @@ def build_postflight(preflight: CapabilityReport, project_root: Path) -> Capabil
         capability_matches = check.actual == check.planned or (
             check.planned == CAPABILITY_PENDING_TRUST and check.actual == CAPABILITY_ACTIVE
         )
+        if (
+            check.tool == "dsh"
+            and check.planned == CAPABILITY_SKILLS_ONLY
+            and check.actual == CAPABILITY_ACTIVE_PARTIAL
+        ):
+            # An explicit skills-only fallback may still activate the
+            # profile-scoped Cordis bundle when a profile becomes available
+            # during installation.  A stronger verified result satisfies the
+            # weaker plan; it must never be downgraded to BLOCKED.
+            capability_matches = True
         if (
             check.tool == "codex"
             and check.scope == "global"
@@ -6043,7 +6667,15 @@ def install_scope_option(scope: str) -> str:
 def target_scopes_for(targets: list[str], explicit_scope: str | None) -> dict[str, list[str]]:
     if explicit_scope:
         selected = selected_scopes(explicit_scope)
-        return {target: list(selected) for target in targets}
+        scopes: dict[str, list[str]] = {}
+        for target in targets:
+            allowed = list(selected)
+            # A Cordis bundle lives in a user profile; a project-scoped row is
+            # meaningless and previously surfaced as a misleading BLOCKED row.
+            if tool_definition(target).installer == "cordis-bundle":
+                allowed = [scope for scope in allowed if scope == "global"] or ["global"]
+            scopes[target] = allowed
+        return scopes
     return {
         target: [str(platform_contract(target)["default_scope"])]
         for target in targets
@@ -6437,15 +7069,20 @@ def auto_discovered_project_entries(
     }
     roots = auto_discovery_roots(current_project, include_home=include_home)
     current_parent = current_project.resolve(strict=False).parent
-    candidates = (
-        discover_project_candidates(
-            roots,
-            max_depth=AUTO_DISCOVERY_DEPTH,
-            max_candidates=AUTO_DISCOVERY_CANDIDATES,
+    try:
+        candidates = (
+            discover_project_candidates(
+                roots,
+                max_depth=AUTO_DISCOVERY_DEPTH,
+                max_candidates=AUTO_DISCOVERY_CANDIDATES,
+            )
+            if roots
+            else []
         )
-        if roots
-        else []
-    )
+    except RegistryError:
+        # Auto-discovery is best-effort enrichment: a bounded scan that trips
+        # its cap or hits an unreadable root must not block install or upgrade.
+        candidates = []
     for project in candidates:
         # Scope-less discovery may scan the active project's parent to find
         # siblings, but the parent itself is a separate repository boundary.
@@ -7407,7 +8044,7 @@ def run_machine_child(
                 child_command,
                 cwd=cwd,
                 env=child_environment,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 stdout=stdout_file,
                 stderr=stderr_file,
                 start_new_session=os.name != "nt",

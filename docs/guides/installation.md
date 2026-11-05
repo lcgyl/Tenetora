@@ -58,10 +58,10 @@ Users on 0.3.x use the installed CLI:
 tenetora upgrade
 ```
 
-Use `tenetora upgrade --check` for a read-only plan. `tenetora upgrade --apply` is a compatibility alias for older automation. A 0.2.x user enters the 0.3 bridge once with a fixed-version bootstrap, then uses `tenetora upgrade` everywhere:
+Use `tenetora upgrade --check` for a read-only plan. `tenetora upgrade --apply` is a compatibility alias for older automation. A 0.2.x user enters the 0.3 bridge once with the current public installer, then uses `tenetora upgrade` everywhere:
 
 ```bash
-curl -fsSL https://github.com/lcgyl/Tenetora/-/raw/0.3.11/install.sh | bash -s -- --lang en --tools all --both --path "$PWD"
+curl -fsSL https://raw.githubusercontent.com/lcgyl/Tenetora/main/install.sh | bash -s -- --lang en --tools all --both --path "$PWD"
 ```
 
 Routine upgrades do not fetch a remote script. Keep the bootstrap for first installation, the 0.2 bridge, offline recovery, or a broken launcher.
@@ -92,7 +92,7 @@ tenetora upgrade --check --channel preview
 tenetora upgrade --channel preview
 ```
 
-On private Windows installations, execute `install.ps1` by file path (not by piping its BOM-bearing contents into `iex`) and pass `-Channel preview`; the bootstrap command remains the public-channel convenience path documented above. The preview channel keeps one active generic package and never falls back to stable. After a stable release, the protected manual GitLab job runs `scripts/retire_preview.py --yes --delete-tags`, retiring the package and deleting only strictly matching preview tags. Use `tenetora cleanup --json` then `tenetora cleanup --apply --yes` to remove only authenticated superseded releases. `tenetora uninstall --json` previews machine cleanup, and `tenetora uninstall --apply --yes` removes managed files without deleting project `.tenetora` governance.
+Use `tenetora cleanup --json` then `tenetora cleanup --apply --yes` to remove only authenticated superseded releases. `tenetora uninstall --json` previews machine cleanup, and `tenetora uninstall --apply --yes` removes managed files without deleting project `.tenetora` governance.
 
 After a successful online `upgrade --check` or `upgrade`, the CLI stores a small update hint under the managed home. A bare `tenetora` command reads this local hint without making a network request: a fresh hint is valid for 24 hours, an expired hint is reported as stale, and a failed network attempt is reported without replacing the last known release. The cache contains only version, commit, package digest, channel, and timestamps; it does not contain URLs, proxy settings, credentials, or project content. A missing or invalid cache is advisory and never initializes a project or blocks ordinary CLI use.
 
@@ -116,7 +116,7 @@ tenetora upgrade --mirror-url https://mirror.example/tenetora/stable
 
 Advanced direct endpoints must be configured as a complete pair: `TENETORA_RELEASE_MANIFEST_URL` and `TENETORA_RELEASE_ZIP_URL`, or `--manifest-url` and `--zip-url`. Release URLs must be HTTPS and must not contain user credentials, query strings, or fragments. Mirror and direct endpoint settings are mutually exclusive. Partial or malformed settings fail closed before any installation write. A failed network check records `network-failed` while retaining the last authenticated release hint.
 
-Public projections use the R2 Worker by default. The installer and upgrader read one `stable/latest.json` or `preview/latest.json` pointer, then fetch only its immutable versioned ZIP and manifest; channel and digest mismatches fail closed. Set `TENETORA_RELEASE_INDEX_BASE=https://<worker-host>` only when using another compatible Worker. Historical GitLab and public release attachments remain available for older clients; clients still using those attachments should rerun the public installer once to migrate to R2.
+Public projections use the R2 release endpoint `https://r2.lcgylfamily.cn` by default. The installer and upgrader read one `stable/latest.json` or `preview/latest.json` pointer, then fetch only its immutable versioned ZIP and manifest; channel and digest mismatches fail closed. Set `TENETORA_RELEASE_INDEX_BASE=https://<worker-host>` only when using another compatible Worker. Historical GitLab and public release attachments remain available for older clients; clients still using those attachments should rerun the public installer once to migrate to R2.
 
 The no-scope `upgrade` updates registered global and project surfaces and migrates legacy governance only when Tenetora ownership is proven. Detecting a tool never authorizes plugin creation; governance-only migration does not create project skills or runtimes. The launch directory, registered projects, and bounded discoverable projects are considered. Foreign or ambiguous content is preserved for review.
 The installer is split by host under `scripts/tool_installers/`. A host definition owns paths, detection, and capability classification, while its installer adapter owns native-surface dispatch. Shared file safety, transaction, and rollback behavior remains centralized so a host-specific repair does not need to duplicate the upgrade engine.

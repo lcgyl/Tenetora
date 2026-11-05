@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import importlib.util
 import json
 import math
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -17,7 +19,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from governance_trail import TRAIL_REL  # noqa: E402
+from governance_trail import TRAIL_REL, load_trail  # noqa: E402
 
 
 DEFAULT_DAYS = 90
@@ -29,6 +31,7 @@ KNOWN_EVENT_TYPES = {
     "alignment-guard",
     "change-impact-preflight",
     "context-injection",
+    "feature-delivery",
     "guard-action",
     "prompt-guard",
     "rules-context",
@@ -40,9 +43,13 @@ KNOWN_ACTIONS = {
     "alignment",
     "claim",
     "commit",
+    "completed",
     "external-input",
+    "failed",
     "guard",
     "rules",
+    "start",
+    "unavailable",
 }
 
 
@@ -65,29 +72,41 @@ def read_trail(root: Path) -> dict[str, Any]:
     path = root / TRAIL_REL
     if not path.is_file():
         return {"status": "missing", "events": [], "ignored_events": 0, "message": "governance trail is not present"}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    payload = load_trail(root)
+    if payload.get("invalid"):
         return {
             "status": "invalid-data",
             "events": [],
-            "ignored_events": 1,
+            "ignored_events": int(payload.get("ignored_events", 1)),
             "message": "governance trail cannot be read as valid JSON",
         }
-    if not isinstance(payload, dict) or not isinstance(payload.get("events"), list):
-        return {
-            "status": "invalid-data",
-            "events": [],
-            "ignored_events": 1,
-            "message": "governance trail has an unsupported shape",
-        }
-    events = [item for item in payload["events"] if isinstance(item, dict)]
     return {
         "status": "ready",
-        "events": events,
-        "ignored_events": len(payload["events"]) - len(events),
+        "events": payload["events"],
+        "ignored_events": int(payload.get("ignored_events", 0)),
         "message": "",
     }
+
+
+def hook_timing_observation(root: Path, *, days: int, now: dt.datetime) -> dict[str, Any]:
+    """Load bounded Hook timing metrics without exposing sample payloads."""
+    script = Path(__file__).resolve().parents[3] / "hooks" / "hook_timing.py"
+    if not script.is_file():
+        return {"version": 1, "status": "unavailable", "window_days": days,
+            "samples": 0, "invalid_samples": 0, "summary": [],
+            "over_soft_budget": 0, "failed": 0, "small_sample_groups": 0}
+    try:
+        spec = importlib.util.spec_from_file_location("tenetora_insights_hook_timing", script)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("hook timing module unavailable")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return dict(module.load_timing_snapshot(root, days=days, now=now))
+    except Exception as exc:
+        return {"version": 1, "status": "invalid", "window_days": days,
+            "samples": 0, "invalid_samples": 1, "summary": [],
+            "over_soft_budget": 0, "failed": 0, "small_sample_groups": 0,
+            "reason": type(exc).__name__}
 
 
 def safe_event_type(event: dict[str, Any]) -> str:
@@ -102,7 +121,7 @@ def safe_action(event: dict[str, Any]) -> str:
 
 def event_status(event: dict[str, Any]) -> str:
     value = event.get("status")
-    return value if value in {"pass", "fail", "warn", "skip", "error"} else "unknown"
+    return value if value in {"pass", "fail", "warn", "skip", "error", "unavailable"} else "unknown"
 
 
 def safe_rule_key(value: Any) -> str | None:
@@ -232,6 +251,117 @@ def delegation_quality(selected: list[tuple[dict[str, Any], dt.datetime]]) -> di
     }
 
 
+def delivery_outcomes(selected: list[tuple[dict[str, Any], dt.datetime]]) -> dict[str, Any]:
+    events = [event for event, _ in sorted(selected, key=lambda pair: pair[1])
+              if safe_event_type(event) == 'feature-delivery' and (event.get('action') in {'verify', 'outcome'} or event.get('outcome') == 'reopened')]
+    latest: dict[tuple[str, str], dict[str, Any]] = {}
+    missing_identity = 0
+    for event in events:
+        feature, task = event.get('feature_id'), event.get('task_id')
+        if not isinstance(feature, str) or not feature or not isinstance(task, str) or not task:
+            missing_identity += 1
+            continue
+        key = (feature, task)
+        latest[key] = {**latest.get(key, {}), **event}
+        if latest[key].get('outcome') not in {'accepted', 'reopened', 'rejected', 'unknown', 'unlabeled'}:
+            latest[key]['outcome'] = 'unknown' if event.get('outcome') else 'unlabeled'
+    tasks = list(latest.values())
+    outcomes = Counter(str(event.get('outcome', 'unlabeled')) for event in tasks)
+    durations = [
+        int(event["duration_ms"])
+        for event in tasks
+        if type(event.get("duration_ms")) is int and event.get("duration_ms") >= 0
+    ]
+    durations.sort()
+    median = None
+    if durations:
+        middle = len(durations) // 2
+        median = durations[middle] if len(durations) % 2 else (durations[middle - 1] + durations[middle]) / 2
+    return {
+        "status": "ready" if tasks else "insufficient-data",
+        "tasks": len(tasks),
+        "observations": len(events),
+        "missing_task_identity": missing_identity,
+        "outcomes": dict(sorted(outcomes.items())),
+        "duration_ms": {
+            "recorded": len(durations),
+            "average": round(sum(durations) / len(durations), 2) if durations else None,
+            "median": median,
+        },
+        "limitations": [
+            "outcomes are observational labels; no control group or causal effect is inferred",
+            "unlabeled tasks remain visible and are not treated as accepted",
+            "latest outcome per feature/task is counted once; missing identities are excluded from task totals",
+        ],
+    }
+
+
+def verification_efficiency(selected: list[tuple[dict[str, Any], dt.datetime]]) -> dict[str, Any]:
+    decisions: Counter[str] = Counter()
+    subjects: set[str] = set()
+    consumed: set[str] = set()
+    known_actor_subjects: set[tuple[str, str, str]] = set()
+    unknown_actor_observations = 0
+    runs: dict[str, dict[str, Any]] = {}
+    conflicting_runs: set[str] = set()
+    duplicate_runs = 0
+    missing_run_identity = 0
+    for event, _ in selected:
+        plan = event.get('verification_plan')
+        if safe_event_type(event) == 'guard-action' and event.get('action') == 'commit' and isinstance(plan, dict):
+            decision, plan_id = plan.get('decision'), plan.get('plan_id')
+            if decision in {'reuse', 'targeted', 'rerun'} and isinstance(plan_id, str) and re.fullmatch('[0-9a-f]{64}', plan_id):
+                decisions[decision] += 1
+                subjects.add(plan_id)
+                owner, goal = event.get('actor_owner_id'), event.get('actor_goal_hash')
+                if isinstance(owner, str) and owner and isinstance(goal, str) and goal:
+                    known_actor_subjects.add((owner, goal, plan_id))
+                else:
+                    unknown_actor_observations += 1
+                if plan.get('check_status') == 'pass' and plan.get('eligible') is True and decision == 'reuse':
+                    proofs = plan.get('claim_proofs', [])
+                    if isinstance(proofs, list):
+                        consumed.update(proof for proof in proofs if isinstance(proof, str) and re.fullmatch('ah-claim-[0-9a-f]{32}', proof))
+        if safe_event_type(event) == 'feature-delivery' and event.get('action') == 'check':
+            run_id = event.get('run_id')
+            if isinstance(run_id, str) and run_id:
+                if run_id in runs:
+                    keys = ('exit_code', 'duration_ms', 'subject_fingerprint', 'command_hash', 'feature_id', 'task_id', 'verification_plan')
+                    if any(runs[run_id].get(key) != event.get(key) for key in keys):
+                        conflicting_runs.add(run_id)
+                    else:
+                        duplicate_runs += 1
+                else:
+                    runs[run_id] = event
+            else:
+                missing_run_identity += 1
+    for run_id in conflicting_runs:
+        runs.pop(run_id, None)
+    durations = [event['duration_ms'] for event in runs.values()
+        if type(event.get('duration_ms')) is int and event['duration_ms'] >= 0]
+    run_decisions: Counter[str] = Counter()
+    for event in runs.values():
+        plan = event.get('verification_plan')
+        decision = plan.get('decision') if isinstance(plan, dict) else None
+        run_decisions[decision if decision in {'reuse', 'targeted', 'rerun'} else 'unknown'] += 1
+    return {'status': 'ready' if subjects or runs else 'insufficient-data',
+        'decision_observations': dict(sorted(decisions.items())), 'distinct_plan_subjects': len(subjects),
+        'distinct_reported_owner_goal_subjects': len(known_actor_subjects),
+        'observations_with_unknown_actor_or_goal': unknown_actor_observations,
+        'distinct_consumed_proofs': len(consumed),
+        'consumption_boundary': 'fresh proof checked by commit guard; neither an actual commit nor an avoided execution is inferred',
+        'execution_runs': {'recorded': len(runs), 'passed': sum(type(event.get('exit_code')) is int and event['exit_code'] == 0 for event in runs.values()),
+            'failed': sum(type(event.get('exit_code')) is int and event['exit_code'] != 0 for event in runs.values()),
+            'missing_identity': missing_run_identity, 'durations_recorded': len(durations),
+            'duplicate_observations': duplicate_runs, 'conflicting_identities': len(conflicting_runs),
+            'measured_duration_ms': sum(durations) if durations else None,
+            'missing_duration': len(runs) - len(durations), 'by_decision_at_start': dict(sorted(run_decisions.items()))},
+        'saved_time_ms': None, 'provider_tokens': None,
+        'limitations': ['only decisions observed at actual commit guards are counted; read-only plan queries are not recorded',
+            'proof consumption is deduplicated separately from decisions and measured executions',
+            'run duration measures verification only; task wall time, saved time and provider billing tokens are unavailable']}
+
+
 def empty_payload(*, days: int, now: dt.datetime, source_status: str, message: str = "") -> dict[str, Any]:
     start = now - dt.timedelta(days=days)
     data_status = "empty" if source_status == "ready" else source_status
@@ -262,6 +392,7 @@ def empty_payload(*, days: int, now: dt.datetime, source_status: str, message: s
                 "attempts": 0,
                 "passed": 0,
                 "failed": 0,
+                "by_kind": {},
                 "average_delay": {"status": "unavailable", "reason": "missing-start-timestamp"},
             },
             "failure_types": {},
@@ -307,6 +438,28 @@ def empty_payload(*, days: int, now: dt.datetime, source_status: str, message: s
             "verification_failed": 0,
             "limitations": ["no completed dispatch events were available in the selected window"],
         },
+        "verification_efficiency": verification_efficiency([]),
+        "delivery_outcomes": {
+            "status": "insufficient-data",
+            "tasks": 0,
+            "outcomes": {},
+            "duration_ms": {"recorded": 0, "average": None, "median": None},
+            "limitations": [
+                "outcomes are observational labels; no control group or causal effect is inferred",
+                "unlabeled tasks remain visible and are not treated as accepted",
+            ],
+        },
+        "hook_timing": {
+            "version": 1,
+            "status": "not-observed",
+            "window_days": days,
+            "samples": 0,
+            "invalid_samples": 0,
+            "summary": [],
+            "over_soft_budget": 0,
+            "failed": 0,
+            "small_sample_groups": 0,
+        },
     }
 
 
@@ -318,6 +471,7 @@ def analyze(root: Path, *, days: int = DEFAULT_DAYS, now: dt.datetime | None = N
     if source["status"] != "ready":
         payload = empty_payload(days=days, now=current, source_status=source["status"], message=source["message"])
         payload["data_quality"]["ignored_events"] = source["ignored_events"]
+        payload["hook_timing"] = hook_timing_observation(root, days=days, now=current)
         return payload
 
     start = current - dt.timedelta(days=days)
@@ -363,6 +517,7 @@ def analyze(root: Path, *, days: int = DEFAULT_DAYS, now: dt.datetime | None = N
         for event in claim_events
     )
     claim_failed = len(claim_events) - claim_passed
+    claim_kinds = Counter(str(event.get("claim_kind") or "unknown") for event in claim_events)
 
     failure_types: Counter[str] = Counter()
     failure_by_event: Counter[str] = Counter()
@@ -436,6 +591,7 @@ def analyze(root: Path, *, days: int = DEFAULT_DAYS, now: dt.datetime | None = N
                 "attempts": len(claim_events),
                 "passed": claim_passed,
                 "failed": claim_failed,
+                "by_kind": dict(sorted(claim_kinds.items())),
                 "average_delay": {"status": "unavailable", "reason": "missing-start-timestamp"},
             },
             "failure_types": dict(sorted(failure_types.items())),
@@ -458,6 +614,9 @@ def analyze(root: Path, *, days: int = DEFAULT_DAYS, now: dt.datetime | None = N
         },
         "rule_effectiveness": rule_effectiveness(root, selected),
         "delegation_quality": delegation_quality(selected),
+        "delivery_outcomes": delivery_outcomes(selected),
+        "verification_efficiency": verification_efficiency(selected),
+        "hook_timing": hook_timing_observation(root, days=days, now=current),
     }
 
 
@@ -483,6 +642,13 @@ def render_text(payload: dict[str, Any], language: str) -> str:
     value = payload["value_proof"]
     rule_health = payload["rule_effectiveness"]
     delegation = payload["delegation_quality"]
+    delivery = payload["delivery_outcomes"]
+    hook_timing = payload.get("hook_timing", {})
+    timing_preview = "; ".join(
+        f"{item.get('platform', '?')}/{item.get('mode', '?')}/{item.get('cache_state', '?')}: p50={item.get('p50_ms')}ms,p95={item.get('p95_ms')}ms"
+        for item in hook_timing.get("summary", [])[:3]
+        if isinstance(item, dict)
+    ) or "none"
     if language == "zh":
         lines = [
             "Tenetora 洞察",
@@ -517,6 +683,17 @@ def render_text(payload: dict[str, Any], language: str) -> str:
             f"  已完成派发 {delegation['dispatches']} 次；通过 {delegation['passed']}；阻塞 {delegation['blockers']}；不可用 {delegation['unavailable']}",
             f"  已记录后续反馈 {delegation['feedback_recorded']} 次；发现已证实 {delegation['finding_confirmed']}；验证通过 {delegation['verification_passed']}",
             "  仅统计显式元数据；报告正文不进入洞察分析。",
+            "",
+            "功能交付测量：",
+            f"  验收任务 {delivery['tasks']} 个；结果 {', '.join(f'{key}={value}' for key, value in delivery['outcomes'].items()) or '无'}",
+            f"  验证耗时（不含任务总耗时）{delivery['duration_ms']['recorded']} 个；平均 {delivery['duration_ms']['average']} ms；中位数 {delivery['duration_ms']['median']} ms",
+            "  结果标签是观察性数据，不构成因果结论。",
+            "",
+            "Hook 耗时：",
+            f"  状态：{hook_timing.get('status', 'unknown')}；样本 {hook_timing.get('samples', 0)}；超软预算 {hook_timing.get('over_soft_budget', 0)}；失败 {hook_timing.get('failed', 0)}",
+            f"  分组 {len(hook_timing.get('summary', []))}；小样本分组 {hook_timing.get('small_sample_groups', 0)}；无效样本 {hook_timing.get('invalid_samples', 0)}",
+            f"  分位数：{timing_preview}",
+            "  p50/p95 按平台、事件、来源和冷热缓存分组展示，只作描述性指标。",
             "",
             "边界：",
             "  完成声明延迟不可用：治理轨迹没有验证开始时间。",
@@ -558,6 +735,17 @@ def render_text(payload: dict[str, Any], language: str) -> str:
             f"  Feedback recorded: {delegation['feedback_recorded']}; findings confirmed {delegation['finding_confirmed']}; verifications passed {delegation['verification_passed']}",
             "  Only explicit metadata is counted; report bodies are not analyzed.",
             "",
+            "Feature delivery measurement:",
+            f"  Verified tasks: {delivery['tasks']}; outcomes: {', '.join(f'{key}={value}' for key, value in delivery['outcomes'].items()) or 'none'}",
+            f"  Verification durations recorded (task wall time unavailable): {delivery['duration_ms']['recorded']}; average {delivery['duration_ms']['average']} ms; median {delivery['duration_ms']['median']} ms",
+            "  Outcome labels are observational and do not establish causality.",
+            "",
+            "Hook timing:",
+            f"  Status: {hook_timing.get('status', 'unknown')}; samples {hook_timing.get('samples', 0)}; over soft budget {hook_timing.get('over_soft_budget', 0)}; failed {hook_timing.get('failed', 0)}",
+            f"  Groups {len(hook_timing.get('summary', []))}; small-sample groups {hook_timing.get('small_sample_groups', 0)}; invalid samples {hook_timing.get('invalid_samples', 0)}",
+            f"  Quantiles: {timing_preview}",
+            "  p50/p95 are grouped by platform, event, origin, and cache state and are descriptive only.",
+            "",
             "Boundaries:",
             "  Claim delay is unavailable because the governance trail has no verification start timestamp.",
             "  Failure types use bounded event/action categories and never expose raw error text.",
@@ -566,6 +754,17 @@ def render_text(payload: dict[str, Any], language: str) -> str:
     if quality["status"] in {"empty", "insufficient-data", "invalid-data", "missing"}:
         message = "数据不足，不能据此判断趋势。" if language == "zh" else "Insufficient data; no trend should be inferred."
         lines.insert(3, message)
+    efficiency = payload['verification_efficiency']
+    if language == 'zh':
+        lines.extend(['', '验证消费与成本：',
+            f"  数据状态：{efficiency['status']}；门禁观测决策：{efficiency['decision_observations']}；消费的独立凭证：{efficiency['distinct_consumed_proofs']}",
+            f"  实际验证运行：{efficiency['execution_runs']['recorded']}；记录耗时：{efficiency['execution_runs']['measured_duration_ms']} ms",
+            '  门禁检查、查询决策与实际运行分别统计；省时和供应商计费 token 不可用。'])
+    else:
+        lines.extend(['', 'Verification consumption and cost:',
+            f"  Data: {efficiency['status']}; decisions observed at guards: {efficiency['decision_observations']}; distinct proofs consumed: {efficiency['distinct_consumed_proofs']}",
+            f"  Measured verification runs: {efficiency['execution_runs']['recorded']}; duration {efficiency['execution_runs']['measured_duration_ms']} ms",
+            '  Guard checks, query decisions and actual runs are counted separately; saved time and billing tokens are unavailable.'])
     return "\n".join(lines)
 
 
@@ -575,6 +774,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--days", type=int, default=DEFAULT_DAYS, help="Lookback window in days (1-365).")
     parser.add_argument("--json", action="store_true", help="Print complete machine-readable output.")
     parser.add_argument("--lang", choices=("en", "zh"), default="en", help="Text output language.")
+    parser.add_argument('--investment-month', help='Read-only monthly commit mix (YYYY-MM, UTC) for this Git repository.')
+    parser.add_argument('--investment-review', type=Path, help='Optional sampled annotations bound to the month and observed HEAD.')
+    parser.add_argument('--investment-head', help='Read a pinned historical commit for a reproducible monthly snapshot; defaults to HEAD.')
     return parser.parse_args(argv)
 
 
@@ -582,8 +784,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     root = args.path.expanduser().resolve()
     try:
+        if args.investment_month:
+            from investment_report import monthly_report
+            from investment_report import render_text as investment_text
+            payload = monthly_report(root, args.investment_month, args.investment_review, args.investment_head or 'HEAD')
+            print(json.dumps(payload, ensure_ascii=False, indent=2) if args.json else investment_text(payload, args.lang))
+            return 0
+        if args.investment_review or args.investment_head:
+            raise ValueError('--investment-review/--investment-head require --investment-month')
         payload = analyze(root, days=args.days)
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
     if args.json:

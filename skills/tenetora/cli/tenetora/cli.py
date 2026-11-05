@@ -69,6 +69,10 @@ LEGACY_COMMANDS = {
     "aggregate-claim": "aggregate_claim.py",
     "repository-units": "repository_units.py",
     "verification-plan": "verification_plan.py",
+    "release-readiness": "release_readiness.py",
+    "feature": "feature_delivery.py",
+    "trail": "trail_state.py",
+    "state": "current_state.py",
     "insights": "insights.py",
     "installations": "installations_state.py",
     "local-env": "local_env.py",
@@ -76,6 +80,7 @@ LEGACY_COMMANDS = {
     "onboarding": "onboarding_state.py",
     "loop-state": "loop_state.py",
     "migrate": "migrate_harness.py",
+    "observe": "observe.py",
     "prompt-guard": "prompt_guard.py",
     "recap": "recap_harness.py",
     "repair": "repair_harness.py",
@@ -416,6 +421,10 @@ Options:
         "aggregate-claim": ("Create or validate a parent repository aggregate proof", "创建或验证父仓库聚合证据"),
         "repository-units": ("Inspect or repair repository-unit registrations", "检查或修复仓库单元登记"),
         "verification-plan": ("Classify changes and choose the smallest verification action", "分类变更并选择最小验证动作"),
+        "release-readiness": ("Aggregate read-only release readiness checks", "汇总只读发布就绪检查"),
+        "feature": ("Manage evidence-bound feature delivery packages", "管理绑定证据的功能交付包"),
+        "trail": ("Inspect or rebuild the governance trail view", "检查或重建治理 trail 视图"),
+        "state": ("Read or rebuild compact current governance state", "读取或重建紧凑当前治理状态"),
         "installations": ("Inspect or maintain registered project installations", "检查或维护已登记项目安装"),
         "local-env": ("Register project-local environment paths", "登记项目本地环境路径"),
         "init": ("Initialize or update a project .tenetora", "初始化或更新项目 .tenetora"),
@@ -439,7 +448,7 @@ Options:
         "audit", "alignment", "alignment-route", "audit-configs", "benchmark", "capture-rule", "delegation", "guard", "hooks",
         "impact", "installations", "local-env", "init", "onboarding", "loop-state", "migrate", "prompt-guard", "recap", "repair", "refresh",
         "review", "route", "rules", "run-all", "setup-ci", "cross-impact", "aggregate-claim", "repository-units",
-        "verification-plan",
+        "verification-plan", "release-readiness", "feature", "trail", "state",
     ):
         subparsers.add_parser(name, help=ui_text(*command_help[name]), add_help=False)
     skill_parser = subparsers.add_parser(

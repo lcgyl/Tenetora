@@ -69,6 +69,7 @@ _OUTPUT_EMITTED = False
 _PLATFORM_OVERRIDE: str | None = None
 _EXECUTION_CONTEXT_MODULE: Any | None = None
 _ALIGNMENT_ROUTING_MODULE: Any | None = None
+_GOVERNANCE_TRAIL_MODULE: Any | None = None
 
 
 def machine_home() -> Path:
@@ -208,6 +209,37 @@ def plugin_root() -> Path:
     if raw:
         return Path(raw).expanduser().resolve()
     return Path(__file__).resolve().parents[1]
+
+
+def governance_trail_module() -> Any | None:
+    """Load the canonical trail reader used by hook runtime consumers."""
+
+    global _GOVERNANCE_TRAIL_MODULE
+    if _GOVERNANCE_TRAIL_MODULE is not None:
+        return _GOVERNANCE_TRAIL_MODULE
+    candidates = (
+        plugin_root() / "skills" / "tenetora" / "scripts" / "governance_trail.py",
+        plugin_root() / "scripts" / "governance_trail.py",
+    )
+    script = next((path for path in candidates if path.is_file()), None)
+    if script is None:
+        return None
+    spec = importlib.util.spec_from_file_location("tenetora_hook_governance_trail", script)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    script_dir = str(script.parent)
+    added = script_dir not in sys.path
+    if added:
+        sys.path.insert(0, script_dir)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if added:
+            sys.path.remove(script_dir)
+    _GOVERNANCE_TRAIL_MODULE = module
+    return module
 
 
 def execution_context_module() -> Any | None:
@@ -622,7 +654,16 @@ def emit(payload: dict[str, Any], event_name: str | None = None) -> int:
     global _OUTPUT_EMITTED
     _OUTPUT_EMITTED = True
     payload = platform_payload(payload, event_name)
-    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    # Hook stdout is a JSON protocol surface. Windows may default stdout to a
+    # legacy code page, so write UTF-8 bytes directly; a StringIO capture (tests)
+    # has no buffer and falls back to text mode.
+    stream = getattr(sys.stdout, "buffer", None)
+    if stream is not None:
+        stream.write(text.encode("utf-8") + b"\n")
+        stream.flush()
+    else:
+        print(text)
     return 0
 
 
@@ -754,12 +795,14 @@ def project_governance_update_context(root: Path) -> str:
     return localized_text(
         "- Project governance update recommended: the project default-pack revision is "
         f"{observed}, behind runtime revision {runtime_defaults}. Tell the user that the package upgrade "
-        "does not semantically update project-owned `.tenetora` content, and recommend "
+        "does not semantically update project-owned `.tenetora` content. Preview the exact shipped-default "
+        "differences read-only with `tenetora refresh --preview --path .`, then recommend "
         "`use tenetora-update update .tenetora`. Do not run the update or overwrite project rules "
         "without the user's decision. This reminder is non-blocking for unrelated work.\n",
         "- 建议更新项目治理：项目默认规则包修订为 "
         f"{observed}，落后于 runtime 修订 {runtime_defaults}。请明确提醒用户：软件包升级不会语义更新"
-        "项目自有的 `.tenetora` 内容，建议执行 `use tenetora-update 更新 .tenetora`。"
+        "项目自有的 `.tenetora` 内容。先用 `tenetora refresh --preview --path .` 只读查看具体差异，"
+        "再建议执行 `use tenetora-update 更新 .tenetora`。"
         "未经用户决定不得自行更新或覆盖项目规则；与此无关的任务不被本提醒阻断。\n",
     )
 
@@ -1212,9 +1255,20 @@ def _acquire_cache_lock(handle: Any, *, shared: bool = False):
         if handle.tell() == 0:
             handle.write(b"0")
             handle.flush()
-        handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-        return lambda: (handle.seek(0), msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1))
+        # Windows byte-range locks report EDEADLK for same-process contention
+        # instead of waiting. Poll a non-blocking lock until the deadline so a
+        # concurrent hook cannot silently lose its read-modify-write update.
+        deadline = time.monotonic() + 5.0
+        while True:
+            handle.seek(0)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
+                continue
+            return lambda: (handle.seek(0), msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1))
     fcntl.flock(handle.fileno(), fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
     return lambda: fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
@@ -1847,13 +1901,13 @@ def governance_feedback(root: Path) -> str:
     trail_path = root / ".tenetora" / "state" / "governance-trail.json"
     if not trail_path.is_file():
         return ""
-    try:
-        payload = json.loads(trail_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    trail = governance_trail_module()
+    if trail is None:
         return ""
-    events = payload.get("events")
-    if not isinstance(events, list):
+    payload = trail.load_trail(root)
+    if payload.get("invalid"):
         return ""
+    events = payload["events"]
     now = dt.datetime.now(dt.timezone.utc)
     passed_after: set[tuple[str, str]] = set()
     feedback_events: list[dict[str, Any]] = []
@@ -2303,22 +2357,51 @@ def route_and_rules_context(root: Path, route_payload: dict[str, Any], contexts:
     return route_and_rules_context_details(root, route_payload, contexts)[0]
 
 
+def rules_payload_for_contexts(root: Path, contexts: list[str]) -> dict[str, Any]:
+    """Reuse the rules CLI's API, preserving fresh reads and consumption events."""
+    script = plugin_root() / 'skills' / 'tenetora' / 'scripts' / 'rules_context.py'
+    try:
+        spec = importlib.util.spec_from_file_location('tenetora_hook_rules_context', script)
+        if spec is None or spec.loader is None:
+            raise ImportError('rules loader unavailable')
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        script_dir = str(script.parent)
+        added = script_dir not in sys.path
+        if added:
+            sys.path.insert(0, script_dir)
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            if added:
+                sys.path.remove(script_dir)
+        payload = module.load_contexts(root, contexts)
+        if not isinstance(payload, dict) or payload.get('status') != 'pass':
+            raise ValueError('rules loader returned invalid data')
+        return payload
+    except (OSError, ImportError, AttributeError, ValueError, RuntimeError):
+        # An unavailable in-process API must retain the existing CLI path.
+        rules = run_cli(root, 'rules', '--context', ','.join(contexts), '--json')
+        if rules.returncode != 0:
+            return {}
+        try:
+            payload = json.loads(rules.stdout)
+            return payload if isinstance(payload, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+
+
 def route_and_rules_context_details(
     root: Path,
     route_payload: dict[str, Any],
     contexts: list[str],
 ) -> tuple[str, dict[str, Any]]:
-    context_value = ",".join(contexts)
-    rules = run_cli(root, "rules", "--context", context_value, "--json")
+    rules_payload = rules_payload_for_contexts(root, contexts)
     files: list[str] = []
     snippets: list[str] = []
     fingerprint_items: list[dict[str, str]] = []
     full_chars = 0
-    if rules.returncode == 0:
-        try:
-            rules_payload = json.loads(rules.stdout)
-        except json.JSONDecodeError:
-            rules_payload = {}
+    if rules_payload:
         for item in rules_payload.get("files", []):
             if not isinstance(item, dict) or not item.get("exists"):
                 continue
@@ -2373,23 +2456,10 @@ def record_context_injection(root: Path, event: dict[str, Any], details: dict[st
 
     if not has_harness(root):
         return
-    candidates = (
-        plugin_root() / "skills" / "tenetora" / "scripts" / "governance_trail.py",
-        plugin_root() / "scripts" / "governance_trail.py",
-    )
-    script = next((path for path in candidates if path.is_file()), None)
-    if script is None:
+    module = governance_trail_module()
+    if module is None:
         return
-    original_sys_path = list(sys.path)
     try:
-        script_dir = str(script.parent)
-        if script_dir not in sys.path:
-            sys.path.insert(0, script_dir)
-        spec = importlib.util.spec_from_file_location("tenetora_hook_governance_trail", script)
-        if spec is None or spec.loader is None:
-            return
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
         full_chars = max(0, int(details.get("full_chars", 0)))
         emitted_chars = max(0, int(details.get("emitted_chars", 0)))
         budget_chars = max(0, int(details.get("budget_chars", DEFAULT_CONTEXT_BUDGET)))
@@ -2418,8 +2488,6 @@ def record_context_injection(root: Path, event: dict[str, Any], details: dict[st
         )
     except (OSError, ImportError, TypeError, ValueError):
         return
-    finally:
-        sys.path[:] = original_sys_path
 
 
 def user_prompt_submit(event: dict[str, Any]) -> int:

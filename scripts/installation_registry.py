@@ -91,6 +91,18 @@ SKIP_DIRECTORY_NAMES = {
     "node_modules",
     "target",
     "venv",
+    # Windows profile and system trees never hold a Tenetora project root and
+    # cost thousands of discovery candidates on a normal machine.
+    "AppData",
+    "Application Data",
+    "Local Settings",
+    "ProgramData",
+    "Program Files",
+    "Program Files (x86)",
+    "Windows",
+    "$Recycle.Bin",
+    "System Volume Information",
+    "Recovery",
 }
 AUTO_DISCOVERY_DIRECTORY_NAMES = (
     "Projects",

@@ -22,6 +22,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from harness_io import atomic_write_text
 from path_security import harness_missing_message, validate_existing_project_path
+from security_patterns import GENERAL_SECRET_PATTERN
 
 
 SESSION_REL = Path(".tenetora/state/alignment-session.json")
@@ -58,15 +59,7 @@ OWNER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{3,127}$")
 MACHINE_PATH_RE = re.compile(
     r"(?<![A-Za-z0-9:/])(?:/Users/|/home/|/root/|/private/|[A-Za-z]:[\\/])"
 )
-SECRET_RE = re.compile(
-    r"(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|"
-    r"\bglpat-[A-Za-z0-9._-]{12,}|"
-    r"\bghp_[A-Za-z0-9_]{20,}|"
-    r"\bgithub_pat_[A-Za-z0-9_]{20,}|"
-    r"\bsk-[A-Za-z0-9_-]{16,}|"
-    r"\b[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD)\b\s*[:=]\s*['\"]?[A-Za-z0-9+/._=-]{16,})",
-    re.IGNORECASE,
-)
+SECRET_RE = GENERAL_SECRET_PATTERN
 ALIGNMENT_LIST_FIELDS = (
     "scope",
     "non_goals",

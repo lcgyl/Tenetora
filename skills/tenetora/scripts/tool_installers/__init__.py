@@ -6,13 +6,14 @@ from .agents import DEFINITION as AGENTS, Installer as AgentsInstaller
 from .claude import DEFINITION as CLAUDE, Installer as ClaudeInstaller
 from .codex import DEFINITION as CODEX, Installer as CodexInstaller
 from .cursor import DEFINITION as CURSOR, Installer as CursorInstaller
+from .dsh import DEFINITION as DSH, Installer as DshInstaller
 from .opencode import DEFINITION as OPENCODE, Installer as OpencodeInstaller
 from .pi import DEFINITION as PI, Installer as PiInstaller
 from .zcode import DEFINITION as ZCODE, Installer as ZcodeInstaller
 from .base import ToolDefinition, ToolInstaller
 
 
-DEFINITIONS: tuple[ToolDefinition, ...] = (AGENTS, CODEX, CLAUDE, CURSOR, OPENCODE, PI, ZCODE)
+DEFINITIONS: tuple[ToolDefinition, ...] = (AGENTS, CODEX, CLAUDE, CURSOR, OPENCODE, PI, ZCODE, DSH)
 _BY_NAME = {definition.name: definition for definition in DEFINITIONS}
 _INSTALLERS: dict[str, ToolInstaller] = {
     "agents": AgentsInstaller(),
@@ -22,6 +23,7 @@ _INSTALLERS: dict[str, ToolInstaller] = {
     "opencode": OpencodeInstaller(),
     "pi": PiInstaller(),
     "zcode": ZcodeInstaller(),
+    "dsh": DshInstaller(),
 }
 
 

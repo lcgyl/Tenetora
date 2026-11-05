@@ -26,6 +26,7 @@ import alignment_state  # noqa: E402
 from harness_io import atomic_write_text  # noqa: E402
 from path_security import harness_missing_message, validate_existing_project_path  # noqa: E402
 from worktree_fingerprint import WORKTREE_ENTRIES_VERSION, git_state_entries  # noqa: E402
+from security_patterns import CONTENT_SECRET_PATTERN  # noqa: E402
 
 
 STATE_REL = ".tenetora/state/change-impact.json"
@@ -48,11 +49,7 @@ KINDS = (
     "behavior",
     "other",
 )
-HIGH_CONFIDENCE_SECRET = re.compile(
-    r"(?:glpat-[A-Za-z0-9._-]{16,}|ghp_[A-Za-z0-9_]{20,}|"
-    r"\b(?:TOKEN|SECRET|PASSWORD)\b\s*[:=]\s*['\"]?\S{12,})",
-    re.IGNORECASE,
-)
+CONTENT_CREDENTIAL_MATCHER = CONTENT_SECRET_PATTERN
 WINDOWS_ABSOLUTE = re.compile(r"^[A-Za-z]:[\\/]")
 CONTRACT_PATH_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("hook-contract", re.compile(r"(^|/)(?:hooks?|hook-adapters?)(/|$)|(?:^|/)hooks?[^/]*\.(?:json|ya?ml)$", re.I)),
@@ -219,7 +216,7 @@ def git_head(root: Path) -> str:
 
 def _diagnostic_text(value: str) -> str:
     text = str(sanitize_local_paths(value)).strip()
-    if HIGH_CONFIDENCE_SECRET.search(text):
+    if CONTENT_CREDENTIAL_MATCHER.search(text):
         return "[redacted]"
     return text[:MAX_REFLOG_TEXT]
 
@@ -306,7 +303,7 @@ def safe_text(value: str | None, field: str, required: bool = False) -> str:
     text = str(sanitize_local_paths(value or "")).strip()
     if required and not text:
         raise ValueError(f"{field} is required")
-    if HIGH_CONFIDENCE_SECRET.search(text):
+    if CONTENT_CREDENTIAL_MATCHER.search(text):
         raise ValueError(f"{field} may contain a credential; do not store secrets in change-impact state")
     return text[:MAX_TEXT]
 

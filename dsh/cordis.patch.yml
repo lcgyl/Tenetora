@@ -1,0 +1,16 @@
+# Tenetora bundle layer for a dsh profile.
+#
+# One Host row. The plugin is inert in any workspace that does not contain a
+# `.tenetora/` directory, so installing the bundle does not change behaviour
+# for unrelated projects.
+- insert:
+    - id: tenetora-dsh
+      name: '@lcgyl/tenetora-dsh'
+      config:
+        enabled: true
+        # Override when the managed launcher is not on PATH, for example:
+        #   cli: C:/Users/<user>/.tenetora/bin/tenetora.cmd
+        # A source checkout can be driven without installing the launcher:
+        #   cli: python
+        #   cliArgs: ["-m", "tenetora"]
+        cli: tenetora

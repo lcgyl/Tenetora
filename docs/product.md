@@ -100,7 +100,7 @@ A prompt template can remind an agent to run tests. Tenetora can distinguish a p
 
 ## Multi-Tool and Multi-Conversation Use
 
-Claude Code, Codex, Cursor, OpenCode, ZCode, and generic agents do not have identical Hook or plugin capabilities. Tenetora shares the project record and CLI semantics while reporting each platform's real runtime ceiling. `active`, `active-partial`, `skills-only`, and `needs-trust-review` are capability states, not marketing labels.
+Claude Code, Codex, Cursor, OpenCode, Pi, ZCode, DeepSeek Harness, and generic agents do not have identical Hook or plugin capabilities. Tenetora shares the project record and CLI semantics while reporting each platform's real runtime ceiling. `active`, `active-partial`, `skills-only`, and `needs-trust-review` are capability states, not marketing labels.
 
 The machine installation registry records existing global and project surfaces. Project alignment and completion evidence are owner-bound: a later conversation or another tool must not silently inherit a previous conversation's active goal or claim. A normal Stop reminder is non-blocking; only an explicit completion workflow requires a completion claim.
 

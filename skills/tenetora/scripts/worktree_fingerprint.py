@@ -12,13 +12,17 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-WORKTREE_FINGERPRINT_VERSION = 3
-WORKTREE_ENTRIES_VERSION = 1
+# Version 4 normalizes CRLF to LF for text files before hashing. Existing
+# claims intentionally expire once this changes so they can be re-recorded with
+# the Git-semantic content contract.
+WORKTREE_FINGERPRINT_VERSION = 4
+WORKTREE_ENTRIES_VERSION = 2
 VOLATILE_WORKTREE_PATHS = frozenset(
     {
         ".tenetora/state/aggregate-claim.json",
         ".tenetora/state/governance-trail.json",
         ".tenetora/state/alignment-lifecycle.json",
+        ".tenetora/state/current.json",
     }
 )
 
@@ -32,7 +36,7 @@ def _is_volatile_path(relative: str) -> bool:
         and path.parts[:2] == (".tenetora", "state")
         and path.name.startswith(".")
         and path.name.endswith(".lock")
-    )
+    ) or (len(path.parts) >= 3 and path.parts[:3] == (".tenetora", "state", "trail"))
 
 
 def git_repository_env() -> dict[str, str]:
@@ -89,6 +93,10 @@ def _tracked_and_untracked_paths(root: Path) -> list[str] | None:
             continue
         if candidate.is_absolute() or candidate.drive or ".." in candidate.parts:
             return None
+        # Some Git versions emit a `.`/`./` entry for a submodule index; it
+        # normalizes to no parts and cannot identify a worktree path.
+        if not candidate.parts:
+            continue
         paths.append(relative)
     return sorted(set(paths))
 
@@ -148,12 +156,25 @@ def _matches_scope(relative: str, scopes: tuple[str, ...]) -> bool:
 
 
 def _file_content_digest(path: Path) -> str | None:
-    digest = hashlib.sha256()
+    raw_digest = hashlib.sha256()
+    text_digest = hashlib.sha256()
+    pending_cr = False
+    has_nul = False
     try:
         before = path.lstat()
         with path.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
+                raw_digest.update(chunk)
+                has_nul = has_nul or b"\x00" in chunk
+                if pending_cr:
+                    chunk = b"\r" + chunk
+                    pending_cr = False
+                if chunk.endswith(b"\r"):
+                    chunk = chunk[:-1]
+                    pending_cr = True
+                text_digest.update(chunk.replace(b"\r\n", b"\n"))
+            if pending_cr:
+                text_digest.update(b"\r")
         after = path.lstat()
     except (OSError, ValueError):
         return None
@@ -164,12 +185,16 @@ def _file_content_digest(path: Path) -> str | None:
         or before.st_ino != after.st_ino
     ):
         return None
-    return digest.hexdigest()
+    return raw_digest.hexdigest() if has_nul else text_digest.hexdigest()
 
 
 def _safe_lstat(root: Path, relative: str) -> tuple[os.stat_result | None, bool]:
     current = root
     parts = Path(relative).parts
+    if not parts:
+        # A path that normalizes to the root itself has no entry to describe.
+        return None, True
+    metadata: os.stat_result | None = None
     for index, part in enumerate(parts):
         current /= part
         try:

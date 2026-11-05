@@ -12,7 +12,9 @@ The root [`README.md`](../README.md) gives the product position and shortest sta
 | First installation and project initialization | [`quickstart.md`](quickstart.md) ||
 | Installation, upgrade, offline recovery, and reset | [`guides/installation.md`](guides/installation.md) ||
 | Diagnose the effective plugin/runtime | [`guides/runtime-platforms.md`](guides/runtime-platforms.md) ||
+| Compare support tiers and runtime promises | [`guides/support-matrix.md`](guides/support-matrix.md) ||
 | Lifecycle, alignment, loops, and subagents | [`guides/governance.md`](guides/governance.md) ||
+| Lifecycle entry map and review workflow | [`guides/entry-map.md`](guides/entry-map.md) ||
 | Coordinate multiple agents and repository units | [`guides/multi-agent-repository-collaboration.md`](guides/multi-agent-repository-collaboration.md) ||
 | Prompt guard, repair, evidence, and maintenance | [`guides/security-maintenance.md`](guides/security-maintenance.md) ||
 | Migrate from an Agent Harness installation | [`guides/tenetora-migration.md`](guides/tenetora-migration.md) ||
