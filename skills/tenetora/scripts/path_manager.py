@@ -25,6 +25,9 @@ START_MARKER = "# >>> tenetora managed PATH >>>"
 END_MARKER = "# <<< tenetora managed PATH <<<"
 
 
+from upgrade_messages import MessageIssue, message_issue  # noqa: E402
+
+
 class PathManagerError(RuntimeError):
     """Raised when PATH ownership cannot be proven or updated safely."""
 
@@ -56,11 +59,11 @@ def replace_managed_block(content: str, block: str) -> tuple[str, str]:
     start_count = content.count(START_MARKER)
     end_count = content.count(END_MARKER)
     if start_count != end_count or start_count > 1:
-        raise PathManagerError("shell profile contains duplicate or damaged Tenetora PATH markers")
+        raise PathManagerError(MessageIssue('upgrade.shell-profile-contains-duplicate-or-damaged-tenetora-path-markers'))
     start = content.find(START_MARKER)
     end = content.find(END_MARKER)
     if (start < 0) != (end < 0) or (start >= 0 and end < start):
-        raise PathManagerError("shell profile contains a damaged Tenetora PATH marker")
+        raise PathManagerError(MessageIssue('upgrade.shell-profile-contains-a-damaged-tenetora-path-marker'))
     if start >= 0:
         end += len(END_MARKER)
         updated = content[:start].rstrip() + "\n\n" + block + content[end:]
@@ -74,13 +77,13 @@ def _assert_profile_safe(path: Path) -> None:
     try:
         path = validate_unredirected_file_path(path, label="shell profile")
     except RuntimeError as error:
-        raise PathManagerError(str(error)) from error
+        raise PathManagerError(message_issue(error) or str(error)) from error
     if path.exists() and os.name != "nt" and hasattr(os, "getuid"):
         info = path.stat()
         if info.st_uid != os.getuid():
-            raise PathManagerError("shell profile is not owned by the current user")
+            raise PathManagerError(MessageIssue('upgrade.shell-profile-is-not-owned-by-the-current-user'))
         if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-            raise PathManagerError("shell profile is writable by group or others")
+            raise PathManagerError(MessageIssue('upgrade.shell-profile-is-writable-by-group-or-others'))
 
 
 def configure_posix_path(home: Path, bin_dir: Path, shell: str) -> dict[str, Any]:

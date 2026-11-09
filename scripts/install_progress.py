@@ -62,7 +62,7 @@ SECRET_PATTERNS = (
         r"xox[baprs]-[A-Za-z0-9-]{12,}"
         r")\b"
     ),
-    re.compile(r"(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@"),
+    re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^/@\s]+@"),
 )
 
 
@@ -77,7 +77,7 @@ def redact(text: str) -> str:
             sanitized = pattern.sub("[REDACTED_TOKEN]", sanitized)
         elif pattern.pattern.startswith("\\b"):
             sanitized = pattern.sub("[REDACTED_TOKEN]", sanitized)
-        elif pattern.pattern.startswith("(?i)([a-z]"):
+        elif pattern.pattern.startswith("(?i)(\\b[a-z]"):
             sanitized = pattern.sub(r"\1[REDACTED]@", sanitized)
         else:
             sanitized = pattern.sub(r"\1[REDACTED]", sanitized)

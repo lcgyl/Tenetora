@@ -20,13 +20,13 @@ if str(SCRIPT_DIRECTORY) not in sys.path:
 from path_security import harness_missing_message, is_redirected_path  # noqa: E402
 from alignment_state import state_lock  # noqa: E402
 from harness_io import atomic_write_text  # noqa: E402
-from governance_trail import load_trail  # noqa: E402
+from governance_trail import load_retained_trail  # noqa: E402
+from claim_evidence import superseding_failure  # noqa: E402
 from worktree_fingerprint import (  # noqa: E402
     WORKTREE_FINGERPRINT_VERSION,
     git_state_fingerprint,
     git_repository_env,
     normalize_scopes,
-    verification_scopes_intersect,
 )
 
 
@@ -281,8 +281,8 @@ def _read_claim_events(child: Path) -> list[dict[str, Any]] | None:
     path = child / relative
     if not path.is_file():
         return None
-    payload = load_trail(child)
-    if payload.get("invalid"):
+    payload = load_retained_trail(child)
+    if payload.get("invalid") or payload.get('conflicts'):
         return None
     return payload["events"]
 
@@ -302,6 +302,12 @@ def _claim_proof_problems(child: Path, proof: str) -> list[str]:
     if matching_event is None or matching_index is None:
         return ["verification-claim-proof-missing"]
     problems: list[str] = []
+    from claim_evidence import claim_handoff_problem
+    if claim_handoff_problem(child, matching_event):
+        problems.append('verification-claim-handoff-invalid')
+    from execution_receipts import claim_execution_problem
+    if claim_execution_problem(child,matching_event):
+        problems.append('verification-claim-execution-invalid')
     if matching_event.get("status") != "pass" or matching_event.get("verification_status") != "passed":
         problems.append("verification-claim-not-passed")
     if matching_event.get("claim_kind") not in {"completion", "partial-verification"}:
@@ -320,29 +326,15 @@ def _claim_proof_problems(child: Path, proof: str) -> list[str]:
             normalized_scope = ()
     recorded_version = matching_event.get("git_state_fingerprint_version")
     recorded_fingerprint = matching_event.get("git_state_fingerprint")
-    current_fingerprint = git_state_fingerprint(child, normalized_scope)
+    current_fingerprint = git_state_fingerprint(child, normalized_scope,known_paths=matching_event.get('git_state_entries') or ())
     if recorded_version != WORKTREE_FINGERPRINT_VERSION:
         problems.append("verification-claim-fingerprint-version-invalid")
     if not isinstance(recorded_fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", recorded_fingerprint):
         problems.append("verification-claim-fingerprint-missing")
     elif current_fingerprint is None or current_fingerprint != recorded_fingerprint:
         problems.append("verification-claim-stale")
-    for event in events[matching_index + 1 :]:
-        if event.get("type") != "verification-claim":
-            continue
-        if event.get("status") == "pass" and event.get("verification_status") == "passed":
-            continue
-        later_scope = event.get("verification_scope", [])
-        if not isinstance(later_scope, list) or any(not isinstance(item, str) for item in later_scope):
-            problems.append("verification-claim-superseded")
-            break
-        try:
-            overlaps = verification_scopes_intersect(normalized_scope, later_scope)
-        except ValueError:
-            overlaps = True
-        if overlaps:
-            problems.append("verification-claim-superseded")
-            break
+    if superseding_failure(events, matching_event):
+        problems.append('verification-claim-superseded')
     return sorted(set(problems))
 
 

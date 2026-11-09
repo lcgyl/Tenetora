@@ -51,6 +51,7 @@ HOOK_SOURCE_FILES = (
     "run-hook",
     "run-hook.cmd",
     "tenetora_hook.py",
+    "hook_timing.py",
     "platform-contracts.json",
 )
 HOOK_RUNTIME_FILES = (*HOOK_SOURCE_FILES, "VERSION")
@@ -380,8 +381,8 @@ def ensure_installable() -> None:
         raise FileNotFoundError(f"Embedded CLI package is missing: {CLI_PATH}")
 
 
-def isolated_cli_code() -> str:
-    encoded_cli_path = base64.b64encode(os.fsencode(CLI_PATH)).decode("ascii")
+def isolated_cli_code(cli_path: Path | None = None) -> str:
+    encoded_cli_path = base64.b64encode(os.fsencode(cli_path or CLI_PATH)).decode("ascii")
     return (
         "import base64,os,runpy,sys;"
         f"sys.path.insert(0,os.fsdecode(base64.b64decode({encoded_cli_path!r})));"
@@ -389,9 +390,9 @@ def isolated_cli_code() -> str:
     )
 
 
-def posix_shim(bin_dir: Path, command_name: str = COMMAND_NAME) -> str:
-    python = shlex.quote(sys.executable)
-    cli_code = shlex.quote(isolated_cli_code())
+def posix_shim(bin_dir: Path, command_name: str = COMMAND_NAME, *, python_path: str | None = None, cli_path: Path | None = None) -> str:
+    python = shlex.quote(python_path or sys.executable)
+    cli_code = shlex.quote(isolated_cli_code(cli_path))
     harness_home = shlex.quote(str(bin_dir.parent))
     return f"""#!/bin/sh
 if [ -z "${{TENETORA_HOME:-}}" ]; then
@@ -404,9 +405,9 @@ exec {python} -B -I -c {cli_code} "$@"
 """
 
 
-def windows_shim(bin_dir: Path, command_name: str = COMMAND_NAME) -> str:
-    python = str(Path(sys.executable)).replace("%", "%%")
-    cli_code = isolated_cli_code()
+def windows_shim(bin_dir: Path, command_name: str = COMMAND_NAME, *, python_path: str | None = None, cli_path: Path | None = None) -> str:
+    python = str(Path(python_path or sys.executable)).replace("%", "%%")
+    cli_code = isolated_cli_code(cli_path)
     harness_home = str(bin_dir.parent)
     return f"""@echo off
 if not defined TENETORA_HOME set "TENETORA_HOME={harness_home}"

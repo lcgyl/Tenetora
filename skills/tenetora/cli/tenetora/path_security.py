@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import posixpath
 import shlex
@@ -87,6 +89,48 @@ def validate_existing_project_path(raw: Path | str, *, label: str = "project pat
     return candidate
 
 
+def is_machine_install_home(harness: Path, configured_home: Path) -> bool:
+    """Recognize a machine home without treating directory names as ownership."""
+
+    try:
+        if harness.resolve(strict=False) == configured_home.resolve(strict=False):
+            return True
+        # Preserve project governance, including incomplete or unreadable project
+        # markers. An ambiguous release store must not silently disable Hooks.
+        for name in ("manifest.json", "README.md", "rules", "workflows"):
+            marker = harness / name
+            if marker.exists() or is_redirected_path(marker):
+                return False
+        releases = validate_existing_project_path(harness / "releases", label="release storage")
+        current = harness / "current"
+        if not is_redirected_path(current):
+            return False
+        release = validate_existing_project_path(current.resolve(strict=True), label="active release")
+        if release.parent != releases.resolve(strict=True):
+            return False
+        manifest_path = validate_unredirected_file_path(release / "manifest.json", label="release manifest")
+        # Only bounded identity metadata is needed here; package authentication
+        # and full content checks remain the release store's responsibility.
+        with manifest_path.open("rb") as handle:
+            manifest_bytes = handle.read(1024 * 1024 + 1)
+        if len(manifest_bytes) > 1024 * 1024:
+            return False
+        manifest = json.loads(manifest_bytes)
+        if not isinstance(manifest, dict) or manifest.get("name") != "tenetora":
+            return False
+        if manifest.get("format") != "tenetora-release-zip-v1" or manifest.get("version") != release.name:
+            return False
+        relative = "skills/tenetora/VERSION"
+        version_path = validate_unredirected_file_path(release / relative, label="release version")
+        with version_path.open("rb") as handle:
+            version_bytes = handle.read(129)
+        hashes = manifest.get("file_sha256")
+        return (len(version_bytes) <= 128 and version_bytes.decode("utf-8").strip() == release.name
+                and isinstance(hashes, dict) and hashes.get(relative) == hashlib.sha256(version_bytes).hexdigest())
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def nearest_governed_parent(raw: Path | str) -> Path | None:
     """Find a governed ancestor without implying that its policy owns the child."""
 
@@ -95,7 +139,9 @@ def nearest_governed_parent(raw: Path | str) -> Path | None:
     machine_home = Path(os.environ.get("TENETORA_HOME") or (Path.home() / ".tenetora")).expanduser().resolve(strict=False)
     for parent in current.parents:
         harness = parent / ".tenetora"
-        if harness.is_dir() and harness.resolve(strict=False) != machine_home:
+        if not harness.is_dir():
+            continue
+        if not is_machine_install_home(harness, machine_home):
             return parent
     return None
 

@@ -789,6 +789,8 @@ PRESERVED_PROVENANCE_STATE = {
     "state/benchmark-history.json",
     "state/change-impact.json",
     "state/current-alignment.json",
+    "state/completion-commits/",
+    "state/verification-runs/",
     "state/delegation-state.json",
     "state/governance-trail.json",
     "state/loop-state.json",

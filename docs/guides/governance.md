@@ -92,16 +92,14 @@ tenetora recap --write --path .
 
 Read-only pre-release summary: `tenetora release-readiness --path . --json`. It aggregates worktree, verification, version/changelog, current-state consistency, and review-debt signals; it never changes release state.
 
-CI or release workflows that require evidence to block may pass
-`tenetora guard --action commit --strict-evidence`. It requires a fresh covering
-claim for every verification-impacting staged path (a scoped claim is enough;
-the full suite is not required when the affected boundary is narrower).
-Documentation, release metadata, and other non-verification paths still pass
-with their targeted checks, so a documentation-only commit is never forced
-through the full suite. Ordinary commits retain the warning behavior for
-uncovered evidence.
+CI or release workflows may use `tenetora guard --action commit --strict-evidence` to require fresh covering evidence for every verification-impacting staged path; scoped claims suffice for narrower changes.
+Documentation and release metadata retain targeted checks; ordinary commits retain warning behavior for uncovered evidence.
 
 Before reporting completion:
+
+New completion candidates remain pending on disk; shared readers expose pass only when an immutable receipt in `state/completion-commits/` commits the exact raw candidate digest and proof. Older readers conservatively reject these candidates and need upgrading. The commit rechecks source and authorization while serializing journal writes. After a transient pre-commit write failure, retry the same goal, command and unchanged source to reuse its proof; after a superseding failure or source change, actually verify again and request a normal claim for a new proof on the still-open goal.
+For an older closed-but-unpublished goal, add `--resume-completion` with its explicit original session/owner and verification command. It recovers only that exact proof, never another completion for the closed goal.
+Committed journal/view or lifecycle writes with cleanup errors return pass plus `write_warnings`; unconfirmed writes fail. If a journal-only write leaves the view inconsistent, inspect the raw evidence before an explicit `trail rebuild`, then retry.
 
 ```bash
 tenetora guard \
@@ -140,6 +138,18 @@ The report separates trends, failure patterns, and recorded intervention counts.
 
 For repeated prompts, the `UserPromptSubmit` hook injects the full rule context once for a matching rule fingerprint, then emits a compact reference while that fingerprint remains unchanged. A rule-file change, missing cache, legacy cache entry, or cache write failure falls back to full injection so stale guidance is not reused. `insights --json` reports the number of reference reuses and an estimated character reduction; the token figure is only `characters / 4`, not provider billing or an exact tokenizer measurement.
 
+### Audit scores and retained history
+
+Engineering audit identifies `issue-count-v1` in `score_model` with per-dimension `score_breakdown`.
+Start at 100, deduct 35 per blocking finding and 10 per warning, clamp to 0–100, then average dimensions without weights.
+100 means no counted findings; this is not a calibrated quality, productivity or user-benefit measurement.
+Existing `scores`, `--min-score`, JUnit values and history retain their meaning; new records also identify the model.
+
+Writes retain JSON-only legacy events before rolling the view. Healthy active history above 2,000 events is automatically compacted to a 500-event tail plus any sequence anchor.
+Complete recovery archives and replacement active segments are published before old removal; archives retain obligations without clearing debt or deleting history by age.
+Invalid or conflicting history refuses ordinary writes and preserves evidence. Inspect `trail status --json`; use explicit `trail rebuild` only after verifying the raw journal is valid.
+`trail compact --keep-events N` remains available. The bound applies to active history, not full historical reviews or model latency.
+
 ### Continuing in Another Conversation
 
 Claim evidence is owner-bound. A claim from another conversation, tool, goal revision, or session is intentionally not reusable; this prevents a completed task from being attached to a different task. When continuing work in a new conversation:
@@ -170,7 +180,7 @@ tenetora guard --action alignment --goal "<goal>" --risk-level high --path .
 ```
 Confirmation ends alignment; it does not start planning or implementation. Waiting for confirmation has a seven-day review lease; a matching owner may resume it, but must re-enter awaiting-confirmation before confirming. Expired sessions without running attempts or pending confirmation are historical and non-blocking; sessions with running attempts or pending user confirmation remain actionable and require explicit session identity.
 
-Confirmed handoffs have a separate lifecycle. The host session/conversation id remains stable across the chat, but every task goal has a distinct alignment session id. A completion claim marks one goal `completed`; `tenetora alignment --archive --session-id <session-id> --owner-id <owner-id>` closes a goal whose host conversation is no longer relevant. A later task in the same conversation therefore gets a new alignment id instead of reusing the terminal goal or colliding with the host session id. The local runtime cannot observe host deletion, so open goals expire after 30 days without owner activity; automatic lookup uses only open goals. Multiple matches create a short-lived, prompt-bound request for the host model to select one semantically clear target, while an absent, stale, unsafe, or ambiguous selection remains fail-closed. If identity matches only terminal goals, the claim guard reports that closed-goal state explicitly instead of saying no alignment ever existed. Routing is context selection only, not confirmation or authorization; terminal lifecycle/history is pruned to 64/128 records or 90 days while retained handoffs remain explicitly readable.
+Confirmed handoffs have a separate lifecycle. The host session/conversation id remains stable across the chat, but every task goal has a distinct alignment session id. A completion claim marks one goal `completed`; `tenetora alignment --archive --session-id <session-id> --owner-id <owner-id>` closes a goal whose host conversation is no longer relevant. A later task in the same conversation therefore gets a new alignment id instead of reusing the terminal goal or colliding with the host session id. The local runtime cannot observe host deletion, so open goals expire after 30 days without owner activity; automatic lookup uses only open goals. Multiple matches create a short-lived, prompt-bound request for the host model to select one semantically clear target, while an absent, stale, unsafe, or ambiguous selection remains fail-closed. If identity matches only terminal goals, the claim guard reports that closed-goal state explicitly instead of saying no alignment ever existed. Routing is context selection only, not confirmation or authorization; terminal lifecycle/history is pruned to 64/128 records or 90 days while retained handoffs remain explicitly readable. Receipt-backed completion survives routing and handoff cleanup; retained handoffs are still checked while present. Legacy completion without a receipt requires its retained handoff. Journal sequence determines modern write order, including clock rollback; unordered legacy failures conservatively block reuse until accepted by the writer. Later overlapping failures still invalidate reuse.
 
 ## End-to-End Skeleton First
 

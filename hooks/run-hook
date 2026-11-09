@@ -24,7 +24,7 @@ fi
 python_is_compatible() {
   candidate=$1
   [ -f "$candidate" ] && [ -x "$candidate" ] || return 1
-  "$candidate" -c "import sys; raise SystemExit(0 if sys.version_info >= (${MINIMUM_PYTHON_MAJOR}, ${MINIMUM_PYTHON_MINOR}) else 1)" >/dev/null 2>&1
+  "$candidate" -I -B -c "import sys; raise SystemExit(0 if sys.version_info >= (${MINIMUM_PYTHON_MAJOR}, ${MINIMUM_PYTHON_MINOR}) else 1)" >/dev/null 2>&1
 }
 
 EXPLICIT_PYTHON=${TENETORA_PYTHON:-}
@@ -77,7 +77,7 @@ if [ -z "$PYTHON_BIN" ]; then
 fi
 
 if [ "$1" = "--check" ]; then
-  exec "$PYTHON_BIN" "$SCRIPT_DIR/tenetora_hook.py" --runtime-check
+  exec "$PYTHON_BIN" -I -B "$SCRIPT_DIR/tenetora_hook.py" --runtime-check
 fi
 
-exec "$PYTHON_BIN" "$SCRIPT_DIR/tenetora_hook.py" "$@"
+exec "$PYTHON_BIN" -I -B "$SCRIPT_DIR/tenetora_hook.py" "$@"

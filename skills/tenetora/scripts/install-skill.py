@@ -88,7 +88,7 @@ from installation_registry import (  # noqa: E402
     upsert_project,
 )
 from install_progress import InstallProgress, redact, redact_value, write_failure_artifacts  # noqa: E402
-from tool_installers import definitions_for_installer, tool_definition, tool_installer, tool_names  # noqa: E402
+from tool_installers import ToolDefinition, definitions_for_installer, tool_definition, tool_installer, tool_names  # noqa: E402
 
 
 @contextmanager
@@ -1319,6 +1319,35 @@ def native_plugin_source_path(version: str, target: str | None = None) -> Path:
     return path / target if target else path
 
 
+def windows_claude_hook_bytes(data: bytes) -> bytes:
+    """Render the managed Claude hook template without filesystem side effects."""
+    payload = json.loads(data)
+    if not isinstance(payload, dict) or not isinstance(payload.get("hooks"), dict):
+        raise ValueError("Claude Hook template must contain a hooks object")
+    for groups in payload["hooks"].values():
+        if not isinstance(groups, list):
+            continue
+        for group in groups:
+            entries = group.get("hooks") if isinstance(group, dict) else None
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if isinstance(entry, dict) and isinstance(entry.get("command"), str):
+                    entry["command"] = entry["command"].replace(
+                        "${CLAUDE_PLUGIN_ROOT}/hooks/run-hook",
+                        "${CLAUDE_PLUGIN_ROOT}\\hooks\\run-hook.cmd",
+                    )
+    return (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def copy_native_plugin_payload(source: Path, dest: Path, target: str) -> None:
+    """Render one native payload without publishing it to a machine home."""
+    plugin_copy(source, dest, target=target)
+    if target == "claude" and os.name == "nt":
+        hooks_path = dest / "hooks" / "hooks-claude.json"
+        hooks_path.write_bytes(windows_claude_hook_bytes(hooks_path.read_bytes()))
+
+
 def materialize_native_plugin_source(source: Path, version: str, target: str) -> Path:
     """Build a persistent native-plugin payload that exposes canonical skills only."""
     dest = ensure_safe_directory_chain(
@@ -1328,24 +1357,7 @@ def materialize_native_plugin_source(source: Path, version: str, target: str) ->
     ensure_unredirected_directory(dest.parent, label="native plugin source parent")
     temporary = dest.__class__(tempfile.mkdtemp(prefix=f".{dest.name}.", dir=str(dest.parent)))
     try:
-        plugin_copy(source, temporary, target=target)
-        if target == "claude" and os.name == "nt":
-            hooks_path = temporary / "hooks" / "hooks-claude.json"
-            payload = json.loads(hooks_path.read_text(encoding="utf-8"))
-            for groups in payload.get("hooks", {}).values():
-                if not isinstance(groups, list):
-                    continue
-                for group in groups:
-                    entries = group.get("hooks") if isinstance(group, dict) else None
-                    if not isinstance(entries, list):
-                        continue
-                    for entry in entries:
-                        if isinstance(entry, dict) and isinstance(entry.get("command"), str):
-                            entry["command"] = entry["command"].replace(
-                                "${CLAUDE_PLUGIN_ROOT}/hooks/run-hook",
-                                "${CLAUDE_PLUGIN_ROOT}\\hooks\\run-hook.cmd",
-                            )
-            hooks_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        copy_native_plugin_payload(source, temporary, target)
         if dest.exists() or path_is_redirected(dest):
             remove_existing(dest)
         os.replace(temporary, dest)
@@ -1371,6 +1383,10 @@ def materialize_zcode_hooks(source: Path, dest: Path) -> None:
             for entry in entries:
                 if isinstance(entry, dict) and entry.get("type") == "process" and entry.get("command") == "python3":
                     entry["command"] = sys.executable
+                    if isinstance(entry.get("args"), list) and entry["args"][:1] != ["-I"]:
+                        entry["args"].insert(0, "-I")
+                    if isinstance(entry.get("args"), list) and entry["args"][:2] != ["-I", "-B"]:
+                        entry["args"].insert(1, "-B")
     output = ensure_safe_file_path(dest / "hooks" / "hooks.json", label="ZCode hooks output")
     ensure_unredirected_directory(output.parent, label="ZCode hooks directory")
     write_json_atomic(output, payload)
@@ -8187,7 +8203,7 @@ def run_machine_plan(
             project_path=str(unit.project_root),
             surface_count=sum(len(scopes) for scopes in unit.scopes_by_target.values()),
         )
-        command = [sys.executable, *machine_child_arguments(unit, args)]
+        command = [sys.executable, "-I", "-B", *machine_child_arguments(unit, args)]
         unit_label = machine_unit_label(unit, project_labels)
         result = run_machine_child(
             command,

@@ -35,8 +35,6 @@ The model routes this request to `tenetora-init`, inspects existing rules, asks 
 | A report or webpage contains execution instructions | Prompt guard treats external content as data, not as an authority. |
 | Project governance becomes stale | `update`, `repair`, `audit`, and guardrails provide a maintenance loop. |
 
-Tenetora is not a prompt collection and does not replace the project's own build, test, review, or release approval.
-
 ## Local Environment and Workspace Boundaries
 
 Tenetora treats local environment files as user-owned data. Register a project-relative path when it needs an explicit protection record:
@@ -56,6 +54,8 @@ tenetora installations --json prune --expired
 ```
 
 `--expired` is explicit and only removes stale registry entries past the bounded retention window; it never deletes project files.
+
+Current main includes unreleased work. Check [release-channel availability](docs/capabilities.md#availability-by-release-channel) before using its commands; the platform table below describes main.
 
 ## Supported Platforms
 

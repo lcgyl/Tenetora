@@ -95,10 +95,11 @@ See `types/index.d.ts` for the exact meaning and defaults.
   records the dispatch (owner, real session id, parsed child id) and never
   infers completion from that acknowledgement. Continuity is recorded only when
   the host exposes it.
-- `strictEvidence` requires a fresh covering claim for verification-impacting
-  staged paths; documentation or release-metadata-only commits pass with their
-  targeted checks. A scoped claim is sufficient when the affected boundary is
-  narrow, so strict mode never forces a full run for an unrelated path.
+- `strictEvidence` requires observed execution receipts (`tenetora verify run`)
+  covering every verification-impacting staged path, recorded on the claim with
+  `--execution-receipt`; declaration-only claims are not sufficient.
+  Documentation or release-metadata-only commits pass with their targeted
+  checks, and a scoped observed check avoids a full run for an unrelated path.
 
 ## Verify
 

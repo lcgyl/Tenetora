@@ -171,6 +171,13 @@ tenetora preflight --tools codex --global --require-full --json
 
 ## Support Diagnostics
 
+Upgrade JSON retains the stage-level `error_code` and adds a stable `message_code`
+from the error producer. Parameterized diagnostics carry redacted `message_parameters`;
+individual issue records use `code`, `message` and optional `parameters`.
+Use these codes when reporting or grouping failures rather than matching an English
+sentence. Display wording and locale can change independently. Older string-only
+inputs remain compatible and genuinely unknown diagnostics may use `upgrade.unmapped`.
+
 Generate a strictly redacted machine-readable snapshot for support:
 
 ```bash

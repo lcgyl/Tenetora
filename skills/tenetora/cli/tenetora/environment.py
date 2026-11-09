@@ -133,10 +133,15 @@ def hook_runner_state(plugin_root: Path) -> str:
     else:
         command = [str(unix_runner), "--check"]
     try:
+        hook_environment = restricted_hook_environment()
+        # A Windows-only install may not expose Python on the restricted PATH;
+        # probe with the interpreter that owns this CLI instead of reporting a
+        # healthy launcher as runner-check-failed.
+        hook_environment.setdefault("TENETORA_PYTHON", sys.executable)
         result = subprocess.run(
             command,
             cwd=plugin_root,
-            env=restricted_hook_environment(),
+            env=hook_environment,
             text=True,
             encoding="utf-8",
             errors="replace",

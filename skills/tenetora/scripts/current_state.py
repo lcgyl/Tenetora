@@ -68,6 +68,14 @@ def build_state(root: Path) -> dict[str, Any]:
         ),
         None,
     )
+    if latest_claim:
+        from claim_evidence import claim_worktree_freshness,superseding_failure
+        from governance_trail import load_retained_trail
+        history=load_retained_trail(root)
+        if (history.get('invalid') or history.get('conflicts') or superseding_failure(history['events'],latest_claim)
+            or latest_claim.get('execution_assurance')=='observed' and claim_worktree_freshness(root,latest_claim)['status']!='pass'):
+            latest_claim={**latest_claim,'status':'fail','verification_status':'failed'}
+            problems.append('verification-evidence-invalid')
     loop_status = str(loop.get("status") or "") if loop_matches else ""
     phase = "planning"
     if latest_claim:

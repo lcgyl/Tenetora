@@ -41,10 +41,10 @@ if ($HostModuleRoot) {
   $env:PSModulePath = (@($HostModuleRoot) + $moduleRoots) -join ";"
 }
 $MinimumPython = [version]"3.9"
-$DefaultZipUrl = "https://r2.lcgylfamily.cn/stable/0.3.40/tenetora-0.3.40.zip"
-$DefaultManifestUrl = "https://r2.lcgylfamily.cn/stable/0.3.40/manifest.json"
-$DefaultPreviewZipUrl = "https://r2.lcgylfamily.cn/preview/0.3.40.018-preview/tenetora-0.3.40.018-preview.zip"
-$DefaultPreviewManifestUrl = "https://r2.lcgylfamily.cn/preview/0.3.40.018-preview/manifest.json"
+$DefaultZipUrl = "https://r2.lcgylfamily.cn/stable/0.4.0/tenetora-0.4.0.zip"
+$DefaultManifestUrl = "https://r2.lcgylfamily.cn/stable/0.4.0/manifest.json"
+$DefaultPreviewZipUrl = "https://github.com/lcgyl/Tenetora/releases"
+$DefaultPreviewManifestUrl = "https://github.com/lcgyl/Tenetora/releases"
 $DefaultSourceZipUrl = "https://github.com/lcgyl/Tenetora/archive/refs/heads/main.zip"
 $DefaultReleaseIndexBase = "https://r2.lcgylfamily.cn"
 $IsWindowsHost = ($env:OS -eq "Windows_NT") -or ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT)
@@ -206,7 +206,7 @@ function Resolve-Python {
     # $ErrorActionPreference = "Stop", not a terminating NativeCommandError.
     $versionText = $null
     try {
-      $versionText = & $command.Source @args -c "import sys; print('.'.join(map(str, sys.version_info[:3])))" 2>$null
+      $versionText = & $command.Source @args -I -B -c "import sys; print('.'.join(map(str, sys.version_info[:3])))" 2>$null
     } catch {
       $versionText = $null
     }
@@ -218,7 +218,7 @@ function Resolve-Python {
 }
 
 function Invoke-Python([string]$Python, [string]$LauncherArg, [string[]]$Arguments) {
-  if ($LauncherArg) { & $Python $LauncherArg @Arguments } else { & $Python @Arguments }
+  if ($LauncherArg) { & $Python $LauncherArg -I -B @Arguments } else { & $Python -I -B @Arguments }
   if ($LASTEXITCODE -ne 0) { throw (Get-Text "Python command failed with exit code $LASTEXITCODE." "Python 命令执行失败，退出码：$LASTEXITCODE。") }
 }
 
@@ -459,6 +459,8 @@ function Start-InstallLock([string]$Python, [string]$LauncherArg, [string]$Manag
   $script:installLockProofFile = Join-Path ([IO.Path]::GetTempPath()) ("tenetora-install-proof-" + [guid]::NewGuid().ToString("N"))
   $arguments = @()
   if ($LauncherArg) { $arguments += $LauncherArg }
+  $arguments += "-I"
+  $arguments += "-B"
   $arguments += (Quote-ProcessArgument $Holder)
   $arguments += "--home"
   $arguments += (Quote-ProcessArgument $ManagedHome)
@@ -951,7 +953,7 @@ try {
     if ($NoPruneShadowed) { $bridgeArgs += "--no-prune-shadowed" }
     if ($NoCli) { $bridgeArgs += "--no-cli" }
     if ($DryRun) { $bridgeArgs += "--dry-run" }
-    if ($pythonArg) { & $python $pythonArg @bridgeArgs } else { & $python @bridgeArgs }
+    if ($pythonArg) { & $python $pythonArg -I -B @bridgeArgs } else { & $python -I -B @bridgeArgs }
     $bridgeStatus = $LASTEXITCODE
     $capabilityStatus = ""
     if (Test-Path -LiteralPath $eventFile -PathType Leaf) {

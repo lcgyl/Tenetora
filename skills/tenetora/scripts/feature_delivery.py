@@ -9,7 +9,6 @@ import hashlib
 import json
 import re
 import subprocess
-import shlex
 import time
 import uuid
 import sys
@@ -21,7 +20,11 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from claim_evidence import is_claim_proof, validate_claim, verification_command_hash  # noqa: E402
-from governance_trail import append_event  # noqa: E402
+from feature_criteria import (  # noqa: E402 - scripts bootstrap their import directory above
+    contract_hash, criterion_coverage, execute_criteria, freeze_criteria,
+    review_criterion, valid_criteria, receipt_subject_fingerprint,
+)
+from governance_trail import append_event, require_writable_history, TrailWriteError  # noqa: E402
 from harness_io import atomic_write_text  # noqa: E402
 from path_security import (
     ensure_unredirected_directory,
@@ -34,6 +37,8 @@ from worktree_fingerprint import (
     git_head,
     git_repository_env,
     git_state_fingerprint,
+    git_state_entries,
+    snapshot_fingerprint,
     normalize_scopes,
 )
 
@@ -178,6 +183,12 @@ def save_state(root: Path, payload: dict[str, Any]) -> None:
         rows = ['| Task | Status | Outcome | Claim |', '| --- | --- | --- | --- |',
             *[f"| {task['id']} | {task['current_status']} | {task.get('outcome', 'unlabeled')} | {task.get('claim_proof') or '-'} |" for task in view['tasks']]]
         body = f"Status: {view['status']}\n\n" + '\n'.join(rows)
+        criterion_rows = ['| Criterion | Status | Evidence |', '| --- | --- | --- |']
+        for task in view['tasks']:
+            criterion_rows.extend(f"| {task['id']}/{item['id']} | {item['status']} | {item['kind']} |"
+                for item in task['criterion_coverage']['criteria'])
+        if len(criterion_rows) > 2:
+            body += '\n\n' + '\n'.join(criterion_rows)
         write_status_projection(package / '90-acceptance.md', body)
         write_status_projection(package / '00-plan.md',
             f"Plan approval: {feature.get('plan_approval', 'unrecorded')}\nExecution status: {view['status']}\n\n" + '\n'.join(rows))
@@ -266,25 +277,36 @@ def task_check(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     if task.get('verification_command') and verification_command_hash(task['verification_command']) != verification_command_hash(args.verification_command):
         return {'status': 'fail', 'code': 'task-command-not-frozen'}
     subject_paths = sorted(set(paths + artifacts['paths']))
-    frozen = git_state_fingerprint(root, subject_paths)
+    frozen_entries=git_state_entries(root,subject_paths,known_paths=subject_paths)
+    frozen = snapshot_fingerprint(frozen_entries,subject_paths) if frozen_entries is not None else None
     if not frozen:
         return {'status': 'fail', 'code': 'task-check-subject-unavailable'}
     plan_observation = observation(root, build_plan(root, scopes=subject_paths))
     run = root / '.tenetora/.cache/feature-checks' / uuid.uuid4().hex
     ensure_unredirected_directory(run, label='feature check cache')
+    from execution_receipts import execute_verification,mirror_logs
     started = time.monotonic()
-    try:
-        argv = shlex.split(args.verification_command)
-        result = subprocess.run(argv, cwd=root, capture_output=True, check=False, timeout=args.timeout, env=git_repository_env())
-        output, error, code = result.stdout, result.stderr, result.returncode
-    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
-        output, error, code = b'', str(exc).encode(), -1
+    observed = execute_verification(root,args.verification_command,subject_paths,args.timeout,known_paths=frozen_entries)
+    process_result = observed['receipt']
+    mirror_logs(root,process_result,run)
+    code = process_result['exit_code'] if process_result['status']=='passed' or process_result['exit_code']!=0 else -2
+    observed_reference = {key:value for key,value in observed.items() if key!='receipt'}
+    logs = {name: hashlib.sha256((run / f'{name}.txt').read_bytes()).hexdigest() for name in ('stdout', 'stderr')}
+    main_result = {'exit_code': code, 'observed_execution': observed_reference, 'logs': {name: {'path': f'{name}.txt', 'sha256': digest} for name, digest in logs.items()}}
+    criteria = execute_criteria(root, task, run, main_result, args.timeout, subject_paths=subject_paths,subject_entries=frozen_entries)
+    main_code = process_result['exit_code']
+    failed = next((item for item in criteria if item.get('status') == 'failed'), None)
+    if code == 0 and failed:
+        code = failed['exit_code']
     duration = round((time.monotonic() - started) * 1000)
-    for name, content in (('stdout', output), ('stderr', error)):
-        (run / f'{name}.txt').write_bytes(content)
-    receipt = {'version': 2, 'contract_sha256': contract_digest(task), 'feature': args.feature, 'task': args.task, 'command_hash': verification_command_hash(args.verification_command), 'paths': paths, 'subject_paths': subject_paths, 'subject_fingerprint': frozen, 'exit_code': code, 'duration_ms': duration, 'level': args.evidence_level, 'mode': args.evidence_mode, 'logs': {name: hashlib.sha256((run / f'{name}.txt').read_bytes()).hexdigest() for name in ('stdout', 'stderr')}}
+    receipt = {'version': 3 if 'criteria' in task['contract'] else 2,
+        'run_id': run.name, 'contract_sha256': contract_digest(task), 'feature': args.feature, 'task': args.task, 'command_hash': verification_command_hash(args.verification_command), 'paths': paths, 'subject_paths': subject_paths, 'subject_fingerprint': frozen, 'exit_code': code, 'main_exit_code': main_code, 'duration_ms': duration, 'level': args.evidence_level, 'mode': args.evidence_mode, 'logs': logs}
+    receipt['observed_execution'] = observed_reference
+    receipt['source_entries'] = frozen_entries
+    if 'criteria' in task['contract']:
+        receipt['criteria'] = criteria
     atomic_write_text(run / 'receipt.json', json.dumps(receipt, indent=2) + '\n')
-    if frozen != git_state_fingerprint(root, subject_paths):
+    if frozen != git_state_fingerprint(root, subject_paths,known_paths=frozen_entries):
         code = -2
     task['verification_command'] = args.verification_command
     task['execution_receipt'] = (run / 'receipt.json').relative_to(root).as_posix()
@@ -417,13 +439,15 @@ def task_contract_status(task: dict[str, Any]) -> dict[str, Any]:
     if missing:
         return {'status': 'fail', 'code': 'task-contract-incomplete', 'missing_fields': missing,
             'message': 'Freeze explicit deliverable, observable criteria, scope, check, timebox and rationale using feature task-contract.'}
+    if not valid_criteria(contract):
+        return {'status': 'fail', 'code': 'task-execution-invalid' if task.get('execution_receipt') else 'task-criteria-contract-invalid',
+            'message': 'Criterion declarations differ from the frozen acceptance contract.'}
     return {'status': 'pass', 'code': 'task-contract-complete',
         'assurance': 'mechanical-completeness-only'}
 
 
 def contract_digest(task: dict[str, Any]) -> str:
-    frozen = {key: task.get(key) for key in ('title', 'scope', 'depends_on', 'allowed_paths', 'evidence_level', 'evidence_mode', 'contract')}
-    return hashlib.sha256(json.dumps(frozen, ensure_ascii=False, sort_keys=True).encode('utf-8')).hexdigest()
+    return contract_hash(task)
 
 
 def task_artifact_status(root: Path, task: dict[str, Any]) -> dict[str, Any]:
@@ -461,6 +485,9 @@ def task_contract(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     contract = {key: getattr(args, key).strip() for key in ('deliverable', 'timebox', 'rationale')}
     contract['verification_command'] = args.verification_command
     contract['acceptance'] = [item.strip() for item in args.acceptance]
+    contract['criteria_version'] = 1
+    contract['criteria'] = freeze_criteria(contract['acceptance'], args.verification_command,
+        getattr(args, 'criterion_check', []), getattr(args, 'criterion_review', []))
     artifact_paths = normalize_report_files(args.contract_file)
     if artifact_paths is None:
         return {'status': 'fail', 'code': 'task-contract-artifact-invalid'}
@@ -480,7 +507,7 @@ def task_contract(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     if completeness['status'] != 'pass':
         return completeness
     if args.reset_evidence:
-        for key in ('execution_receipt', 'execution_receipt_sha256', 'execution_status', 'report', 'report_sha256', 'report_files', 'claim_proof', 'verification_command', 'duration_ms'):
+        for key in ('execution_receipt', 'execution_receipt_sha256', 'execution_status', 'report', 'report_sha256', 'report_files', 'claim_proof', 'verification_command', 'duration_ms', 'criterion_reviews'):
             task.pop(key, None)
         task.update(status='planned', outcome='reopened')
     task['contract'] = contract
@@ -516,8 +543,10 @@ def validate_task_evidence(root: Path, feature: dict[str, Any], task: dict[str, 
             changed = git_changed_paths(root, task.get('base_head'))
         except RuntimeError as exc:
             return {'status': 'fail', 'code': 'task-scope-unavailable', 'message': str(exc)}
+        registered_reviews = {item['review_report'] for item in criterion_coverage(root, task)['criteria']
+                              if isinstance(item.get('review_report'), str)}
         def delivery_artifact(path: str) -> bool:
-            return path == task['report'] or path.startswith(('.tenetora/state/', '.tenetora/.cache/', feature['package'] + '/'))
+            return path == task['report'] or path in registered_reviews or path.startswith(('.tenetora/state/', '.tenetora/.cache/', feature['package'] + '/'))
         scoped = {path for path in changed if in_scope(path, task.get('allowed_paths', [])) and not delivery_artifact(path)}
         missing = sorted(set(report_files) - scoped)
         if missing:
@@ -547,7 +576,7 @@ def validate_task_evidence(root: Path, feature: dict[str, Any], task: dict[str, 
         if hashlib.sha256(raw).hexdigest() != task['execution_receipt_sha256']:
             raise ValueError('receipt changed')
         receipt = json.loads(raw)
-        if not isinstance(receipt, dict) or receipt.get('version') != 2 or type(receipt.get('duration_ms')) is not int or receipt['duration_ms'] < 0 or receipt.get('level') not in EVIDENCE_LEVELS or receipt.get('mode') not in EVIDENCE_MODES or not isinstance(receipt.get('logs'), dict):
+        if not isinstance(receipt, dict) or type(receipt.get('version')) is not int or receipt['version'] not in {2, 3} or type(receipt.get('duration_ms')) is not int or receipt['duration_ms'] < 0 or receipt.get('level') not in EVIDENCE_LEVELS or receipt.get('mode') not in EVIDENCE_MODES or not isinstance(receipt.get('logs'), dict):
             raise ValueError('execution receipt schema invalid')
         if receipt.get('contract_sha256') != contract_digest(task):
             raise ValueError('frozen task contract changed; rerun the declared check')
@@ -555,7 +584,7 @@ def validate_task_evidence(root: Path, feature: dict[str, Any], task: dict[str, 
             raise ValueError('execution failed')
         if receipt['command_hash'] != verification_command_hash(command) or receipt['feature'] != feature['id'] or receipt['task'] != task['id'] or receipt['paths'] != report_files:
             raise ValueError('execution subject/command differs')
-        if receipt.get('subject_paths', report_files) != subject_paths or receipt['subject_fingerprint'] != git_state_fingerprint(root, subject_paths):
+        if receipt.get('subject_paths', report_files) != subject_paths or receipt['subject_fingerprint'] != receipt_subject_fingerprint(root,receipt,subject_paths):
             raise ValueError('verified implementation changed')
         for name, digest in receipt['logs'].items():
             validate_unredirected_file_path(receipt_path.parent / f'{name}.txt', label='execution log')
@@ -571,6 +600,9 @@ def validate_task_evidence(root: Path, feature: dict[str, Any], task: dict[str, 
         return {'status': 'fail', 'code': 'task-evidence-inconsistent'}
     if receipt['level'] not in EVIDENCE_LEVELS or receipt['level'] < required_level or receipt['mode'] not in EVIDENCE_MODES or (required_mode != 'mixed' and receipt['mode'] != required_mode):
         return {'status': 'fail', 'code': 'task-evidence-insufficient'}
+    coverage = criterion_coverage(root, task)
+    if coverage['status'] != 'pass':
+        return {'status': 'fail', 'code': 'task-criteria-not-covered', 'criterion_coverage': coverage}
     return {'status': 'pass', 'receipt': receipt}
 
 
@@ -628,6 +660,7 @@ def current_feature_view(root: Path, feature: dict[str, Any]) -> dict[str, Any]:
     for task in view['tasks']:
         task['current_status'] = task['status']
         task['contract_check'] = task_contract_status(task)
+        task['criterion_coverage'] = criterion_coverage(root, task)
         if task.get('status') != 'completed':
             continue
         validity = dependency_validity(root, feature, task, cache=cache)
@@ -642,6 +675,25 @@ def current_feature_view(root: Path, feature: dict[str, Any]) -> dict[str, Any]:
     if view['status'] == 'completed' and any(task.get('current_validity', {}).get('status') == 'fail' for task in view['tasks']):
         view['status'] = 'awaiting-acceptance'
     return view
+
+
+def task_criterion_review(root: Path, args: argparse.Namespace) -> dict[str, Any]:
+    state = load_state(root)
+    feature = find_feature(state, args.feature)
+    task = next((item for item in feature['tasks'] if item.get('id') == args.task), None) if feature else None
+    if task is None:
+        return {'status': 'fail', 'code': 'task-missing'}
+    result = review_criterion(root, task, args.criterion, args.file, args.outcome, args.reviewer_kind)
+    if result['status'] == 'pass':
+        if task.get('status') == 'completed':
+            task.update(status='awaiting-acceptance', outcome='reopened')
+        feature['updated_at'] = now()
+        save_state(root, state)
+        append_event(root, {'type': 'feature-delivery', 'action': 'criterion-review', 'feature_id': args.feature,
+            'task_id': args.task, 'criterion_id': args.criterion, 'status': 'pass',
+            'outcome': args.outcome, 'reviewer_kind': args.reviewer_kind,
+            'report_sha256': result['review']['report_sha256']})
+    return result
 
 
 def task_verify(root: Path, args: argparse.Namespace) -> dict[str, Any]:
@@ -769,6 +821,41 @@ def task_add(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     return {"status": "pass", "feature": args.feature, "task": task, "file": task_path.relative_to(root).as_posix()}
 
 
+def prompt_conflicts(task: dict[str, Any]) -> list[dict[str, str]]:
+    """Flag explicit replanning instructions without changing frozen input."""
+
+    contract = task['contract']
+    fields = {'deliverable': contract['deliverable'], 'rationale': contract['rationale']}
+    fields.update({f'acceptance[{index}]': text for index, text in enumerate(contract['acceptance'], 1)})
+    patterns = (
+        r'先调研需求', r'自行设计方案', r'选择合理的数据模型',
+        r'根据情况决定范围', r'(?:如有需要)?可扩展其他模块',
+        r'design\s+(?:the\s+)?solution\s+yourself',
+        r'choose\s+(?:a\s+)?(?:reasonable\s+)?data\s+model',
+        r'(?:expand|extend|decide)\s+(?:the\s+)?scope\s+as\s+needed',
+    )
+    negation = re.compile(r'(?:不要|不得|禁止|不应|无需|不需要|不可|不能|勿|不允许|不再|避免|do\s+not|don[’\']t|never|must\s+not|avoid)\s*[^，,。.;；\n]{0,12}$', re.IGNORECASE)
+    warnings = []
+    for field, value in fields.items():
+        # Quoted examples describe text rather than instructing the executor.
+        # Clause boundaries stop an earlier negation hiding a later command.
+        unquoted = re.sub(r'''`[^`]*`|“[^”]*”|‘[^’]*’|「[^」]*」|『[^』]*』|"[^"]*"|(?<![A-Za-z0-9_])'[^'\n]*'(?![A-Za-z0-9_])''', '', value)
+        for clause in re.split(r'[，,；;。.!?\n]|但(?:是)?|然而|不过|\bbut\b|\bhowever\b', unquoted, flags=re.IGNORECASE):
+            matches = sorted((match for pattern in patterns for match in re.finditer(pattern, clause, re.IGNORECASE)),
+                key=lambda match: (match.start(), match.end()))
+            previous_end, negative = 0, False
+            for match in matches:
+                local_prefix = clause[previous_end:match.start()]
+                coordinated = re.fullmatch(r'\s*(?:和|或|与|及|以及|、|and|or)\s*', local_prefix, re.IGNORECASE)
+                negative = bool(negation.search(local_prefix) or (negative and coordinated))
+                if not negative:
+                    warnings.append({'code': 'task-prompt-replanning-conflict', 'field': field,
+                        'message': '冻结内容要求重新规划或扩大范围，与只执行契约冲突；请规划方澄清，不得自行改变范围。'})
+                    break
+                previous_end = match.end()
+    return warnings
+
+
 def task_prompt(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     if args.role not in {"backend", "frontend"}:
         return {"status": "fail", "code": "prompt-role-invalid", "message": "Prompt role must be backend or frontend."}
@@ -784,6 +871,10 @@ def task_prompt(root: Path, args: argparse.Namespace) -> dict[str, Any]:
     completeness = task_contract_status(task)
     if completeness['status'] != 'pass':
         return completeness
+    warnings = prompt_conflicts(task)
+    warnings.extend({'code': 'task-criterion-evidence-unbound', 'field': item['id'],
+        'message': '该必需判据尚未关联检查或显式复核；不能据任务级检查宣布覆盖。'}
+        for item in task['contract'].get('criteria', []) if item['kind'] == 'unbound')
     lines = [
         f"任务：{task.get('title', task['id'])}",
         f"功能包：{feature.get('title', feature['id'])}",
@@ -798,6 +889,9 @@ def task_prompt(root: Path, args: argparse.Namespace) -> dict[str, Any]:
         f"证据等级：{task.get('evidence_level', 'L1')}；证据模式：{task.get('evidence_mode', 'static')}",
         "只执行冻结范围，复用现有模式，不重新规划产品决策，不扩大任务，不提交或推送。",
     ]
+    lines.extend(f"判据 {item['id']}：{item['description']}；证据：{item['kind']}"
+        for item in task['contract'].get('criteria', []))
+    lines.extend(f"冲突提示（{item['field']}）：{item['message']}" for item in warnings)
     if args.role == "backend":
         lines.extend(
             [
@@ -812,7 +906,8 @@ def task_prompt(root: Path, args: argparse.Namespace) -> dict[str, Any]:
                 "前端验收：组件行为、契约检查、异步失败路径和声明的项目验证命令。",
             ]
         )
-    return {"status": "pass", "feature": args.feature, "task": args.task, "role": args.role, "prompt": "\n".join(lines)}
+    return {"status": "pass", "feature": args.feature, "task": args.task, "role": args.role,
+        "warnings": warnings, "prompt": "\n".join(lines)}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -856,6 +951,17 @@ def main(argv: list[str] | None = None) -> int:
     contract.add_argument('--rationale', required=True)
     contract.add_argument('--reset-evidence', action='store_true')
     contract.add_argument('--contract-file', action='append', default=[], help='Existing project-relative schema/contract artifact; repeatable and included in check/claim subjects.')
+    contract.add_argument('--criterion-check', action='append', default=[], metavar='ID[=COMMAND]',
+        help='Bind A01, A02, ... to a frozen real check; omit =COMMAND to reuse the main command.')
+    contract.add_argument('--criterion-review', action='append', default=[], metavar='ID',
+        help='Require an explicit source-bound review report for this criterion.')
+    review = sub.add_parser('criterion-review')
+    review.add_argument('--feature', required=True)
+    review.add_argument('--task', required=True)
+    review.add_argument('--criterion', required=True)
+    review.add_argument('--file', required=True)
+    review.add_argument('--outcome', choices=('accepted', 'rejected', 'unverified'), required=True)
+    review.add_argument('--reviewer-kind', choices=('human', 'agent', 'unknown'), default='unknown')
     prompt = sub.add_parser("prompt")
     prompt.add_argument("--feature", required=True)
     prompt.add_argument("--task", required=True)
@@ -881,14 +987,19 @@ def main(argv: list[str] | None = None) -> int:
         "status": feature_status,
         "task-add": task_add,
         "task-contract": task_contract,
+        "criterion-review": task_criterion_review,
         "prompt": task_prompt,
         "check": task_check,
         "outcome": task_outcome,
     }
     try:
+        if args.action != 'status':
+            require_writable_history(root)
         if args.action in {'start', 'task-add'}:
             ensure_unredirected_directory(root / FEATURE_ROOT, label='feature packages')
         payload = actions[args.action](root, args)
+    except TrailWriteError as exc:
+        payload = exc.payload()
     except (OSError, ValueError, RuntimeError) as exc:
         payload = {'status': 'fail', 'code': 'feature-operation-invalid', 'message': str(exc)}
     print(json.dumps(payload, ensure_ascii=False, indent=2) if args.json else json.dumps(payload, ensure_ascii=False))

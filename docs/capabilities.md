@@ -4,6 +4,22 @@
 
 This guide explains the public capabilities individually. It is organized by engineering responsibility, not by internal source file. For the complete product model, start with [What Tenetora Is](product.md); for concrete situations, see [Use Cases](use-cases.md).
 
+## Availability by release channel
+
+This main-branch documentation includes unreleased work. The published channel
+metadata was checked on 2026-11-07: stable `0.3.40`, preview `0.3.40.018-preview`.
+Check the installed version before using a command from this branch.
+
+| Capability | Stable `0.3.40` | Verified preview `.018` | Current main |
+| --- | --- | --- | --- |
+| diagnostics | Available | Available | Available |
+| feature, release-readiness, trail, observe, DSH | Unavailable | Available | Available |
+| verify run and observed execution receipts | Unavailable | Unavailable | Unreleased |
+
+For platform capabilities see the [main README](../README.md). See the
+[release notes](../CHANGELOG.md) and
+[upgrade procedure](guides/installation.md#preview-channel).
+
 ## Project Record and Initialization
 
 **Problem:** tool-specific instruction files describe only fragments of the project, and a new agent cannot tell current rules from historical notes.

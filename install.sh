@@ -6,10 +6,10 @@ MINIMUM_PYTHON_MINOR=9
 REQUIRED_INSTALLER_PROTOCOL=3
 MAX_ARCHIVE_BYTES=$((128*1024*1024))
 DEFAULT_RAW_URL="https://raw.githubusercontent.com/lcgyl/Tenetora/main/install.sh"
-DEFAULT_ZIP_URL="https://r2.lcgylfamily.cn/stable/0.3.40/tenetora-0.3.40.zip"
-DEFAULT_MANIFEST_URL="https://r2.lcgylfamily.cn/stable/0.3.40/manifest.json"
-DEFAULT_PREVIEW_ZIP_URL="https://r2.lcgylfamily.cn/preview/0.3.40.018-preview/tenetora-0.3.40.018-preview.zip"
-DEFAULT_PREVIEW_MANIFEST_URL="https://r2.lcgylfamily.cn/preview/0.3.40.018-preview/manifest.json"
+DEFAULT_ZIP_URL="https://r2.lcgylfamily.cn/stable/0.4.0/tenetora-0.4.0.zip"
+DEFAULT_MANIFEST_URL="https://r2.lcgylfamily.cn/stable/0.4.0/manifest.json"
+DEFAULT_PREVIEW_ZIP_URL="https://github.com/lcgyl/Tenetora/releases"
+DEFAULT_PREVIEW_MANIFEST_URL="https://github.com/lcgyl/Tenetora/releases"
 DEFAULT_SOURCE_ZIP_URL="https://github.com/lcgyl/Tenetora/archive/refs/heads/main.zip"
 DEFAULT_RELEASE_INDEX_BASE="https://r2.lcgylfamily.cn"
 
@@ -111,7 +111,7 @@ start_install_lock() {
     INSTALL_LOCK_TOKEN_ENV_WAS_SET=1
     INSTALL_LOCK_TOKEN_ENV_VALUE="$TENETORA_OUTER_INSTALL_LOCK_TOKEN"
   fi
-  "$PYTHON_BIN" "$holder" --home "$HARNESS_HOME" --ready-file "$INSTALL_LOCK_READY" \
+  "$PYTHON_BIN" -I -B "$holder" --home "$HARNESS_HOME" --ready-file "$INSTALL_LOCK_READY" \
     <"$INSTALL_LOCK_FIFO" >/dev/null 2>&1 &
   INSTALL_LOCK_PID=$!
   exec 9>"$INSTALL_LOCK_FIFO"
@@ -211,7 +211,7 @@ language_from_preferences() {
     preference_python="$(command -v python3 || command -v python || true)"
   fi
   [[ -n "$preference_python" ]] || return 1
-  "$preference_python" - "$home/state/preferences.json" <<'PY'
+  "$preference_python" -I -B - "$home/state/preferences.json" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -479,7 +479,7 @@ find_python() {
       continue
     fi
     candidate_path="$(command -v "$candidate")"
-    if "$candidate_path" -c "import sys; raise SystemExit(0 if sys.version_info >= (${MINIMUM_PYTHON_MAJOR}, ${MINIMUM_PYTHON_MINOR}) else 1)" >/dev/null 2>&1; then
+    if "$candidate_path" -I -B -c "import sys; raise SystemExit(0 if sys.version_info >= (${MINIMUM_PYTHON_MAJOR}, ${MINIMUM_PYTHON_MINOR}) else 1)" >/dev/null 2>&1; then
       echo "$candidate_path"
       return 0
     fi
@@ -493,7 +493,7 @@ canonical_dir() {
 }
 
 resolve_managed_current_source() {
-  "$PYTHON_BIN" - "$1" <<'PY'
+  "$PYTHON_BIN" -I -B - "$1" <<'PY'
 import stat
 import sys
 from pathlib import Path
@@ -526,7 +526,7 @@ PY
 }
 
 validate_managed_home_path() {
-  "$PYTHON_BIN" - "$1" <<'PY'
+  "$PYTHON_BIN" -I -B - "$1" <<'PY'
 import os
 import stat
 import sys
@@ -585,7 +585,7 @@ source_version() {
     echo "unknown"
     return 0
   fi
-  "$PYTHON_BIN" - "$legacy_version_file" <<'PY'
+  "$PYTHON_BIN" -I -B - "$legacy_version_file" <<'PY'
 import ast
 import sys
 from pathlib import Path
@@ -614,7 +614,7 @@ source_installer_protocol() {
   local dir="$1"
   local manifest="${dir}/manifest.json"
   if [[ -f "$manifest" ]]; then
-    "$PYTHON_BIN" - "$manifest" <<'PY'
+    "$PYTHON_BIN" -I -B - "$manifest" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -652,7 +652,7 @@ source_bridge_protocol() {
     echo 0
     return 0
   fi
-  "$PYTHON_BIN" - "${dir}/manifest.json" <<'PY'
+  "$PYTHON_BIN" -I -B - "${dir}/manifest.json" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -669,7 +669,7 @@ source_bridge_worker_channel() {
     echo 0
     return 0
   fi
-  "$PYTHON_BIN" - "${dir}/manifest.json" <<'PY'
+  "$PYTHON_BIN" -I -B - "${dir}/manifest.json" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -686,7 +686,7 @@ source_release_channel() {
     echo ""
     return 0
   fi
-  "$PYTHON_BIN" - "${dir}/manifest.json" <<'PY'
+  "$PYTHON_BIN" -I -B - "${dir}/manifest.json" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -773,7 +773,7 @@ stamp_manifest_sha() {
   if [[ ! -f "${dir}/manifest.json" ]]; then
     return 0
   fi
-  "$PYTHON_BIN" - "${dir}/manifest.json" "$sha" <<'PY'
+  "$PYTHON_BIN" -I -B - "${dir}/manifest.json" "$sha" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -787,7 +787,7 @@ PY
 
 manifest_sha256() {
   local manifest="$1"
-  "$PYTHON_BIN" - "$manifest" <<'PY'
+  "$PYTHON_BIN" -I -B - "$manifest" <<'PY'
 import json
 import re
 import sys
@@ -805,7 +805,7 @@ validate_external_manifest() {
   local manifest="$1"
   local source="$2"
   local actual_sha="$3"
-  "$PYTHON_BIN" - "$manifest" "${source}/manifest.json" "$actual_sha" <<'PY'
+  "$PYTHON_BIN" -I -B - "$manifest" "${source}/manifest.json" "$actual_sha" <<'PY'
 import json
 import re
 import sys
@@ -877,7 +877,7 @@ PY
 source_identity() {
   local dir="$1"
   if [[ -f "${dir}/manifest.json" ]]; then
-    "$PYTHON_BIN" - "${dir}/manifest.json" <<'PY'
+    "$PYTHON_BIN" -I -B - "${dir}/manifest.json" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -905,7 +905,7 @@ PY
 
 zip_sha256() {
   local file="$1"
-  "$PYTHON_BIN" - "$file" <<'PY'
+  "$PYTHON_BIN" -I -B - "$file" <<'PY'
 import hashlib
 import sys
 from pathlib import Path
@@ -920,7 +920,7 @@ PY
 
 validate_archive_size() {
   local file="$1"
-  "$PYTHON_BIN" - "$file" "$MAX_ARCHIVE_BYTES" <<'PY'
+  "$PYTHON_BIN" -I -B - "$file" "$MAX_ARCHIVE_BYTES" <<'PY'
 import sys
 from pathlib import Path
 
@@ -930,7 +930,7 @@ PY
 }
 
 validate_source_tree() {
-  "$PYTHON_BIN" - "$1" <<'PY'
+  "$PYTHON_BIN" -I -B - "$1" <<'PY'
 import os
 import stat
 import sys
@@ -974,7 +974,7 @@ download_zip() {
 
 resolve_release_pointer() {
   local pointer_file="$1"
-  "$PYTHON_BIN" - "$pointer_file" "$RELEASE_INDEX_BASE" "$CHANNEL" <<'PY'
+  "$PYTHON_BIN" -I -B - "$pointer_file" "$RELEASE_INDEX_BASE" "$CHANNEL" <<'PY'
 import json
 import re
 import sys
@@ -1013,7 +1013,7 @@ PY
 }
 
 validate_pointer_manifest() {
-  "$PYTHON_BIN" - "$1" "$CHANNEL" "$POINTER_VERSION" "$POINTER_SHA256" <<'PY'
+  "$PYTHON_BIN" -I -B - "$1" "$CHANNEL" "$POINTER_VERSION" "$POINTER_SHA256" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -1034,7 +1034,7 @@ extract_zip() {
   local zip_file="$1"
   local extract_dir="$2"
   local allow_source_archive="${3:-0}"
-  "$PYTHON_BIN" - "$zip_file" "$extract_dir" "$allow_source_archive" <<'PY'
+  "$PYTHON_BIN" -I -B - "$zip_file" "$extract_dir" "$allow_source_archive" <<'PY'
 import shutil
 import sys
 import zipfile
@@ -1222,7 +1222,7 @@ prepare_current_links() {
 
 snapshot_managed_runtime() {
   local snapshot="$1"
-  "$PYTHON_BIN" "${SOURCE_DIR}/skills/tenetora/scripts/runtime_transaction.py" \
+  "$PYTHON_BIN" -I -B "${SOURCE_DIR}/skills/tenetora/scripts/runtime_transaction.py" \
     --snapshot \
     --bin-dir "${HARNESS_HOME}/bin" \
     --journal "$snapshot" \
@@ -1232,7 +1232,7 @@ snapshot_managed_runtime() {
 restore_managed_runtime() {
   local snapshot="$1"
   local output
-  if output="$("$PYTHON_BIN" "${SOURCE_DIR}/skills/tenetora/scripts/runtime_transaction.py" \
+  if output="$("$PYTHON_BIN" -I -B "${SOURCE_DIR}/skills/tenetora/scripts/runtime_transaction.py" \
     --restore \
     --bin-dir "${HARNESS_HOME}/bin" \
     --journal "$snapshot" \
@@ -1426,13 +1426,13 @@ if [[ "$ALLOW_SKILLS_ONLY" == "1" && "$REQUIRE_FULL" == "1" ]]; then
 fi
 
 PYTHON_BIN="$(find_python)"
-PYTHON_VERSION="$($PYTHON_BIN -c 'import platform; print(platform.python_version())')"
+PYTHON_VERSION="$("$PYTHON_BIN" -I -B -c 'import platform; print(platform.python_version())')"
 if ! HOME_VALIDATION_ERROR="$(validate_managed_home_path "$HARNESS_HOME" 2>&1)"; then
   die "$(i18n_text "Unsafe Tenetora home: ${HOME_VALIDATION_ERROR}" "Tenetora 主目录不安全：${HOME_VALIDATION_ERROR}")"
 fi
-HARNESS_HOME="$($PYTHON_BIN -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).expanduser().resolve(strict=False))' "$HARNESS_HOME")"
+HARNESS_HOME="$("$PYTHON_BIN" -I -B -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).expanduser().resolve(strict=False))' "$HARNESS_HOME")"
 if [[ -n "$USER_HOME" ]]; then
-  DEFAULT_HARNESS_HOME="$($PYTHON_BIN -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).expanduser().resolve(strict=False))' "$USER_HOME/.tenetora")"
+  DEFAULT_HARNESS_HOME="$("$PYTHON_BIN" -I -B -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).expanduser().resolve(strict=False))' "$USER_HOME/.tenetora")"
 else
   DEFAULT_HARNESS_HOME=""
 fi
@@ -1757,8 +1757,8 @@ if [[ -f "$DISCOVERY_SCRIPT" ]]; then
   if [[ "$DRY_RUN" == "1" ]]; then
     DISCOVERY_ARGS+=("--dry-run")
   fi
-  DISCOVERY_JSON="$("$PYTHON_BIN" "${DISCOVERY_ARGS[@]}")"
-  DISCOVERED_WORK="$("$PYTHON_BIN" -c 'import json, sys; payload=json.load(sys.stdin); print(int(payload.get("work_count", payload.get("surface_count", 0))))' <<<"$DISCOVERY_JSON")"
+  DISCOVERY_JSON="$("$PYTHON_BIN" -I -B "${DISCOVERY_ARGS[@]}")"
+  DISCOVERED_WORK="$("$PYTHON_BIN" -I -B -c 'import json, sys; payload=json.load(sys.stdin); print(int(payload.get("work_count", payload.get("surface_count", 0))))' <<<"$DISCOVERY_JSON")"
   if [[ "$DISCOVERED_WORK" -gt 0 ]]; then
     OPERATION="upgrade"
   fi
@@ -1838,12 +1838,12 @@ if [[ "$BRIDGE_PROTOCOL" -ge 1 ]]; then
     say "Version: ${AFTER_VERSION}" "版本：${AFTER_VERSION}"
   fi
   set +e
-  TENETORA_OUTER_INSTALLER=1 "$PYTHON_BIN" "${BRIDGE_ARGS[@]}"
+  TENETORA_OUTER_INSTALLER=1 "$PYTHON_BIN" -I -B "${BRIDGE_ARGS[@]}"
   BRIDGE_STATUS=$?
   set -e
   INSTALL_CAPABILITY_RESULT=""
   if [[ -f "$EVENT_FILE" ]]; then
-    INSTALL_CAPABILITY_RESULT="$("$PYTHON_BIN" -c '
+    INSTALL_CAPABILITY_RESULT="$("$PYTHON_BIN" -I -B -c '
 import json, sys
 status = ""
 with open(sys.argv[1], encoding="utf-8") as handle:
@@ -1966,7 +1966,7 @@ if [[ "$DRY_RUN" == "1" && ! -f "$PREFLIGHT_SCRIPT" ]]; then
 else
   set +e
   TENETORA_OUTER_INSTALLER=1 TENETORA_DEFER_MACHINE_HOME_MIGRATION=1 \
-    "$PYTHON_BIN" "${PREFLIGHT_ARGS[@]}"
+    "$PYTHON_BIN" -I -B "${PREFLIGHT_ARGS[@]}"
   PREFLIGHT_STATUS=$?
   set -e
 fi
@@ -2014,7 +2014,7 @@ if [[ "$DRY_RUN" != "1" && "$OPERATION" == "upgrade" ]]; then
     "--all-existing"
   )
   set +e
-  HOOK_SNAPSHOT_OUTPUT="$("$PYTHON_BIN" "${HOOK_SNAPSHOT_ARGS[@]}" 2>&1)"
+  HOOK_SNAPSHOT_OUTPUT="$("$PYTHON_BIN" -I -B "${HOOK_SNAPSHOT_ARGS[@]}" 2>&1)"
   HOOK_SNAPSHOT_STATUS=$?
   set -e
   if [[ "$HOOK_SNAPSHOT_STATUS" -ne 0 ]]; then
@@ -2162,7 +2162,7 @@ elif [[ "$DRY_RUN" == "1" && ! -f "$INSTALL_SCRIPT" ]]; then
 else
   set +e
   TENETORA_OUTER_INSTALLER=1 TENETORA_DEFER_MACHINE_HOME_MIGRATION=1 \
-    "$PYTHON_BIN" "${INSTALL_ARGS[@]}"
+    "$PYTHON_BIN" -I -B "${INSTALL_ARGS[@]}"
   INSTALL_STATUS=$?
   set -e
 fi
@@ -2187,7 +2187,7 @@ elif [[ "$DRY_RUN" == "1" ]]; then
 else
   set +e
   CLI_OUTPUT="$(TENETORA_DEFER_MACHINE_HOME_MIGRATION=1 \
-    "$PYTHON_BIN" "${CLI_ARGS[@]}" 2>&1)"
+    "$PYTHON_BIN" -I -B "${CLI_ARGS[@]}" 2>&1)"
   CLI_STATUS=$?
   set -e
   if [[ "$CLI_STATUS" -ne 0 ]]; then
@@ -2215,7 +2215,7 @@ if [[ "$CLI_STATUS" -eq 0 && "$DRY_RUN" != "1" && -f "${HOOK_ROLLBACK_JOURNAL}/m
     HOOK_CONVERGENCE_ARGS+=("--all-existing")
   fi
   set +e
-  HOOK_CONVERGENCE_OUTPUT="$("$PYTHON_BIN" "${HOOK_CONVERGENCE_ARGS[@]}" 2>&1)"
+  HOOK_CONVERGENCE_OUTPUT="$("$PYTHON_BIN" -I -B "${HOOK_CONVERGENCE_ARGS[@]}" 2>&1)"
   HOOK_CONVERGENCE_STATUS=$?
   set -e
   if [[ "$HOOK_CONVERGENCE_STATUS" -ne 0 ]]; then
@@ -2230,7 +2230,7 @@ fi
 
 if [[ "$DRY_RUN" != "1" && -f "${HOOK_ROLLBACK_JOURNAL}/manifest.json" ]]; then
   set +e
-  "$PYTHON_BIN" "$INSTALL_SCRIPT" \
+  "$PYTHON_BIN" -I -B "$INSTALL_SCRIPT" \
     --finalize-hook-journal \
     --hook-rollback-journal "$HOOK_ROLLBACK_JOURNAL" \
     --package-root "$SOURCE_DIR" \
@@ -2276,7 +2276,7 @@ checkpoint_managed_runtime() {
     fi
     checkpoint_args+=(--json)
     set +e
-    "$PYTHON_BIN" "${checkpoint_args[@]}" >/dev/null
+    "$PYTHON_BIN" -I -B "${checkpoint_args[@]}" >/dev/null
     RUNTIME_CHECKPOINT_STATUS=$?
     set -e
     if [[ "$RUNTIME_CHECKPOINT_STATUS" -ne 0 ]]; then
@@ -2323,7 +2323,7 @@ if [[ "$INSTALL_STATUS" -eq 0 && "$INSTALL_CLI" != "0" && "$CLI_STATUS" -eq 0 &&
     )
   fi
   set +e
-  MACHINE_HOME_MIGRATION_OUTPUT="$("$PYTHON_BIN" "${MIGRATION_ARGS[@]}" 2>&1)"
+  MACHINE_HOME_MIGRATION_OUTPUT="$("$PYTHON_BIN" -I -B "${MIGRATION_ARGS[@]}" 2>&1)"
   MACHINE_HOME_MIGRATION_STATUS=$?
   set -e
   if [[ "$MACHINE_HOME_MIGRATION_STATUS" -ne 0 ]]; then
@@ -2361,7 +2361,7 @@ fi
 
 INSTALL_CAPABILITY_RESULT=""
 if [[ -f "$EVENT_FILE" ]]; then
-  INSTALL_CAPABILITY_RESULT="$("$PYTHON_BIN" -c '
+  INSTALL_CAPABILITY_RESULT="$("$PYTHON_BIN" -I -B -c '
 import json, sys
 status = ""
 with open(sys.argv[1], encoding="utf-8") as handle:
@@ -2395,14 +2395,14 @@ if [[ "$DRY_RUN" != "1" && "$FINAL_RESULT" != "FULL" && "$FINAL_RESULT" != "PEND
   && -f "${MANAGED_RUNTIME_SNAPSHOT}/manifest.json" ]]; then
   if [[ -f "${HOOK_ROLLBACK_JOURNAL}/manifest.json" ]]; then
     set +e
-    "$PYTHON_BIN" "$INSTALL_SCRIPT" \
+    "$PYTHON_BIN" -I -B "$INSTALL_SCRIPT" \
       --finalize-hook-journal \
       --hook-rollback-journal "$HOOK_ROLLBACK_JOURNAL" \
       --package-root "$SOURCE_DIR" \
       --json >/dev/null
     HOOK_ROLLBACK_STATUS=$?
     if [[ "$HOOK_ROLLBACK_STATUS" -eq 0 ]]; then
-      "$PYTHON_BIN" "$INSTALL_SCRIPT" \
+      "$PYTHON_BIN" -I -B "$INSTALL_SCRIPT" \
         --restore-hooks \
         --hook-rollback-journal "$HOOK_ROLLBACK_JOURNAL" \
         --package-root "$SOURCE_DIR" \

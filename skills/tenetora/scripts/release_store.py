@@ -47,6 +47,9 @@ RELEASE_CONTRACT_FIELDS = (
 )
 
 
+from upgrade_messages import MessageIssue, message_issue  # noqa: E402
+
+
 class ReleaseStoreError(RuntimeError):
     """Raised when a release or managed pointer is unsafe."""
 
@@ -56,7 +59,7 @@ def read_release_manifest(root: Path) -> dict[str, Any]:
         payload = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
         return normalize_manifest(payload, require_artifact=False)
     except (OSError, json.JSONDecodeError, UpgradeContractError) as exc:
-        raise ReleaseStoreError(f"managed release manifest is invalid: {exc}") from exc
+        raise ReleaseStoreError(MessageIssue('upgrade.managed-release-manifest-invalid', parameters={'detail': message_issue(exc) or str(exc)})) from exc
 
 
 def _inside_releases(path: Path, home: Path) -> bool:
@@ -181,35 +184,35 @@ def stage_release(source_root: Path, home: Path, manifest: dict[str, Any]) -> tu
         source = validate_existing_project_path(source_root, label="release staging source")
         home = validate_unredirected_path(home, label="Tenetora release home")
     except RuntimeError as exc:
-        raise ReleaseStoreError(str(exc)) from exc
+        raise ReleaseStoreError(message_issue(exc) or str(exc)) from exc
     expected = normalize_manifest(manifest, require_artifact=bool(manifest.get("artifact")))
     source_manifest = read_release_manifest(source)
     if not release_content_matches(source, source_manifest):
-        raise ReleaseStoreError("acquired release contents do not match its manifest")
+        raise ReleaseStoreError(MessageIssue('upgrade.acquired-release-contents-do-not-match-its-manifest'))
     if not _manifest_contract_matches(source_manifest, expected):
-        raise ReleaseStoreError("acquired release does not match the selected manifest")
+        raise ReleaseStoreError(MessageIssue('upgrade.acquired-release-does-not-match-the-selected-manifest'))
     try:
         releases = validate_unredirected_path(
             home / "releases",
             label="Tenetora release storage",
         )
     except RuntimeError as exc:
-        raise ReleaseStoreError(str(exc)) from exc
+        raise ReleaseStoreError(message_issue(exc) or str(exc)) from exc
     releases.mkdir(parents=True, exist_ok=True)
     destination = releases / str(expected["version"])
     if destination.exists() or is_redirected_path(destination):
         if is_redirected_path(destination) or not destination.is_dir() or not _inside_releases(destination, home):
-            raise ReleaseStoreError("existing versioned release is not a valid managed release")
+            raise ReleaseStoreError(MessageIssue('upgrade.existing-versioned-release-is-not-a-valid-managed-release'))
         current = read_release_manifest(destination)
         if not _managed_release_identity_matches(destination, home, current):
-            raise ReleaseStoreError("existing versioned release is not a valid managed release")
+            raise ReleaseStoreError(MessageIssue('upgrade.existing-versioned-release-is-not-a-valid-managed-release'))
         if not _manifest_contract_matches(current, expected):
-            raise ReleaseStoreError("versioned release is immutable and already contains different content")
+            raise ReleaseStoreError(MessageIssue('upgrade.versioned-release-is-immutable-and-already-contains-different-content'))
         prune_python_bytecode(destination)
         if not managed_release(destination, home):
-            raise ReleaseStoreError("existing versioned release is not a valid managed release")
+            raise ReleaseStoreError(MessageIssue('upgrade.existing-versioned-release-is-not-a-valid-managed-release'))
         if not release_content_matches(destination, expected):
-            raise ReleaseStoreError("versioned release contents do not match its manifest")
+            raise ReleaseStoreError(MessageIssue('upgrade.versioned-release-contents-do-not-match-its-manifest'))
         return destination, False
     staging = Path(tempfile.mkdtemp(prefix=f".{expected['version']}.", dir=releases))
     staging.rmdir()
@@ -232,7 +235,7 @@ def _assert_pointer_replaceable(path: Path, home: Path) -> None:
         home = validate_unredirected_path(home, label="Tenetora release home")
         validate_unredirected_path(path.parent, label="managed pointer parent")
     except RuntimeError as exc:
-        raise ReleaseStoreError(str(exc)) from exc
+        raise ReleaseStoreError(message_issue(exc) or str(exc)) from exc
     if not (path.exists() or is_redirected_path(path)):
         return
     try:
@@ -240,14 +243,14 @@ def _assert_pointer_replaceable(path: Path, home: Path) -> None:
     except OSError as exc:
         raise ReleaseStoreError(f"managed pointer is unreadable: {path.name}") from exc
     if not managed_release(resolved, home) and not legacy_release(resolved, home):
-        raise ReleaseStoreError(f"refusing to replace unowned pointer: {path.name}")
+        raise ReleaseStoreError(MessageIssue('upgrade.managed-pointer-unowned', parameters={'name': path.name}))
 
 
 def _remove(path: Path) -> None:
     try:
         remove_unredirected_entry(path, label="managed release cleanup")
     except RuntimeError as exc:
-        raise ReleaseStoreError(str(exc)) from exc
+        raise ReleaseStoreError(message_issue(exc) or str(exc)) from exc
 
 
 def _new_pointer(link: Path, target: Path) -> Path:
@@ -269,7 +272,7 @@ def _new_pointer(link: Path, target: Path) -> Path:
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "").strip().splitlines()
             suffix = f": {detail[0]}" if detail else ""
-            raise ReleaseStoreError(f"cannot create the managed Windows release junction{suffix}")
+            raise ReleaseStoreError(MessageIssue('upgrade.cannot-create-the-managed-windows-release-junction', parameters={'detail': suffix}))
         if not temporary.exists():
             # mklink /J can exit 0 while creating nothing (e.g. a dangling
             # target); surface it instead of handing a ghost path to os.replace.
@@ -294,9 +297,9 @@ def _replace_windows_pointer(link: Path, temporary: Path) -> None:
                 os.replace(backup, link)
             except OSError as restore_exc:
                 raise ReleaseStoreError(
-                    f"managed pointer replacement failed and its backup could not be restored: {backup.name}"
+                    MessageIssue('upgrade.managed-pointer-restore-failed', parameters={'name': backup.name})
                 ) from restore_exc
-        raise ReleaseStoreError("managed pointer replacement failed; the prior pointer was restored") from exc
+        raise ReleaseStoreError(MessageIssue('upgrade.managed-pointer-replacement-failed-the-prior-pointer-was-restored')) from exc
     if backup is not None:
         _remove(backup)
 
@@ -306,7 +309,7 @@ def replace_pointer(link: Path, target: Path, home: Path) -> None:
         validate_unredirected_path(link.parent, label="managed pointer parent")
         target = validate_existing_project_path(target, label="managed release target")
     except RuntimeError as exc:
-        raise ReleaseStoreError(str(exc)) from exc
+        raise ReleaseStoreError(message_issue(exc) or str(exc)) from exc
     _assert_pointer_replaceable(link, home)
     link.parent.mkdir(parents=True, exist_ok=True)
     temporary = _new_pointer(link, target)
@@ -351,7 +354,7 @@ def restore_release_activation(home: Path, receipt: dict[str, Any]) -> None:
     try:
         home = validate_unredirected_path(home, label="Tenetora release home")
     except RuntimeError as exc:
-        raise ReleaseStoreError(str(exc)) from exc
+        raise ReleaseStoreError(message_issue(exc) or str(exc)) from exc
     if not isinstance(receipt, dict):
         raise ReleaseStoreError("release activation receipt is invalid")
     try:
@@ -360,7 +363,7 @@ def restore_release_activation(home: Path, receipt: dict[str, Any]) -> None:
             label="activated release",
         ).resolve(strict=True)
     except RuntimeError as exc:
-        raise ReleaseStoreError(str(exc)) from exc
+        raise ReleaseStoreError(message_issue(exc) or str(exc)) from exc
     if not _inside_releases(expected, home) or not managed_release(expected, home):
         raise ReleaseStoreError("release activation receipt points to an invalid release")
     previous = receipt.get("previous")
@@ -439,18 +442,18 @@ def _restore_pointer_after_activation_failure(
 def activate_release(home: Path, release: Path) -> dict[str, Any]:
     requested_release = release.expanduser()
     if is_redirected_path(requested_release):
-        raise ReleaseStoreError("release activation requires a valid immutable managed release")
+        raise ReleaseStoreError(MessageIssue('upgrade.release-activation-requires-a-valid-immutable-managed-release'))
     try:
         home = validate_unredirected_path(home, label="Tenetora release home")
         release = validate_existing_project_path(requested_release, label="managed release")
     except RuntimeError as exc:
-        raise ReleaseStoreError(str(exc)) from exc
+        raise ReleaseStoreError(message_issue(exc) or str(exc)) from exc
     if not _inside_releases(release, home):
-        raise ReleaseStoreError("release activation requires a valid immutable managed release")
+        raise ReleaseStoreError(MessageIssue('upgrade.release-activation-requires-a-valid-immutable-managed-release'))
     read_release_manifest(release)
     prune_python_bytecode(release)
     if not managed_release(release, home):
-        raise ReleaseStoreError("release activation requires a valid immutable managed release")
+        raise ReleaseStoreError(MessageIssue('upgrade.release-activation-requires-a-valid-immutable-managed-release'))
     current = home / "current"
     source = home / "source" / "tenetora"
     legacy = home / "source" / "agent-harness"

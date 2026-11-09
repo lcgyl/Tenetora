@@ -69,6 +69,7 @@ LEGACY_COMMANDS = {
     "aggregate-claim": "aggregate_claim.py",
     "repository-units": "repository_units.py",
     "verification-plan": "verification_plan.py",
+    "verify": "verification_run.py",
     "release-readiness": "release_readiness.py",
     "feature": "feature_delivery.py",
     "trail": "trail_state.py",
@@ -156,6 +157,15 @@ def run_script(command: str, script_name: str, forwarded: list[str]) -> int:
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
         return int(module.main() or 0)
+    except ValueError as exc:
+        history = sys.modules.get('governance_trail')
+        if not isinstance(exc, getattr(history, 'TrailWriteError', ())):
+            raise
+        if '--json' in forwarded:
+            print(json.dumps(exc.payload(), ensure_ascii=False, indent=2))
+        else:
+            print(ui_text(str(exc), '治理历史损坏或冲突，未记录新事件；请先检查并显式修复。'), file=sys.stderr)
+        return 2
     except SystemExit as exc:
         return int(exc.code or 0)
     finally:
@@ -295,7 +305,8 @@ def main(argv: list[str] | None = None) -> int:
     if not raw:
         return handle_home()
     if raw and raw[0] in LEGACY_COMMANDS:
-        return run_script(raw[0], LEGACY_COMMANDS[raw[0]], raw[1:])
+        forwarded = raw if raw[0] in {'cleanup', 'uninstall'} else raw[1:]
+        return run_script(raw[0], LEGACY_COMMANDS[raw[0]], forwarded)
 
     command_name = invoked_command()
     examples = ui_text("""Examples:

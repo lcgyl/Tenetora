@@ -70,6 +70,7 @@ _PLATFORM_OVERRIDE: str | None = None
 _EXECUTION_CONTEXT_MODULE: Any | None = None
 _ALIGNMENT_ROUTING_MODULE: Any | None = None
 _GOVERNANCE_TRAIL_MODULE: Any | None = None
+_PATH_SECURITY_MODULE: Any | None = None
 
 
 def machine_home() -> Path:
@@ -306,15 +307,26 @@ def has_project_governance(root: Path) -> bool:
 def is_machine_install_root(root: Path) -> bool:
     """Do not treat the global Tenetora home as a project harness."""
 
+    global _PATH_SECURITY_MODULE
     harness = root / ".tenetora"
     try:
-        if harness.resolve(strict=False) != machine_home().resolve(strict=False):
-            return False
-    except OSError:
+        if harness.resolve(strict=False) == machine_home().resolve(strict=False):
+            return True
+        if _PATH_SECURITY_MODULE is None:
+            # Use the validator shipped with this Hook, including packaged
+            # layouts. Do not import a workspace module via ambient sys.path.
+            path = trusted_cli_entrypoint().with_name("path_security.py")
+            spec = importlib.util.spec_from_file_location("tenetora_hook_path_security", path)
+            if spec is None or spec.loader is None:
+                return False
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _PATH_SECURITY_MODULE = module
+        predicate = getattr(_PATH_SECURITY_MODULE, "is_machine_install_home", None)
+        return bool(predicate and predicate(harness, machine_home()))
+    except (OSError, RuntimeError, ImportError):
+        # Without evidence of a machine installation, retain project handling.
         return False
-    # TENETORA_HOME is a machine-level installation boundary, even when the
-    # installation is incomplete and has not created its runtime markers yet.
-    return True
 
 
 def nearest_harness_root(candidate: Path) -> Path:
@@ -472,6 +484,18 @@ def cli_env(root: Path, event: dict[str, Any] | None = None) -> dict[str, str]:
     return env
 
 
+def trusted_cli_entrypoint() -> Path:
+    """Resolve only the CLI distributed with this owned Hook/runtime."""
+    code_root = Path(__file__).resolve().parent.parent
+    roots = (plugin_root() / 'cli', plugin_root() / 'skills' / 'tenetora' / 'cli',
+        code_root / 'cli', code_root / 'skills' / 'tenetora' / 'cli')
+    for root in roots:
+        entry = root / 'tenetora' / 'python_invocation.py'
+        if entry.is_file() and (root / 'tenetora' / 'cli.py').is_file():
+            return entry.resolve()
+    raise RuntimeError('The trusted Tenetora CLI entrypoint is unavailable; upgrade or repair the runtime.')
+
+
 def run_cli(
     root: Path,
     *args: str,
@@ -479,7 +503,7 @@ def run_cli(
     event: dict[str, Any] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-m", "tenetora.cli", *args],
+        [sys.executable, "-I", "-B", str(trusted_cli_entrypoint()), *args],
         cwd=root,
         env=cli_env(root, event),
         input=input_text,
@@ -487,6 +511,7 @@ def run_cli(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        timeout=20 if args[:3] == ('guard', '--action', 'commit') else 5,
     )
 
 
@@ -2372,10 +2397,10 @@ def rules_payload_for_contexts(root: Path, contexts: list[str]) -> dict[str, Any
             sys.path.insert(0, script_dir)
         try:
             spec.loader.exec_module(module)
+            payload = module.load_contexts(root, contexts)
         finally:
             if added:
                 sys.path.remove(script_dir)
-        payload = module.load_contexts(root, contexts)
         if not isinstance(payload, dict) or payload.get('status') != 'pass':
             raise ValueError('rules loader returned invalid data')
         return payload
@@ -2863,6 +2888,7 @@ def resolved_git_worktree_root(candidate: Path) -> Path | None:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            timeout=3,
         )
     except OSError:
         return None
@@ -2879,7 +2905,7 @@ def path_is_within(root: Path, candidate: Path) -> bool:
         return False
 
 
-def git_invocation(event: dict[str, Any], project: Path) -> dict[str, Any] | None:
+def git_invocation(event: dict[str, Any], project: Path, *, resolve_target: bool = True) -> dict[str, Any] | None:
     command = tool_command(event)
     if not command:
         return None
@@ -2930,6 +2956,8 @@ def git_invocation(event: dict[str, Any], project: Path) -> dict[str, Any] | Non
                 continue
             break
         if index < len(tokens) and tokens[index] in {"commit", "push"}:
+            if not resolve_target:
+                return {'operation': tokens[index]}
             operation_index = index
             resolved_root = resolved_git_worktree_root(candidate_root)
             if resolved_root is None:
@@ -3005,10 +3033,20 @@ def git_invocation(event: dict[str, Any], project: Path) -> dict[str, Any] | Non
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            timeout=3,
         )
         if previous.returncode == 0:
             invocation["message"] = previous.stdout
     return invocation
+
+
+def deny_git_guard_unavailable() -> int:
+    reason = localized_text(
+        'Tenetora could not obtain a valid Git guard result before its deadline. The Git write is blocked; restore the managed runtime and retry.',
+        'Tenetora 未在期限内取得有效 Git 检查结果，已阻止本次 Git 写操作。请修复受管运行时后重试。',
+    )
+    return emit({'hookSpecificOutput': {'hookEventName': 'PreToolUse',
+        'permissionDecision': 'deny', 'permissionDecisionReason': reason}})
 
 
 def pre_tool_commit(event: dict[str, Any]) -> int:
@@ -3080,12 +3118,17 @@ def pre_tool_commit(event: dict[str, Any]) -> int:
             guard_args.extend(["--commit-message", str(invocation["message"])])
         elif isinstance(invocation.get("message_file"), Path):
             guard_args.extend(["--commit-message-file", str(invocation["message_file"])])
-    result = run_cli(root, *guard_args, event=event)
+    try:
+        result = run_cli(root, *guard_args, event=event)
+    except (OSError, subprocess.SubprocessError, RuntimeError, ValueError):
+        return deny_git_guard_unavailable()
     if result.returncode == 0:
         try:
             guard_payload = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            guard_payload = {}
+        except (json.JSONDecodeError, TypeError):
+            return deny_git_guard_unavailable()
+        if not isinstance(guard_payload, dict) or guard_payload.get('status') != 'pass':
+            return deny_git_guard_unavailable()
         guard_checks = guard_payload.get("checks") if isinstance(guard_payload, dict) else None
         impact_warning = None
         if isinstance(guard_checks, list):
@@ -3536,6 +3579,13 @@ def main(argv: list[str] | None = None) -> int:
             print("{}")
         return result
     except Exception as error:  # pragma: no cover - defensive hook boundary
+        if args.mode == 'pre-tool-commit':
+            try:
+                governed = nearest_harness_root(tool_working_directory(event))
+                if has_harness(governed) and git_invocation(event, governed, resolve_target=False):
+                    return deny_git_guard_unavailable()
+            except (OSError, RuntimeError, ValueError, TypeError):
+                pass
         print(f"Tenetora hook failed: {error}", file=sys.stderr)
         return 1
 

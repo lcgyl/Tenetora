@@ -30,7 +30,7 @@ from install_progress import redact, write_failure_artifacts  # noqa: E402
 from installation_registry import RegistryError, registered_projects  # noqa: E402
 from governance_paths import pending_defaults_review  # noqa: E402
 from governance_trail import sanitize_local_paths  # noqa: E402
-from upgrade_messages import MESSAGE_TEMPLATES, MESSAGE_TEMPLATES_BY_ENGLISH, MessageIssue, issue_code  # noqa: E402
+from upgrade_messages import MESSAGE_TEMPLATES, MESSAGE_TEMPLATES_BY_ENGLISH, MessageIssue, issue_code, message_issue  # noqa: E402
 
 
 UPGRADE_LOCAL_PATH_PATTERN = re.compile(
@@ -43,17 +43,26 @@ def use_chinese() -> bool:
 
 
 def safe_issue_value(value: object) -> str:
-    text = str(sanitize_local_paths(redact(str(value))))
-    return UPGRADE_LOCAL_PATH_PATTERN.sub("<path>", text)
+    # Redact absolute paths before home sanitization, otherwise a Windows path
+    # becomes "<home>\\..." and no longer matches the absolute-path pattern.
+    text = UPGRADE_LOCAL_PATH_PATTERN.sub("<path>", str(value))
+    return str(sanitize_local_paths(redact(text)))
 
 
 def issue_text(issue: object) -> str:
-    text = safe_issue_value(issue)
-    if isinstance(issue, MessageIssue):
-        template = MESSAGE_TEMPLATES.get(issue.code)
+    coded = message_issue(issue)
+    if coded is not None:
+        template = MESSAGE_TEMPLATES.get(coded.code)
         if template is None:
-            return issue.fallback or issue.code
-        return template.chinese if use_chinese() else template.english
+            return safe_issue_value(coded.fallback or coded.code)
+        parameters = {str(key): issue_text(value) if message_issue(value) is not None else safe_issue_value(value)
+            for key, value in coded.parameters.items()}
+        source = template.chinese if use_chinese() else template.english
+        try:
+            return safe_issue_value(source.format_map(parameters))
+        except (KeyError, ValueError):
+            return safe_issue_value(coded.fallback or str(coded))
+    text = safe_issue_value(issue)
     if not use_chinese():
         return text
     template = MESSAGE_TEMPLATES_BY_ENGLISH.get(text)
@@ -84,17 +93,54 @@ def issue_text(issue: object) -> str:
     return text
 
 
-def issue_record(issue: object) -> dict[str, str]:
+def issue_record(issue: object) -> dict[str, object]:
     """Return stable machine metadata while preserving the human message."""
 
-    if isinstance(issue, MessageIssue):
-        redacted: object = MessageIssue(issue.code, safe_issue_value(issue.fallback))
-    else:
-        redacted = safe_issue_value(issue)
-    return {
-        "code": issue_code(redacted),
-        "message": issue_text(redacted),
-    }
+    coded = message_issue(issue)
+    record: dict[str, object] = {'code': safe_issue_value(issue_code(issue)), 'message': issue_text(issue)}
+    if coded is not None and coded.parameters:
+        record['parameters'] = {str(key): issue_record(value) if message_issue(value) is not None else safe_issue_value(value)
+            for key, value in coded.parameters.items()}
+    return record
+
+
+WORKER_ERROR_PREFIX = 'TENETORA_UPGRADE_ERROR_V1:'
+
+
+def emit_worker_error(args: argparse.Namespace, issue: object, stage: str, exit_code: int) -> None:
+    """Frame a redacted error only for a captured machine-mode worker."""
+    if not (getattr(args, 'worker', False) and getattr(args, 'json', False)):
+        return
+    args.worker_error_emitted = True
+    frame = {'version': 1, 'status': 'failed', 'exit_code': exit_code,
+        'stage': stage, 'error': issue_record(issue)}
+    print(WORKER_ERROR_PREFIX + json.dumps(frame, ensure_ascii=False), file=sys.stderr, flush=True)
+
+
+def worker_error_records(result: subprocess.CompletedProcess[str]) -> list[dict[str, object]]:
+    if result.returncode == 0:
+        return []
+    records = []
+    for line in (result.stderr or '').splitlines():
+        if not line.startswith(WORKER_ERROR_PREFIX) or len(line) > 32768:
+            continue
+        try:
+            frame = json.loads(line[len(WORKER_ERROR_PREFIX):])
+            if type(frame.get('version')) is not int or frame['version'] != 1 or frame.get('status') != 'failed':
+                continue
+            if type(frame.get('exit_code')) is not int or frame['exit_code'] != result.returncode:
+                continue
+            stage, error = frame['stage'], frame['error']
+            if not isinstance(stage, str) or not re.fullmatch(r'[a-z0-9-]{1,80}', stage):
+                continue
+            if not isinstance(error, dict) or not isinstance(error.get('message'), str) or message_issue(error) is None:
+                continue
+            records.append({'stage': stage, **issue_record(error)})
+            if len(records) >= 20:
+                break
+        except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+            continue
+    return records
 
 from tenetora import __version__  # noqa: E402
 from tenetora.brand import (  # noqa: E402
@@ -448,7 +494,7 @@ def check_payload(args: argparse.Namespace, release_manifest: dict[str, object] 
         }
     issues = list(status.issues)
     if machine_result.returncode != 0 and machine.get("status") != "missing":
-        issues.append(str(machine.get("error") or "machine-wide upgrade preflight is blocked"))
+        issues.append((machine.get("error") or MessageIssue('upgrade.machine-wide-upgrade-preflight-is-blocked')))
     payload: dict[str, object] = {
         "status": "checked",
         "action": "check",
@@ -748,6 +794,7 @@ def _apply_upgrade(args: argparse.Namespace) -> int:
     try:
         release_manifest = local_release_manifest(source_root)
     except ReleaseStoreError as exc:
+        emit_worker_error(args, exc, 'release-manifest', 1)
         print(f"升级被阻断：{issue_text(exc)}" if use_chinese() else f"Upgrade blocked: {exc}", file=sys.stderr)
         return 1
     controlled_bridge = bool(args.bridge_source_version)
@@ -755,10 +802,11 @@ def _apply_upgrade(args: argparse.Namespace) -> int:
         preflight = check_payload(args, release_manifest)
         machine_plan = preflight.get("machine") if isinstance(preflight.get("machine"), dict) else {}
         if machine_plan.get("result") in {"BLOCKED", "PARTIAL"} or machine_plan.get("status") == "blocked":
+            emit_worker_error(args, machine_plan.get('error') or MessageIssue('upgrade.machine-wide-upgrade-preflight-is-blocked'), 'machine-preflight', 1)
             print_preflight_failure(
                 args,
                 machine_plan,
-                str(machine_plan.get("error") or "machine-wide upgrade preflight is blocked"),
+                (machine_plan.get("error") or MessageIssue('upgrade.machine-wide-upgrade-preflight-is-blocked')),
             )
             return 1
     else:
@@ -790,6 +838,7 @@ def _apply_upgrade(args: argparse.Namespace) -> int:
 
     def record_stage(stage: str, *, status: str = "running", error_code: str = "") -> None:
         nonlocal transaction
+        args.worker_stage = stage
         if transaction is None:
             return
         transaction = advance_transaction(
@@ -825,6 +874,7 @@ def _apply_upgrade(args: argparse.Namespace) -> int:
                 restore_release_activation(machine_home(), activation_receipt)
             except ReleaseStoreError as exc:
                 release_restored = False
+                emit_worker_error(args, exc, 'release-rollback', 1)
                 print(
                     f"升级被阻断：{issue_text(exc)}"
                     if use_chinese()
@@ -982,6 +1032,7 @@ def _apply_upgrade(args: argparse.Namespace) -> int:
             try:
                 activation_receipt = activate_release(machine_home(), source_root)
             except ReleaseStoreError as exc:
+                emit_worker_error(args, exc, 'release-activation', 1)
                 print(f"升级被阻断：{issue_text(exc)}" if use_chinese() else f"Upgrade blocked: {exc}", file=sys.stderr)
                 return fail(1, "release-activation", hook_journal, runtime_journal)
             if not checkpoint_runtime_journal(args, runtime_journal, source_root):
@@ -997,6 +1048,8 @@ def _apply_upgrade(args: argparse.Namespace) -> int:
 
 
 def apply_upgrade(args: argparse.Namespace) -> int:
+    args.worker_error_emitted = False
+    args.worker_stage = 'upgrade'
     previous_bytecode_setting = os.environ.get("PYTHONDONTWRITEBYTECODE")
     previous_migration_setting = os.environ.get("TENETORA_DEFER_MACHINE_HOME_MIGRATION")
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -1006,8 +1059,12 @@ def apply_upgrade(args: argparse.Namespace) -> int:
         if args.bin_dir is not None:
             lock_roots.append(args.bin_dir.expanduser().absolute().parent)
         with install_transaction_locks(lock_roots):
-            return _apply_upgrade(args)
+            code = _apply_upgrade(args)
+            if code and not args.worker_error_emitted:
+                emit_worker_error(args, MessageIssue('upgrade.worker-stage-failed', parameters={'stage': args.worker_stage}), args.worker_stage, code)
+            return code
     except (RuntimeError, UpgradeTransactionError) as exc:
+        emit_worker_error(args, exc, 'upgrade-transaction' if isinstance(exc, UpgradeTransactionError) else args.worker_stage, 1)
         print(f"升级被阻断：{issue_text(exc)}" if use_chinese() else f"Upgrade blocked: {exc}", file=sys.stderr)
         return 1
     finally:
@@ -1065,7 +1122,7 @@ def worker_arguments(args: argparse.Namespace, action: str) -> list[str]:
         forwarded.extend(["--log-file", str(args.log_file)])
     if args.events_jsonl is not None:
         forwarded.extend(["--events-jsonl", str(args.events_jsonl)])
-    if action == "check":
+    if action == "check" or getattr(args, 'json', False):
         forwarded.append("--json")
     return forwarded
 
@@ -1125,6 +1182,15 @@ def render_apply_result(
         } if transaction is not None else None,
         "error_code": "" if result.returncode == 0 else "upgrade-worker-failed",
     }
+    if result.returncode:
+        errors = worker_error_records(result)
+        payload['worker_diagnostics'] = 'recorded' if errors else 'unavailable'
+        if errors:
+            primary = errors[0]
+            payload.update(message_code=primary['code'], message=primary['message'],
+                worker_stage=primary['stage'], worker_errors=errors)
+            if primary.get('parameters'):
+                payload['message_parameters'] = primary['parameters']
     advisories = project_update_advisories(manifest, args)
     if advisories:
         payload["project_update"] = advisories[0]
@@ -1199,7 +1265,7 @@ def render_blocked_result(
     source_kind: str,
     error_code: str,
     exit_code: int = 1,
-    message: str | None = None,
+    message: object | None = None,
     message_code: str | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
@@ -1218,6 +1284,9 @@ def render_blocked_result(
     if message is not None:
         payload["message"] = safe_issue_value(message)
         payload["message_code"] = message_code or issue_code(message)
+        details = issue_record(message)
+        if details.get('parameters'):
+            payload['message_parameters'] = details['parameters']
     return payload
 
 
@@ -1416,7 +1485,7 @@ def ensure_release_direction(manifest: dict[str, object]) -> bool:
             pass
     current = version_key(current_version)
     if target < current:
-        raise UpgradeContractError("release version is older than the installed version")
+        raise UpgradeContractError(MessageIssue('upgrade.release-version-is-older-than-the-installed-version'))
     return target > current
 
 
@@ -1647,9 +1716,9 @@ def run_release_controller(args: argparse.Namespace) -> int:
                     persist_preflight_failure(
                         args,
                         machine,
-                        str(machine.get("error") or "machine-wide upgrade preflight is blocked"),
+                        (machine.get("error") or MessageIssue('upgrade.machine-wide-upgrade-preflight-is-blocked')),
                     )
-                    machine_message = str(machine.get("error") or "machine-wide upgrade preflight is blocked")
+                    machine_message = (machine.get("error") or MessageIssue('upgrade.machine-wide-upgrade-preflight-is-blocked'))
                     print(render_json(render_blocked_result(
                         manifest,
                         source_kind,
@@ -1660,7 +1729,7 @@ def run_release_controller(args: argparse.Namespace) -> int:
                     print_preflight_failure(
                         args,
                         machine,
-                        str(machine.get("error") or "machine-wide upgrade preflight is blocked"),
+                        (machine.get("error") or MessageIssue('upgrade.machine-wide-upgrade-preflight-is-blocked')),
                     )
                     print(
                         render_terminal_apply_summary(
@@ -1726,13 +1795,13 @@ def run_release_controller(args: argparse.Namespace) -> int:
                 return result.returncode
     except (OSError, UpgradeAcquireError, UpgradeContractError, ReleaseStoreError) as exc:
         cache_update_failure(source_override, args.zip_file)
-        message_code = issue_code(redact(str(exc)))
+        message_code = issue_code(exc)
         if args.json:
             print(render_json(render_blocked_result(
                 observed_manifest,
                 observed_source_kind,
                 "acquisition-or-contract-failed",
-                message=redact(str(exc)),
+                message=exc,
                 message_code=message_code,
             )))
         else:
@@ -1772,6 +1841,9 @@ def render_check(payload: dict[str, object]) -> str:
     issues = payload.get("issues")
     if isinstance(issues, list) and issues:
         lines.append("问题：" if use_chinese() else "Issues:")
+        details = payload.get('issue_details')
+        if isinstance(details, list) and len(details) == len(issues):
+            issues = [detail if message_issue(detail) is not None else issue for issue, detail in zip(issues, details)]
         lines.extend(f"- {issue_text(issue)}" for issue in issues)
     machine = payload.get("machine")
     if isinstance(machine, dict):

@@ -13,7 +13,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from governance_trail import JOURNAL_REL, MAX_EVENTS, canonical_events, compact_journal, compatibility_payload, load_trail, trail_lock, trail_path, write_json_atomic  # noqa: E402
+from governance_trail import AUTO_COMPACT_EVENTS, JOURNAL_REL, MAX_EVENTS, canonical_events, compact_journal, compatibility_payload, load_trail, trail_lock, trail_path, write_json_atomic  # noqa: E402
 
 
 def journal_events(root: Path) -> tuple[list[dict[str, Any]], int]:
@@ -37,7 +37,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--keep-events", type=int, default=MAX_EVENTS)
     args = parser.parse_args(argv)
     root = args.path.expanduser().resolve()
-    events, invalid = merged_events(root)
+    original = load_trail(root)
+    events, invalid = list(original.get('events', [])), int(original.get('ignored_events', 0))
     compact = None
     if args.action == "compact":
         try:
@@ -56,6 +57,7 @@ def main(argv: list[str] | None = None) -> int:
         "status": "ready" if not invalid else "ready-with-invalid-events",
         "events": len(events),
         "invalid_events": invalid,
+        "conflicting_events": len(original.get('conflicts', [])),
         "journal": str((root / JOURNAL_REL).relative_to(root)),
         "view": str(trail_path(root).relative_to(root)),
     }
@@ -67,16 +69,21 @@ def main(argv: list[str] | None = None) -> int:
         repaired = load_trail(root)
         payload["events"] = len(repaired.get("events", []))
         payload["invalid_events"] = int(repaired.get("ignored_events", invalid))
+        payload['conflicting_events'] = len(repaired.get('conflicts', []))
         invalid = payload["invalid_events"]
         payload["status"] = "ready" if not invalid else "ready-with-invalid-events"
         payload["rebuilt"] = True
     if compact is not None:
         payload["compacted"] = compact
         payload["status"] = payload_status
+    if args.action == 'status' and original.get('conflicts'):
+        payload['status'] = 'blocked'
     payload["source"] = "journal" if (root / JOURNAL_REL).is_dir() else "legacy"
     payload["legacy_view"] = "governance-trail.json"
     payload["retention"] = {
-        "journal": "append-only until explicit compact",
+        "journal": "append-only segments with lossless automatic or explicit compaction",
+        "active_event_threshold": AUTO_COMPACT_EVENTS,
+        "archive": "complete snapshots; historical obligations remain retained",
         "compatibility_view_max_events": MAX_EVENTS,
     }
     payload["legacy_retirement"] = {
@@ -91,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         print(f"trail: {payload['status']} events={len(events)} invalid={invalid}")
-    return 0 if not invalid else 1
+    return 0 if not invalid and payload['status'] != 'blocked' else 1
 
 
 if __name__ == "__main__":
