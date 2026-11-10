@@ -910,7 +910,11 @@ def _atomic_write(path: Path, content: bytes) -> None:
         os.fsync(handle.fileno())
     try:
         temporary.chmod(mode)
-        os.replace(temporary, path)
+        if os.environ.get('TENETORA_SURFACE_JOURNAL'):
+            from installation_transaction import publish
+            publish(temporary, path)
+        else:
+            os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
 

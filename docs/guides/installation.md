@@ -65,7 +65,7 @@ curl -fsSL https://raw.githubusercontent.com/lcgyl/Tenetora/main/install.sh | ba
 ```
 
 Routine upgrades do not fetch a remote script. Keep the bootstrap for first installation, the 0.2 bridge, offline recovery, or a broken launcher.
-An upgrade first authenticates the remote `manifest.json`. When the advertised version equals the installed CLI version, it reports `already latest`, skips the ZIP download and installation transaction, and exits successfully. Use `tenetora upgrade --force` only to repair or re-converge existing installation surfaces at that same version.
+An upgrade first authenticates the remote `manifest.json`. If the target already matches the installed release, it reports `already latest` and skips ZIP download and installation. It checks the current release again under the installation lock before writing: if another upgrade finishes during acquisition, the package has already been fetched but installation is skipped. Use `tenetora upgrade --force` only to repair or re-converge existing surfaces at that same version.
 
 ### Preview channel
 
@@ -85,14 +85,14 @@ curl -fsSL https://raw.githubusercontent.com/lcgyl/Tenetora/main/install.sh \
 curl -fsSL https://raw.githubusercontent.com/lcgyl/Tenetora/main/install.sh \
   | bash -s -- --channel preview --lang en
 ```
-Without an explicit scope, an existing installation updates all registered or ownership-proven surfaces; use `--global`, `--in-project --path <dir>`, or `--both --path <dir>` to narrow it. A fresh machine uses the same installer command as its first preview installation. If no preview manifest is active, the installer fails closed without changing the current stable installation or falling back to stable. After the migration, the CLI supports:
+Without an explicit scope, an existing installation updates all registered or ownership-proven surfaces; use `--global`, `--in-project --path <dir>`, or `--both --path <dir>` to narrow it. A fresh machine uses the same installer command as its first preview installation. An explicit preview request fails closed when no preview is active, preserving the existing installation. After the migration, the CLI supports:
 
 ```bash
 tenetora upgrade --check --channel preview
 tenetora upgrade --channel preview
 ```
 
-Use `tenetora cleanup --json` then `tenetora cleanup --apply --yes` to remove only authenticated superseded releases. `tenetora uninstall --json` previews machine cleanup, and `tenetora uninstall --apply --yes` removes managed files without deleting project `.tenetora` governance.
+An installed preview's default `tenetora upgrade` continues on preview while one is active. Confirmed preview-pointer absence (HTTP 404/410) selects stable automatically for that upgrade. A successful application records the stable release, so later default upgrades stay on stable. Returning to preview requires `--channel preview`. Network errors, invalid metadata, missing release objects and failed digest checks do not cause fallback; version downgrade protection remains active. The same selection applies to `--check`, `--dry-run` and `--force`. Use `tenetora cleanup --json` then `tenetora cleanup --apply --yes` to remove only authenticated superseded releases. `tenetora uninstall --json` previews machine cleanup, and `tenetora uninstall --apply --yes` removes managed files without deleting project `.tenetora` governance.
 
 After a successful online `upgrade --check` or `upgrade`, the CLI stores a small update hint under the managed home. A bare `tenetora` command reads this local hint without making a network request: a fresh hint is valid for 24 hours, an expired hint is reported as stale, and a failed network attempt is reported without replacing the last known release. The cache contains only version, commit, package digest, channel, and timestamps; it does not contain URLs, proxy settings, credentials, or project content. A missing or invalid cache is advisory and never initializes a project or blocks ordinary CLI use.
 
@@ -116,7 +116,7 @@ tenetora upgrade --mirror-url https://mirror.example/tenetora/stable
 
 Advanced direct endpoints must be configured as a complete pair: `TENETORA_RELEASE_MANIFEST_URL` and `TENETORA_RELEASE_ZIP_URL`, or `--manifest-url` and `--zip-url`. Release URLs must be HTTPS and must not contain user credentials, query strings, or fragments. Mirror and direct endpoint settings are mutually exclusive. Partial or malformed settings fail closed before any installation write. A failed network check records `network-failed` while retaining the last authenticated release hint.
 
-Public projections use the R2 release endpoint `https://r2.lcgylfamily.cn` by default. The installer and upgrader read one `stable/latest.json` or `preview/latest.json` pointer, then fetch only its immutable versioned ZIP and manifest; channel and digest mismatches fail closed. Set `TENETORA_RELEASE_INDEX_BASE=https://<worker-host>` only when using another compatible Worker. Historical GitLab and public release attachments remain available for older clients; clients still using those attachments should rerun the public installer once to migrate to R2.
+Public projections use the R2 release endpoint `https://r2.lcgylfamily.cn` by default. The installer and upgrader follow the channel-selection rules above to read `stable/latest.json` or `preview/latest.json`, then fetch only the selected pointer's immutable versioned ZIP and manifest; channel and digest mismatches fail closed. Set `TENETORA_RELEASE_INDEX_BASE=https://<worker-host>` only when using another compatible Worker. Historical GitLab and public release attachments remain available for older clients; clients still using those attachments should rerun the public installer once to migrate to R2.
 
 The no-scope `upgrade` updates registered global and project surfaces and migrates legacy governance only when Tenetora ownership is proven. Detecting a tool never authorizes plugin creation; governance-only migration does not create project skills or runtimes. The launch directory, registered projects, and bounded discoverable projects are considered. Foreign or ambiguous content is preserved for review.
 The installer is split by host under `scripts/tool_installers/`. A host definition owns paths, detection, and capability classification, while its installer adapter owns native-surface dispatch. Shared file safety, transaction, and rollback behavior remains centralized so a host-specific repair does not need to duplicate the upgrade engine.
@@ -170,6 +170,13 @@ tenetora preflight --tools codex --global --require-full --json
 `skills-only` is an honest state for Generic Agents or a host with limited capabilities. Use `--allow-skills-only` only when that limitation is accepted; `--require-full` blocks below-maximum capability before writes.
 
 ## Support Diagnostics
+
+Upgrade JSON retains the stage-level `error_code` and adds a stable `message_code`
+from the error producer. Parameterized diagnostics carry redacted `message_parameters`;
+individual issue records use `code`, `message` and optional `parameters`.
+Use these codes when reporting or grouping failures rather than matching an English
+sentence. Display wording and locale can change independently. Older string-only
+inputs remain compatible and genuinely unknown diagnostics may use `upgrade.unmapped`.
 
 Generate a strictly redacted machine-readable snapshot for support:
 
@@ -229,7 +236,7 @@ When the installed CLI is available, use it for an offline upgrade:
 tenetora upgrade --zip-file /path/to/tenetora-<version>.zip --sha256 <expected-sha256>
 ```
 
-This uses the same existing-only plan, release activation, and rollback transaction as an online upgrade. If a later upgrade step fails before a concurrent external change is detected, the previous `current`, `source/tenetora`, and legacy source pointers are restored and the same verified ZIP can be retried.
+Online and offline upgrades share one transaction across selected skills/plugins, managed configuration and registry entries, CLI/runtime, hooks, PATH and release pointers. Failure attempts every compensation; only verified complete recovery is marked `rolled-back`. Replaced entries remain available as private transaction backups, including after successful upgrades. Concurrent changes are preserved. If recovery cannot complete, the transaction stays blocked and retains snapshots and a recovery summary under the managed home’s `backups/upgrade-transactions/` directory.
 
 Use the bootstrap only for first installation, the 0.2.x bridge, a broken launcher, or a machine without a working CLI. Bash on macOS/Linux:
 

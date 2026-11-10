@@ -26,6 +26,7 @@ if str(CLI_DIR) not in sys.path:
 
 import alignment_state
 from harness_io import atomic_write_text
+from tenetora.file_lock import locked_file
 from tenetora.commit_hook_state import (
     STATE_SCHEMA_VERSION,
     command_from_state,
@@ -36,7 +37,7 @@ from tenetora.commit_hook_state import (
 )
 from tenetora.brand import machine_home
 from tenetora.path_security import (
-    ensure_unredirected_directory,
+    ensure_unredirected_directory as original_ensure_directory,
     harness_missing_message,
     is_redirected_path,
     validate_existing_project_path,
@@ -44,6 +45,13 @@ from tenetora.path_security import (
     validate_unredirected_file_path,
     validate_unredirected_path,
 )
+
+def ensure_unredirected_directory(path, *, label):
+    if os.environ.get('TENETORA_SURFACE_JOURNAL'):
+        from installation_transaction import ensure_directory
+        return ensure_directory(path, label=label)
+    return original_ensure_directory(path, label=label)
+
 
 STATE_REL = ".tenetora/state/commit-hooks.json"
 HOOK_NAMES = ("pre-commit", "commit-msg")
@@ -488,7 +496,11 @@ def install_one_hook(
         os.fsync(handle.fileno())
     try:
         temporary.chmod(0o755)
-        os.replace(temporary, path)
+        if os.environ.get('TENETORA_SURFACE_JOURNAL'):
+            from installation_transaction import publish
+            publish(temporary, path)
+        else:
+            os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
     return {
@@ -503,8 +515,14 @@ def install_one_hook(
 def hooks_operation_lock(root: Path):
     """Serialize hook-file installation and backup decisions per project."""
 
-    path = root / ".tenetora/state/commit-hooks.install.lock"
-    with alignment_state.state_lock(path):
+    # Coordination must survive replacement of a project's governance tree.
+    # Keeping the lock in that tree changes its inode during a copy/publish
+    # and also makes our own lock creation look like an external edit. Like
+    # the machine-install lock, it must also stay outside a purged home.
+    directory = root.stat()
+    identity = hashlib.sha256(f'{directory.st_dev}:{directory.st_ino}'.encode('utf-8')).hexdigest()
+    path = Path(tempfile.gettempdir()) / f'tenetora-hooks-{identity}.lock'
+    with locked_file(path):
         yield
 
 

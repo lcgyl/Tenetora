@@ -35,8 +35,6 @@ The model routes this request to `tenetora-init`, inspects existing rules, asks 
 | A report or webpage contains execution instructions | Prompt guard treats external content as data, not as an authority. |
 | Project governance becomes stale | `update`, `repair`, `audit`, and guardrails provide a maintenance loop. |
 
-Tenetora is not a prompt collection and does not replace the project's own build, test, review, or release approval.
-
 ## Local Environment and Workspace Boundaries
 
 Tenetora treats local environment files as user-owned data. Register a project-relative path when it needs an explicit protection record:
@@ -56,6 +54,8 @@ tenetora installations --json prune --expired
 ```
 
 `--expired` is explicit and only removes stale registry entries past the bounded retention window; it never deletes project files.
+
+Current main includes unreleased work. Check [release-channel availability](docs/capabilities.md#availability-by-release-channel) before using its commands; the platform table below describes main.
 
 ## Supported Platforms
 
@@ -181,7 +181,7 @@ tenetora upgrade --mirror-url https://mirror.example/tenetora/stable
 
 The mirror directory must contain `manifest.json` and `tenetora-latest.zip`. Both files are still checked as one release contract. Advanced direct endpoints may be supplied as the pair `TENETORA_RELEASE_MANIFEST_URL` and `TENETORA_RELEASE_ZIP_URL`, or with both `--manifest-url` and `--zip-url`. Release URLs must be HTTPS, must not contain credentials, query strings, or fragments, and a mirror cannot be combined with direct endpoints. A malformed or partial configuration fails closed before writes; a failed acquisition preserves the last valid update hint.
 
-The public installer and upgrader use the operator-managed R2 endpoint `https://r2.lcgylfamily.cn` by default. They read one `stable/latest.json` or `preview/latest.json` pointer and then download only the exact versioned ZIP and manifest named by that pointer. The pointer and manifest must agree; the installer never lists the bucket or silently falls back between channels. Set `TENETORA_RELEASE_INDEX_BASE=https://<worker-host>` only when using another compatible Worker. Historical GitLab and public release attachments remain available for older clients, but new releases publish one R2 artifact.
+The public installer and upgrader use the operator-managed R2 endpoint `https://r2.lcgylfamily.cn` by default. They read the selected channel pointer, then download only the exact versioned ZIP and manifest it names. A preview installation's default `tenetora upgrade` checks preview first and uses stable when the preview pointer is confirmed absent (HTTP 404/410). Stable installations stay on stable; switching to preview requires `--channel preview`. An explicit preview request stays strict, and network, authentication or artifact failures never trigger a channel change. Pointer, manifest, digest and version-direction checks remain enforced. Set `TENETORA_RELEASE_INDEX_BASE=https://<worker-host>` only when using another compatible Worker. Historical GitLab and public release attachments remain available for older clients, but new releases publish one R2 artifact.
 
 `tenetora upgrade --apply` is a 0.3.x compatibility alias for the same release acquisition and transaction engine.
 

@@ -30,6 +30,9 @@ except ImportError:
     from tenetora.path_security import validate_unredirected_file_path, validate_unredirected_path
 
 
+from upgrade_messages import MessageIssue, message_issue  # noqa: E402
+
+
 class UpgradeTransactionError(RuntimeError):
     """Raised when transaction state changes concurrently or is invalid."""
 
@@ -46,7 +49,7 @@ def transaction_path(home: Path) -> Path:
             label="upgrade transaction journal",
         )
     except RuntimeError as exc:
-        raise UpgradeTransactionError(str(exc)) from exc
+        raise UpgradeTransactionError(message_issue(exc) or str(exc)) from exc
 
 
 @contextmanager
@@ -60,7 +63,7 @@ def _write(path: Path, payload: dict[str, Any]) -> None:
     try:
         path = validate_unredirected_file_path(path, label="upgrade transaction journal")
     except RuntimeError as exc:
-        raise UpgradeTransactionError(str(exc)) from exc
+        raise UpgradeTransactionError(message_issue(exc) or str(exc)) from exc
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(name)
@@ -102,11 +105,11 @@ def load(home: Path) -> dict[str, Any] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise UpgradeTransactionError("upgrade transaction journal is unreadable") from exc
+        raise UpgradeTransactionError(MessageIssue('upgrade.upgrade-transaction-journal-is-unreadable')) from exc
     if not isinstance(payload, dict) or payload.get("version") != SCHEMA_VERSION:
-        raise UpgradeTransactionError("upgrade transaction journal schema is invalid")
+        raise UpgradeTransactionError(MessageIssue('upgrade.upgrade-transaction-journal-schema-is-invalid'))
     if type(payload.get("revision")) is not int or payload["revision"] < 1:
-        raise UpgradeTransactionError("upgrade transaction revision is invalid")
+        raise UpgradeTransactionError(MessageIssue('upgrade.upgrade-transaction-revision-is-invalid'))
     return payload
 
 
@@ -114,7 +117,7 @@ def begin(home: Path, *, source_version: str, target_version: str, plan: dict[st
     with transaction_lock(home):
         current = load(home)
         if current is not None and current.get("status") not in TERMINAL:
-            raise UpgradeTransactionError("an unfinished upgrade transaction already exists")
+            raise UpgradeTransactionError(MessageIssue('upgrade.an-unfinished-upgrade-transaction-already-exists'))
         now = utc_now()
         payload = {
             "version": SCHEMA_VERSION,
@@ -140,14 +143,14 @@ def resume(home: Path, *, target_version: str, plan: dict[str, Any]) -> dict[str
     with transaction_lock(home):
         payload = load(home)
         if payload is None or payload.get("status") in TERMINAL:
-            raise UpgradeTransactionError("no unfinished upgrade transaction is available to resume")
+            raise UpgradeTransactionError(MessageIssue('upgrade.no-unfinished-upgrade-transaction-is-available-to-resume'))
         if payload.get("target_version") != target_version:
-            raise UpgradeTransactionError("unfinished upgrade transaction targets another release")
+            raise UpgradeTransactionError(MessageIssue('upgrade.unfinished-upgrade-transaction-targets-another-release'))
         if payload.get("plan_sha256") != canonical_plan_sha256(plan):
-            raise UpgradeTransactionError("unfinished upgrade transaction plan no longer matches")
+            raise UpgradeTransactionError(MessageIssue('upgrade.unfinished-upgrade-transaction-plan-no-longer-matches'))
         prior_process = payload.get("process_id")
         if type(prior_process) is int and prior_process != os.getpid() and process_alive(prior_process):
-            raise UpgradeTransactionError("unfinished upgrade transaction still belongs to a live process")
+            raise UpgradeTransactionError(MessageIssue('upgrade.unfinished-upgrade-transaction-still-belongs-to-a-live-process'))
         updated = dict(payload)
         updated["revision"] = int(payload["revision"]) + 1
         updated["process_id"] = os.getpid()
@@ -172,9 +175,9 @@ def advance(
     with transaction_lock(home):
         payload = load(home)
         if payload is None or payload.get("transaction_id") != transaction_id:
-            raise UpgradeTransactionError("upgrade transaction identity mismatch")
+            raise UpgradeTransactionError(MessageIssue('upgrade.upgrade-transaction-identity-mismatch'))
         if payload.get("revision") != expected_revision:
-            raise UpgradeTransactionError("upgrade transaction changed concurrently")
+            raise UpgradeTransactionError(MessageIssue('upgrade.upgrade-transaction-changed-concurrently'))
         updated = dict(payload)
         updated.update(
             revision=expected_revision + 1,

@@ -24,6 +24,23 @@ EVENT_SCHEMA_VERSION = 1
 MAX_LOG_FILES = 10
 MAX_LOG_BYTES = 20 * 1024 * 1024
 RECENT_LINES = 3
+
+
+def is_expected_skills_only_payload(check: dict[str, object]) -> bool:
+    """Share the presentation rule without suppressing blocked or invalid checks."""
+    if (check.get("matches_plan") is False or check.get("version_matches_package") is False
+            or check.get("planned") == "BLOCKED" or check.get("actual") == "BLOCKED"):
+        return False
+    status = str(check.get("actual") or check.get("planned") or "")
+    return status == "SKILLS_ONLY" and (
+        check.get("fallback_accepted") is True
+        or check.get("maximum") == "SKILLS_ONLY"
+        or check.get("runtime_role") == "skills-only-shadow"
+        or (check.get("scope") == "project" and check.get("plugin_api") == "scope-unsupported"
+            and check.get("planned") == "SKILLS_ONLY")
+    )
+
+
 SECRET_FIELD_KEYS = {
     "accesstoken",
     "apikey",
@@ -62,7 +79,7 @@ SECRET_PATTERNS = (
         r"xox[baprs]-[A-Za-z0-9-]{12,}"
         r")\b"
     ),
-    re.compile(r"(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@"),
+    re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^/@\s]+@"),
 )
 
 
@@ -77,7 +94,7 @@ def redact(text: str) -> str:
             sanitized = pattern.sub("[REDACTED_TOKEN]", sanitized)
         elif pattern.pattern.startswith("\\b"):
             sanitized = pattern.sub("[REDACTED_TOKEN]", sanitized)
-        elif pattern.pattern.startswith("(?i)([a-z]"):
+        elif pattern.pattern.startswith("(?i)(\\b[a-z]"):
             sanitized = pattern.sub(r"\1[REDACTED]@", sanitized)
         else:
             sanitized = pattern.sub(r"\1[REDACTED]", sanitized)

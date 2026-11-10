@@ -19,9 +19,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from claim_evidence import VERIFICATION_COMMAND_HASH_VERSION
+from claim_evidence import VERIFICATION_COMMAND_HASH_VERSION, pending_preparation, superseding_failure, verification_failure, claim_handoff_problem  # noqa: E402
 from path_security import validate_existing_project_path  # noqa: E402
-from governance_trail import iter_events  # noqa: E402
+from governance_trail import load_retained_trail  # noqa: E402
 from worktree_fingerprint import (  # noqa: E402
     WORKTREE_ENTRIES_VERSION,
     WORKTREE_FINGERPRINT_VERSION,
@@ -209,11 +209,19 @@ def _project_root_fingerprint(root: Path) -> str:
 
 def _load_claim_events(root: Path) -> list[dict[str, Any]]:
     project_fingerprint = _project_root_fingerprint(root)
+    trail = load_retained_trail(root)
+    if trail.get('invalid') or trail.get('conflicts'):
+        return [{'type': 'verification-claim', 'status': 'fail', 'verification_status': 'failed',
+            'verification_scope': [], '_history_invalid': True}]
+    events = [{**event, 'status': 'fail', 'verification_status': 'failed'}
+        if event.get('status') == 'pass' and claim_handoff_problem(root, event) else event
+        for event in trail['events']]
     return (
         [
             item
-            for item in iter_events(root)
-            if item.get("project_root_fingerprint") == project_fingerprint
+            for item in events
+            if item.get('type') != 'verification-claim'
+            or item.get("project_root_fingerprint") == project_fingerprint or verification_failure(item)
         ]
     )
 
@@ -267,6 +275,8 @@ def _latest_claim_from_events(
     for event in reversed(events):
         if event.get("type") != "verification-claim":
             continue
+        if pending_preparation(event):
+            continue
         event_scope = _event_scope(event)
         if event_scope is None:
             continue
@@ -274,6 +284,8 @@ def _latest_claim_from_events(
             continue
         passed = event.get("status") == "pass" and event.get("verification_status") == "passed"
         if passed and CLAIM_PROOF_PATTERN.fullmatch(str(event.get("claim_proof") or "")):
+            if superseding_failure(events, event):
+                return None, 'a newer overlapping failed or blocked verification supersedes this claim'
             return event, None
         return None, "latest matching verification claim failed or was skipped"
     return None, "no passed verification claim is recorded"
@@ -296,6 +308,11 @@ def _claim_summary(
             "changed_after_claim_paths": [],
             "post_claim_paths_known": False,
         }
+    from execution_receipts import claim_execution_problem
+    execution_problem=claim_execution_problem(root,event)
+    if execution_problem:
+        return {'eligible':False,'reason':execution_problem,'claim_proof':event.get('claim_proof'),
+            'changed_after_claim_paths':[],'post_claim_paths_known':False}
     if event.get('verification_command_hash_version') != VERIFICATION_COMMAND_HASH_VERSION:
         return {'eligible': False, 'reason': 'legacy command identity requires revalidation',
             'claim_proof': event.get('claim_proof'), 'changed_after_claim_paths': [],
@@ -303,15 +320,15 @@ def _claim_summary(
     event_scope = _event_scope(event) or ()
     recorded = event.get("git_state_fingerprint")
     version = event.get("git_state_fingerprint_version")
-    current = git_state_fingerprint(root, event_scope)
     recorded_entries = event.get("git_state_entries")
+    current = git_state_fingerprint(root, event_scope,known_paths=recorded_entries or ())
     entries_version = event.get("git_state_entries_version")
     entries_supported = (
         entries_version == WORKTREE_ENTRIES_VERSION
         and isinstance(recorded_entries, dict)
         and all(isinstance(path, str) and isinstance(entry, str) for path, entry in recorded_entries.items())
     )
-    current_entries = git_state_entries(root, event_scope) if entries_supported else None
+    current_entries = git_state_entries(root, event_scope,known_paths=recorded_entries) if entries_supported else None
     changed_after_claim = []
     if entries_supported and current_entries is not None:
         changed_after_claim = sorted(

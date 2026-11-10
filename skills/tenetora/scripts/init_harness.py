@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from typing import Any
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -78,6 +79,9 @@ HARNESS_INTERNAL_GITIGNORE_ENTRIES = (
     "state/alignment-session.json",
     "state/alignment-sessions/",
     "state/alignment-history/",
+    "state/verification-runs/",
+    "state/completion-commits/",
+    "state/completion-locks/",
     "state/alignment-lifecycle.json",
     "state/delegation-state.json",
     "state/local-env.json",
@@ -2855,7 +2859,7 @@ if ! command -v python3 >/dev/null 2>&1; then
   echo "SEE: .tenetora/workflows/verification.md" >&2
   exit 2
 fi
-exec python3 "$SCRIPT_DIR/run-all.py" "$@"
+exec python3 -I "$SCRIPT_DIR/run-all.py" "$@"
 
 # Failure format used by every check:
 # ERROR: <what failed>
@@ -2870,7 +2874,6 @@ def render_guardrail_run_all_python_script() -> str:
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import subprocess
@@ -2894,50 +2897,32 @@ def local_skill_invocations(root: Path) -> list[list[str]]:
     invocations = []
     for tool_dir in (".agents", ".codex", ".claude", ".cursor", ".opencode", ".pi", ".zcode"):
         cli_dir = root / tool_dir / "skills" / "tenetora" / "cli"
+        entry = cli_dir / "tenetora" / "python_invocation.py"
         if not (cli_dir / "tenetora" / "cli.py").is_file():
             continue
-        invocations.append([
-            sys.executable,
-            "-c",
-            "import sys; sys.path.insert(0, sys.argv.pop(1)); from tenetora.cli import main; raise SystemExit(main())",
-            str(cli_dir),
-        ])
+        if entry.is_file():
+            invocations.append([sys.executable, "-I", "-B", str(entry)])
+        else:
+            # Older project skills predate the owned entrypoint. Load that
+            # explicit package under -I without installing a machine launcher.
+            invocations.append([sys.executable, "-I", "-B", "-c",
+                "import sys; sys.path.insert(0, sys.argv.pop(1)); from tenetora.cli import main; raise SystemExit(main())",
+                str(cli_dir)])
     return invocations
 
 
 def tenetora_invocation(root: Path, *, require_only: bool = False) -> list[str] | None:
-    # A generated project runner must prefer its own embedded skill CLI.  CI
-    # jobs intentionally run without a globally installed Tenetora binary, and
-    # the fallback command produced by ensure_cli cannot import ``tenetora.cli``
-    # unless a package or PYTHONPATH happens to exist on the host.
+    # Discovery and checks are read-only with respect to machine installation.
+    # A project skill runs through its owned isolated entry without bootstrap.
     candidates: list[list[str]] = local_skill_invocations(root)
     found = shutil.which("tenetora")
     if found:
         candidates.append([found])
     suffix = ".cmd" if sys.platform == "win32" else ""
-    managed = Path.home() / ".tenetora" / "bin" / f"tenetora{suffix}"
+    machine = Path(os.environ.get("TENETORA_HOME") or (Path.home() / ".tenetora"))
+    managed = machine / "bin" / f"tenetora{suffix}"
     if managed.is_file():
         candidates.append([str(managed)])
-    for tool_dir in (".agents", ".codex", ".claude", ".cursor", ".opencode", ".pi", ".zcode"):
-        ensure_cli = root / tool_dir / "skills" / "tenetora" / "scripts" / "ensure_cli.py"
-        if not ensure_cli.is_file():
-            continue
-        completed = subprocess.run(
-            [sys.executable, str(ensure_cli), "--install", "--json"],
-            cwd=root,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        if completed.returncode != 0:
-            continue
-        try:
-            command = json.loads(completed.stdout).get("command")
-        except json.JSONDecodeError:
-            continue
-        if isinstance(command, str) and Path(command).is_file():
-            candidates.append([command])
     for candidate in candidates:
         if not require_only or supports_only(candidate, root):
             return candidate
@@ -4380,7 +4365,9 @@ def render_state_inventory(evidence: dict[str, object]) -> str:
         ("state/alignment-session.json", "legacy", "Unowned pre-0.2.6 singleton; never inherited automatically; review or explicitly recover it"),
         ("state/alignment-sessions/", "on demand", "One owner-bound alignment record per conversation/session"),
         ("state/alignment-history/", "on demand", "Terminal alignment records retained under a bounded retention policy"),
-        ("state/alignment-lifecycle.json", "on demand", "Bounded open/completed/archived/expired goal index used for safe identity binding"),
+        ("state/alignment-lifecycle.json", "on demand", "Bounded goal routing cache; completed state projects from durable receipts"),
+        ("state/verification-runs/", "on demand", "Observed run receipts with command/source identity, real results and bounded redacted output; reuse does not execute checks"),
+        ("state/completion-commits/", "on demand", "Immutable completion receipts bound to exact raw evidence; retained independently of routing cleanup"),
         ("state/current-alignment.json", "on demand", "Latest confirmed or risk-accepted alignment handoff pointer"),
         ("state/change-impact.json", "on demand", "Current bounded shared-contract impact inventory, rescan, and verification lifecycle"),
         ("state/rules-inventory.json", "canonical", "Rule origin, ownership, and default-pack match inventory"),
@@ -5000,7 +4987,7 @@ def resolve_initial_state(args: argparse.Namespace) -> tuple[
     dict[str, object],
     bool,
     bool,
-    list[MigrationDecision],
+    dict[MigrationCandidate, str],
 ]:
     root = args.path
     tools = selected_tools(root, args.tools)

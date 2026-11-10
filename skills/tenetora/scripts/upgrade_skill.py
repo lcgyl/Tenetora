@@ -26,11 +26,11 @@ if CLI_DIR.exists():
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from install_progress import redact, write_failure_artifacts  # noqa: E402
+from install_progress import is_expected_skills_only_payload, redact, write_failure_artifacts  # noqa: E402
 from installation_registry import RegistryError, registered_projects  # noqa: E402
 from governance_paths import pending_defaults_review  # noqa: E402
 from governance_trail import sanitize_local_paths  # noqa: E402
-from upgrade_messages import MESSAGE_TEMPLATES, MESSAGE_TEMPLATES_BY_ENGLISH, MessageIssue, issue_code  # noqa: E402
+from upgrade_messages import MESSAGE_TEMPLATES, MESSAGE_TEMPLATES_BY_ENGLISH, MessageIssue, issue_code, message_issue  # noqa: E402
 
 
 UPGRADE_LOCAL_PATH_PATTERN = re.compile(
@@ -43,17 +43,26 @@ def use_chinese() -> bool:
 
 
 def safe_issue_value(value: object) -> str:
-    text = str(sanitize_local_paths(redact(str(value))))
-    return UPGRADE_LOCAL_PATH_PATTERN.sub("<path>", text)
+    # Redact absolute paths before home sanitization, otherwise a Windows path
+    # becomes "<home>\\..." and no longer matches the absolute-path pattern.
+    text = UPGRADE_LOCAL_PATH_PATTERN.sub("<path>", str(value))
+    return str(sanitize_local_paths(redact(text)))
 
 
 def issue_text(issue: object) -> str:
-    text = safe_issue_value(issue)
-    if isinstance(issue, MessageIssue):
-        template = MESSAGE_TEMPLATES.get(issue.code)
+    coded = message_issue(issue)
+    if coded is not None:
+        template = MESSAGE_TEMPLATES.get(coded.code)
         if template is None:
-            return issue.fallback or issue.code
-        return template.chinese if use_chinese() else template.english
+            return safe_issue_value(coded.fallback or coded.code)
+        parameters = {str(key): issue_text(value) if message_issue(value) is not None else safe_issue_value(value)
+            for key, value in coded.parameters.items()}
+        source = template.chinese if use_chinese() else template.english
+        try:
+            return safe_issue_value(source.format_map(parameters))
+        except (KeyError, ValueError):
+            return safe_issue_value(coded.fallback or str(coded))
+    text = safe_issue_value(issue)
     if not use_chinese():
         return text
     template = MESSAGE_TEMPLATES_BY_ENGLISH.get(text)
@@ -84,17 +93,54 @@ def issue_text(issue: object) -> str:
     return text
 
 
-def issue_record(issue: object) -> dict[str, str]:
+def issue_record(issue: object) -> dict[str, object]:
     """Return stable machine metadata while preserving the human message."""
 
-    if isinstance(issue, MessageIssue):
-        redacted: object = MessageIssue(issue.code, safe_issue_value(issue.fallback))
-    else:
-        redacted = safe_issue_value(issue)
-    return {
-        "code": issue_code(redacted),
-        "message": issue_text(redacted),
-    }
+    coded = message_issue(issue)
+    record: dict[str, object] = {'code': safe_issue_value(issue_code(issue)), 'message': issue_text(issue)}
+    if coded is not None and coded.parameters:
+        record['parameters'] = {str(key): issue_record(value) if message_issue(value) is not None else safe_issue_value(value)
+            for key, value in coded.parameters.items()}
+    return record
+
+
+WORKER_ERROR_PREFIX = 'TENETORA_UPGRADE_ERROR_V1:'
+
+
+def emit_worker_error(args: argparse.Namespace, issue: object, stage: str, exit_code: int) -> None:
+    """Frame a redacted error only for a captured machine-mode worker."""
+    if not (getattr(args, 'worker', False) and getattr(args, 'json', False)):
+        return
+    args.worker_error_emitted = True
+    frame = {'version': 1, 'status': 'failed', 'exit_code': exit_code,
+        'stage': stage, 'error': issue_record(issue)}
+    print(WORKER_ERROR_PREFIX + json.dumps(frame, ensure_ascii=False), file=sys.stderr, flush=True)
+
+
+def worker_error_records(result: subprocess.CompletedProcess[str]) -> list[dict[str, object]]:
+    if result.returncode == 0:
+        return []
+    records = []
+    for line in (result.stderr or '').splitlines():
+        if not line.startswith(WORKER_ERROR_PREFIX) or len(line) > 32768:
+            continue
+        try:
+            frame = json.loads(line[len(WORKER_ERROR_PREFIX):])
+            if type(frame.get('version')) is not int or frame['version'] != 1 or frame.get('status') != 'failed':
+                continue
+            if type(frame.get('exit_code')) is not int or frame['exit_code'] != result.returncode:
+                continue
+            stage, error = frame['stage'], frame['error']
+            if not isinstance(stage, str) or not re.fullmatch(r'[a-z0-9-]{1,80}', stage):
+                continue
+            if not isinstance(error, dict) or not isinstance(error.get('message'), str) or message_issue(error) is None:
+                continue
+            records.append({'stage': stage, **issue_record(error)})
+            if len(records) >= 20:
+                break
+        except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+            continue
+    return records
 
 from tenetora import __version__  # noqa: E402
 from tenetora.brand import (  # noqa: E402
@@ -110,7 +156,7 @@ from tenetora.install_lock import (  # noqa: E402
     install_lock_subprocess_kwargs,
     install_transaction_locks,
 )
-from path_manager import checkpoint_user_path, configure_user_path, restore_user_path, snapshot_user_path  # noqa: E402
+from path_manager import restore_user_path, snapshot_user_path  # noqa: E402
 from onboarding_state import derive as derive_onboarding_state  # noqa: E402
 from release_store import (  # noqa: E402
     ReleaseStoreError,
@@ -142,6 +188,8 @@ from upgrade_transaction import (  # noqa: E402
     load as load_transaction,
     resume as resume_transaction,
 )
+from installation_transaction import Journal as InstallationJournal, JOURNAL_ENV, DIGEST_ENV  # noqa: E402
+from tenetora.path_security import ensure_unredirected_directory  # noqa: E402
 
 
 def refresh_onboarding_state() -> bool:
@@ -297,6 +345,8 @@ def preflight_failure_details(payload: object) -> list[str]:
             for check in checks:
                 if not isinstance(check, dict):
                     continue
+                if is_expected_skills_only_payload(check):
+                    continue
                 blocker = str(check.get("blocker") or "").strip()
                 remediation = str(check.get("remediation") or "").strip()
                 actual = str(check.get("actual") or "")
@@ -305,7 +355,7 @@ def preflight_failure_details(payload: object) -> list[str]:
                     check.get("matches_plan") is False
                     or check.get("version_matches_package") is False
                 )
-                if actual == "PENDING_TRUST" and not validation_failed:
+                if actual == "PENDING_TRUST" and planned != "BLOCKED" and not validation_failed:
                     continue
                 if (
                     not blocker
@@ -448,7 +498,7 @@ def check_payload(args: argparse.Namespace, release_manifest: dict[str, object] 
         }
     issues = list(status.issues)
     if machine_result.returncode != 0 and machine.get("status") != "missing":
-        issues.append(str(machine.get("error") or "machine-wide upgrade preflight is blocked"))
+        issues.append((machine.get("error") or MessageIssue('upgrade.machine-wide-upgrade-preflight-is-blocked')))
     payload: dict[str, object] = {
         "status": "checked",
         "action": "check",
@@ -660,6 +710,9 @@ def restore_runtime_journal(args: argparse.Namespace, journal: Path) -> bool:
 
 
 def preserve_failed_transaction_journals(hook_journal: Path, runtime_journal: Path) -> Path:
+    if (hook_journal.parent == runtime_journal.parent
+            and hook_journal.parent.parent == machine_home() / 'backups/failed-transactions'):
+        return hook_journal.parent
     timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     destination = machine_home() / "backups" / "failed-transactions" / f"upgrade-{timestamp}-{uuid.uuid4().hex[:8]}"
     destination.mkdir(parents=True, exist_ok=False)
@@ -675,12 +728,62 @@ def preserve_failed_transaction_journals(hook_journal: Path, runtime_journal: Pa
     return destination
 
 
-def rollback_upgrade(args: argparse.Namespace, hook_journal: Path, runtime_journal: Path) -> bool:
-    hook_restored = restore_hook_journal(args, hook_journal)
-    runtime_restored = restore_runtime_journal(args, runtime_journal)
-    if not (hook_restored and runtime_restored):
+def rollback_upgrade(
+    args: argparse.Namespace, hook_journal: Path, runtime_journal: Path,
+    *, activation_receipt: dict[str, object] | None = None,
+) -> bool:
+    results = []
+    for label, action in (('hook-rollback', lambda: restore_hook_journal(args, hook_journal)),
+                          ('runtime-rollback', lambda: restore_runtime_journal(args, runtime_journal))):
+        try:
+            results.append(bool(action()))
+        except Exception as exc:  # noqa: BLE001 -- every post-write failure must attempt all compensators
+            emit_worker_error(args, exc, label, 1)
+            results.append(False)
+    hook_restored, runtime_restored = results
+    release_restored = True
+    if activation_receipt is not None:
+        try:
+            restore_release_activation(machine_home(), activation_receipt)
+        except Exception as exc:  # noqa: BLE001 -- every post-write failure must attempt all compensators
+            emit_worker_error(args, exc, 'release-rollback', 1)
+            release_restored = False
+        if release_restored and not runtime_restored:
+            # A failed activation checkpoint may leave the runtime journal
+            # unaware of new pointers. The activation receipt restores those
+            # exact pointers; retry the conditional runtime restore once.
+            try:
+                runtime_restored = restore_runtime_journal(args, runtime_journal)
+            except Exception as exc:  # noqa: BLE001 -- every post-write failure must attempt all compensators
+                emit_worker_error(args, exc, 'runtime-rollback', 1)
+    if not (hook_restored and runtime_restored and release_restored):
         preserve_failed_transaction_journals(hook_journal, runtime_journal)
-    return hook_restored and runtime_restored
+    return hook_restored and runtime_restored and release_restored
+
+
+def snapshot_surface_journal(args: argparse.Namespace, journal: Path) -> str:
+    command = install_args(args)
+    command = [item for item in command if item != '--update']
+    command.extend(['--snapshot-surfaces', '--surface-rollback-journal', str(journal), '--json'])
+    if args.bin_dir is not None:
+        command.extend(['--upgrade-bin-dir', str(args.bin_dir)])
+    if getattr(args, 'upgrade_profile_file', None) is not None:
+        command.extend(['--upgrade-path-file', str(args.upgrade_profile_file)])
+    if not args.bootstrap_install:
+        command.append('--existing-only')
+    result = subprocess.run(command, env=controller_child_environment(), text=True, encoding='utf-8',
+                            errors='replace', stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                            **install_lock_subprocess_kwargs())
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or 'installation surface snapshot failed')
+    payload = json.loads(result.stdout)
+    digest = payload.get('inventory_sha256') if isinstance(payload, dict) else None
+    if not isinstance(digest, str) or not re.fullmatch('[0-9a-f]{64}', digest):
+        raise RuntimeError('installation surface snapshot returned an invalid inventory receipt')
+    # Reopen it before allowing any installer write, binding recovery to this
+    # immutable inventory rather than trusting mutable later path metadata.
+    InstallationJournal(journal, digest)
+    return digest
 
 
 def migrate_legacy_machine_home(args: argparse.Namespace, runtime_journal: Path, source_root: Path) -> int:
@@ -748,17 +851,23 @@ def _apply_upgrade(args: argparse.Namespace) -> int:
     try:
         release_manifest = local_release_manifest(source_root)
     except ReleaseStoreError as exc:
+        emit_worker_error(args, exc, 'release-manifest', 1)
         print(f"升级被阻断：{issue_text(exc)}" if use_chinese() else f"Upgrade blocked: {exc}", file=sys.stderr)
         return 1
+    # apply_upgrade holds the installation lock. Older controllers can invoke
+    # this worker directly, so it must independently reject a stale target.
+    args.worker_stage = 'release-direction'
+    ensure_release_direction(release_manifest)
     controlled_bridge = bool(args.bridge_source_version)
     if controlled_bridge:
         preflight = check_payload(args, release_manifest)
         machine_plan = preflight.get("machine") if isinstance(preflight.get("machine"), dict) else {}
         if machine_plan.get("result") in {"BLOCKED", "PARTIAL"} or machine_plan.get("status") == "blocked":
+            emit_worker_error(args, machine_plan.get('error') or MessageIssue('upgrade.machine-wide-upgrade-preflight-is-blocked'), 'machine-preflight', 1)
             print_preflight_failure(
                 args,
                 machine_plan,
-                str(machine_plan.get("error") or "machine-wide upgrade preflight is blocked"),
+                (machine_plan.get("error") or MessageIssue('upgrade.machine-wide-upgrade-preflight-is-blocked')),
             )
             return 1
     else:
@@ -790,6 +899,7 @@ def _apply_upgrade(args: argparse.Namespace) -> int:
 
     def record_stage(stage: str, *, status: str = "running", error_code: str = "") -> None:
         nonlocal transaction
+        args.worker_stage = stage
         if transaction is None:
             return
         transaction = advance_transaction(
@@ -802,7 +912,37 @@ def _apply_upgrade(args: argparse.Namespace) -> int:
         )
 
     path_snapshot: dict[str, object] | None = None
-    activation_receipt: dict[str, object] | None = None
+    surface_digest: str | None = None
+    journals_finished = bool(args.dry_run)
+    upgrade_succeeded = False
+    journal_root: Path | None = None
+    keep_after_images = False
+    filesystem_recovery: dict[str, object] | None = None
+    previous_transaction_environment: dict[str, str | None] = {}
+
+    def restore_path_receipt() -> bool:
+        if path_snapshot is None or path_snapshot.get('kind') != 'windows':
+            return True  # POSIX profile files belong to the filesystem journal.
+        receipt_path = journal_root / 'path-receipt.json'
+        if not receipt_path.is_file():
+            return True  # The producer records before any registry write.
+        receipt = json.loads(receipt_path.read_text(encoding='utf-8'))
+        if receipt.get('changed') is False:
+            return True
+        before = receipt.get('before')
+        after = receipt.get('after_sha256')
+        if (not isinstance(before, dict) or before.get('kind') != 'windows'
+                or not isinstance(after, str) or not re.fullmatch('[0-9a-f]{64}', after)
+                or hashlib.sha256(str(before.get('content', '')).encode()).hexdigest() != before.get('before_sha256')):
+            return False
+        return restore_user_path({**before, 'after_sha256': after})
+
+    def compensate(label, action) -> bool:
+        try:
+            return bool(action())
+        except Exception as exc:  # noqa: BLE001 -- every post-write failure must attempt all compensators
+            emit_worker_error(args, exc, label, 1)
+            return False
 
     def fail(
         code: int,
@@ -812,36 +952,50 @@ def _apply_upgrade(args: argparse.Namespace) -> int:
         *,
         restored_code: int | None = None,
     ) -> int:
-        path_restored = path_snapshot is None or restore_user_path(path_snapshot)
-        # The runtime journal includes the current/source pointers after the
-        # activation checkpoint. Restore that complete snapshot before the
-        # release-specific compensator validates the same pointers; reversing
-        # these operations makes the compensators report their own change as
-        # an external concurrent edit.
-        restored = rollback_upgrade(args, hook_journal, runtime_journal)
-        release_restored = True
-        if activation_receipt is not None:
+        nonlocal journals_finished, keep_after_images, filesystem_recovery
+        if not getattr(args, 'worker_error_emitted', False):
+            emit_worker_error(args, MessageIssue('upgrade.worker-stage-failed', parameters={'stage': stage}), stage, code)
+        path_restored = compensate('path-rollback', restore_path_receipt)
+        def restore_filesystem():
+            nonlocal keep_after_images, filesystem_recovery
+            result = InstallationJournal(journal_root / 'installation-surfaces', surface_digest).restore()
+            filesystem_recovery = result
+            keep_after_images = bool(result.get('retained'))
+            if result['status'] != 'restored':
+                print(f"Filesystem rollback conflicts: {', '.join(result.get('conflicts', []))}", file=sys.stderr)
+            return result['status'] == 'restored'
+        # No installation mutation is permitted before the unified inventory
+        # is ready. Once ready, it owns files, runtimes, hooks and pointers;
+        # older destructive compensators must not run in front of it.
+        files_restored = surface_digest is None or compensate('filesystem-rollback', restore_filesystem)
+        fully_restored = path_restored and files_restored
+        recorded = compensate('transaction-rollback-record', lambda: (
+            record_stage('rolled-back' if fully_restored else stage,
+                         status='rolled-back' if fully_restored else 'blocked', error_code=stage) is None))
+        journals_finished = fully_restored and recorded
+        args.worker_stage = stage
+        if journal_root is not None and (not journals_finished or keep_after_images):
             try:
-                restore_release_activation(machine_home(), activation_receipt)
-            except ReleaseStoreError as exc:
-                release_restored = False
-                print(
-                    f"升级被阻断：{issue_text(exc)}"
-                    if use_chinese()
-                    else f"Upgrade blocked: {exc}",
-                    file=sys.stderr,
-                )
-        fully_restored = restored and path_restored and release_restored
-        record_stage(
-            "rolled-back" if fully_restored else stage,
-            status="rolled-back" if fully_restored else "blocked",
-            error_code=stage,
-        )
-        return (restored_code if restored_code is not None else code) if fully_restored else 1
+                (journal_root / 'recovery.json').write_text(json.dumps({
+                    'status': 'rolled-back' if journals_finished else 'blocked', 'failure_stage': stage, 'restoration_complete': fully_restored,
+                    'transaction_recorded': recorded, 'surface_inventory_sha256': surface_digest,
+                    'filesystem_recovery': filesystem_recovery,
+                }, indent=2) + '\n', encoding='utf-8')
+            except OSError:
+                # The existing snapshots remain durable even if disk failure
+                # also prevents writing this advisory recovery summary.
+                pass
+        return (restored_code if restored_code is not None else code) if journals_finished else 1
 
-    with tempfile.TemporaryDirectory(prefix="tenetora-upgrade-hooks-") as temporary:
-        hook_journal = Path(temporary) / "commit-hooks"
-        runtime_journal = Path(temporary) / "managed-runtime"
+    if args.dry_run:
+        journal_root = Path(tempfile.mkdtemp(prefix='tenetora-upgrade-dry-run-'))
+    else:
+        parent = ensure_unredirected_directory(machine_home() / 'backups/upgrade-transactions', label='upgrade recovery directory')
+        journal_root = Path(tempfile.mkdtemp(prefix='upgrade-', dir=parent))
+    hook_journal = journal_root / 'commit-hooks'
+    runtime_journal = journal_root / 'managed-runtime'
+    surface_journal = journal_root / 'installation-surfaces'
+    try:
         if not args.dry_run:
             print("[0/4] 正在准备升级并保存回滚快照……" if use_chinese() else "[0/4] Preparing the upgrade and saving rollback snapshots...")
             runtime_snapshot = subprocess.run(
@@ -874,13 +1028,27 @@ def _apply_upgrade(args: argparse.Namespace) -> int:
                     print(hook_snapshot.stderr, end="", file=sys.stderr)
                 record_stage("hook-snapshot-failed", status="blocked", error_code="hook-snapshot")
                 return hook_snapshot.returncode
+            if args.configure_path:
+                path_snapshot = snapshot_user_path()
+                if path_snapshot.get('kind') != 'windows':
+                    args.upgrade_profile_file = Path(path_snapshot['path'])
+            surface_digest = snapshot_surface_journal(args, surface_journal)
+            values = {JOURNAL_ENV: str(surface_journal), DIGEST_ENV: surface_digest,
+                      'TENETORA_RUNTIME_ROLLBACK_JOURNAL': str(runtime_journal),
+                      'TENETORA_PATH_RECEIPT': str(journal_root / 'path-receipt.json')}
+            previous_transaction_environment = {key: os.environ.get(key) for key in values}
+            os.environ.update(values)
             record_stage("snapshotted")
 
+        installer_environment = controller_child_environment()
+        if surface_digest is not None:
+            installer_environment.update({JOURNAL_ENV: str(surface_journal), DIGEST_ENV: surface_digest,
+                                          'TENETORA_RUNTIME_ROLLBACK_JOURNAL': str(runtime_journal)})
         command = install_args(args, hook_journal if not args.dry_run else None)
         print("[1/4] 正在更新已有安装面……" if use_chinese() else "[1/4] Updating existing installation surfaces...")
         result = subprocess.run(
             command,
-            env=controller_child_environment(),
+            env=installer_environment,
             text=True,
             encoding="utf-8",
             errors="replace",
@@ -902,8 +1070,6 @@ def _apply_upgrade(args: argparse.Namespace) -> int:
             return install_result
         else:
             effective_bin_dir = args.bin_dir or (machine_home() / "bin")
-            if args.configure_path:
-                path_snapshot = snapshot_user_path()
             cli_command = [
                 sys.executable,
                 str(ensure_cli),
@@ -945,8 +1111,6 @@ def _apply_upgrade(args: argparse.Namespace) -> int:
             if args.verbose and cli_result.stdout:
                 print(cli_result.stdout, end="")
             print("CLI：已就绪" if use_chinese() else "CLI bootstrap: ready")
-            if path_snapshot is not None:
-                path_snapshot = checkpoint_user_path(path_snapshot)
             record_stage("cli-bootstrapped")
 
         print("[3/4] 正在收敛提交 Hook……" if use_chinese() else "[3/4] Converging commit hooks...")
@@ -980,8 +1144,9 @@ def _apply_upgrade(args: argparse.Namespace) -> int:
         print("[4/4] 正在激活 release 并完成复检……" if use_chinese() else "[4/4] Activating the release and completing verification...")
         if controlled_bridge:
             try:
-                activation_receipt = activate_release(machine_home(), source_root)
+                activate_release(machine_home(), source_root)
             except ReleaseStoreError as exc:
+                emit_worker_error(args, exc, 'release-activation', 1)
                 print(f"升级被阻断：{issue_text(exc)}" if use_chinese() else f"Upgrade blocked: {exc}", file=sys.stderr)
                 return fail(1, "release-activation", hook_journal, runtime_journal)
             if not checkpoint_runtime_journal(args, runtime_journal, source_root):
@@ -993,10 +1158,46 @@ def _apply_upgrade(args: argparse.Namespace) -> int:
                 return fail(1, "runtime-checkpoint", hook_journal, runtime_journal)
             refresh_onboarding_state()
             record_stage("completed", status="completed")
+        journals_finished = True
+        upgrade_succeeded = True
         return install_result
+    except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 -- every post-write failure must attempt all compensators
+        failure_code = 130 if isinstance(exc, KeyboardInterrupt) else 1
+        emit_worker_error(args, exc, str(getattr(args, 'worker_stage', 'upgrade')), failure_code)
+        if args.dry_run:
+            return failure_code
+        return fail(failure_code,
+                    str(getattr(args, 'worker_stage', 'upgrade')), hook_journal, runtime_journal)
+    finally:
+        for key, value in previous_transaction_environment.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        if surface_digest is not None:
+            from tenetora.file_transaction import retained_entries
+            keep_after_images = keep_after_images or bool(retained_entries(surface_journal / 'after-images'))
+        if journals_finished and not keep_after_images:
+            try:
+                shutil.rmtree(journal_root)
+            except OSError:
+                print(f'Upgrade recovery snapshots could not be removed: {journal_root}', file=sys.stderr)
+        else:
+            if upgrade_succeeded:
+                try:
+                    (journal_root / 'recovery.json').write_text(json.dumps({
+                        'status': 'completed', 'target_version': release_manifest.get('version'),
+                        'surface_inventory_sha256': surface_digest,
+                    }, indent=2) + '\n', encoding='utf-8')
+                except OSError:
+                    pass
+            print((f"升级事务备份已保留：{journal_root}" if use_chinese()
+                   else f"Upgrade transaction backup retained: {journal_root}"), file=sys.stderr)
 
 
 def apply_upgrade(args: argparse.Namespace) -> int:
+    args.worker_error_emitted = False
+    args.worker_stage = 'upgrade'
     previous_bytecode_setting = os.environ.get("PYTHONDONTWRITEBYTECODE")
     previous_migration_setting = os.environ.get("TENETORA_DEFER_MACHINE_HOME_MIGRATION")
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -1006,8 +1207,12 @@ def apply_upgrade(args: argparse.Namespace) -> int:
         if args.bin_dir is not None:
             lock_roots.append(args.bin_dir.expanduser().absolute().parent)
         with install_transaction_locks(lock_roots):
-            return _apply_upgrade(args)
-    except (RuntimeError, UpgradeTransactionError) as exc:
+            code = _apply_upgrade(args)
+            if code and not args.worker_error_emitted:
+                emit_worker_error(args, MessageIssue('upgrade.worker-stage-failed', parameters={'stage': args.worker_stage}), args.worker_stage, code)
+            return code
+    except (OSError, RuntimeError, UpgradeTransactionError) as exc:
+        emit_worker_error(args, exc, 'upgrade-transaction' if isinstance(exc, UpgradeTransactionError) else args.worker_stage, 1)
         print(f"升级被阻断：{issue_text(exc)}" if use_chinese() else f"Upgrade blocked: {exc}", file=sys.stderr)
         return 1
     finally:
@@ -1065,7 +1270,7 @@ def worker_arguments(args: argparse.Namespace, action: str) -> list[str]:
         forwarded.extend(["--log-file", str(args.log_file)])
     if args.events_jsonl is not None:
         forwarded.extend(["--events-jsonl", str(args.events_jsonl)])
-    if action == "check":
+    if action == "check" or getattr(args, 'json', False):
         forwarded.append("--json")
     return forwarded
 
@@ -1125,6 +1330,15 @@ def render_apply_result(
         } if transaction is not None else None,
         "error_code": "" if result.returncode == 0 else "upgrade-worker-failed",
     }
+    if result.returncode:
+        errors = worker_error_records(result)
+        payload['worker_diagnostics'] = 'recorded' if errors else 'unavailable'
+        if errors:
+            primary = errors[0]
+            payload.update(message_code=primary['code'], message=primary['message'],
+                worker_stage=primary['stage'], worker_errors=errors)
+            if primary.get('parameters'):
+                payload['message_parameters'] = primary['parameters']
     advisories = project_update_advisories(manifest, args)
     if advisories:
         payload["project_update"] = advisories[0]
@@ -1199,7 +1413,7 @@ def render_blocked_result(
     source_kind: str,
     error_code: str,
     exit_code: int = 1,
-    message: str | None = None,
+    message: object | None = None,
     message_code: str | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
@@ -1218,6 +1432,9 @@ def render_blocked_result(
     if message is not None:
         payload["message"] = safe_issue_value(message)
         payload["message_code"] = message_code or issue_code(message)
+        details = issue_record(message)
+        if details.get('parameters'):
+            payload['message_parameters'] = details['parameters']
     return payload
 
 
@@ -1374,6 +1591,8 @@ def render_terminal_current_summary(
     manifest: dict[str, object],
     source_kind: str,
     args: argparse.Namespace,
+    *,
+    package_acquired: bool = False,
 ) -> str:
     version = str(manifest.get("version") or "unknown")
     if use_chinese():
@@ -1384,7 +1603,8 @@ def render_terminal_current_summary(
                 f"发布来源：{source_kind}",
                 f"升级范围：{selected_scope(args) or 'existing'}",
                 f"处理工具：{args.tools}",
-                "未下载 ZIP，未执行安装。若需修复安装面，请使用 tenetora upgrade --force。",
+                ("已获取发布包；其他升级进程已激活该版本，本次未重复安装。"
+                 if package_acquired else "未下载 ZIP，未执行安装。若需修复安装面，请使用 tenetora upgrade --force。"),
         ]
         lines.append("下一步：tenetora doctor")
         return "\n".join(lines)
@@ -1395,7 +1615,8 @@ def render_terminal_current_summary(
             f"Release source: {source_kind}",
             f"Upgrade scope: {selected_scope(args) or 'existing'}",
             f"Tools: {args.tools}",
-            "ZIP download and installation were skipped. Use tenetora upgrade --force to repair installation surfaces.",
+            ("The release package was acquired; another upgrade already activated it, so installation was skipped."
+             if package_acquired else "ZIP download and installation were skipped. Use tenetora upgrade --force to repair installation surfaces."),
     ]
     lines.append("Next: tenetora doctor")
     return "\n".join(lines)
@@ -1416,7 +1637,7 @@ def ensure_release_direction(manifest: dict[str, object]) -> bool:
             pass
     current = version_key(current_version)
     if target < current:
-        raise UpgradeContractError("release version is older than the installed version")
+        raise UpgradeContractError(MessageIssue('upgrade.release-version-is-older-than-the-installed-version'))
     return target > current
 
 
@@ -1433,6 +1654,23 @@ def installed_release_channel() -> str:
         except (OSError, UnicodeError, json.JSONDecodeError, UpgradeContractError):
             pass
     return "preview" if str(__version__).endswith("-preview") else "stable"
+
+
+def _with_preview_fallback(args: argparse.Namespace, request):
+    """Promote an implicit preview selection only on confirmed pointer absence."""
+    try:
+        return request()
+    except PreviewUnavailableError:
+        if (args.channel != "preview" or getattr(args, "channel_explicit", True)
+                or args.zip_file is not None or args.source_dir is not None):
+            raise
+        args.channel = "stable"
+        if not args.json:
+            print("当前没有在发预览版，改为检查正式渠道。" if use_chinese()
+                  else "No preview release is active; checking the stable channel.", file=sys.stderr, flush=True)
+        # Retry only the fetch, keeping its remote-source context. Re-entering
+        # the controller could incorrectly select a developer checkout instead.
+        return request()
 
 
 def ensure_requested_channel(manifest: dict[str, object], channel: str) -> None:
@@ -1500,14 +1738,16 @@ def run_release_controller(args: argparse.Namespace) -> int:
                     prevalidated_manifest = local_release_manifest(source_override)
                     prevalidated_source_kind = "developer-source"
                 else:
-                    prevalidated_manifest, prevalidated_source_kind = inspect_release_manifest(
-                        workdir,
-                        manifest_url=args.manifest_url,
-                        zip_url=args.zip_url,
-                        mirror_url=args.mirror_url,
-                        zip_file=args.zip_file,
-                        expected_sha256=args.sha256,
-                        channel=args.channel,
+                    prevalidated_manifest, prevalidated_source_kind = _with_preview_fallback(
+                        args, lambda: inspect_release_manifest(
+                            workdir,
+                            manifest_url=args.manifest_url,
+                            zip_url=args.zip_url,
+                            mirror_url=args.mirror_url,
+                            zip_file=args.zip_file,
+                            expected_sha256=args.sha256,
+                            channel=args.channel,
+                        ),
                     )
                 observed_manifest = prevalidated_manifest
                 observed_source_kind = prevalidated_source_kind or ""
@@ -1527,11 +1767,12 @@ def run_release_controller(args: argparse.Namespace) -> int:
                 "zip_file": args.zip_file,
                 "expected_sha256": args.sha256,
                 "source_dir": source_override,
-                "channel": args.channel,
             }
             if prevalidated_manifest is not None and prevalidated_source_kind == "release":
                 acquire_kwargs["prevalidated_manifest"] = prevalidated_manifest
-            source_root, manifest, source_kind = acquire_release(workdir, **acquire_kwargs)
+            source_root, manifest, source_kind = _with_preview_fallback(
+                args, lambda: acquire_release(workdir, channel=args.channel, **acquire_kwargs)
+            )
             observed_manifest = manifest
             observed_source_kind = source_kind
             ensure_requested_channel(manifest, args.channel)
@@ -1647,9 +1888,9 @@ def run_release_controller(args: argparse.Namespace) -> int:
                     persist_preflight_failure(
                         args,
                         machine,
-                        str(machine.get("error") or "machine-wide upgrade preflight is blocked"),
+                        (machine.get("error") or MessageIssue('upgrade.machine-wide-upgrade-preflight-is-blocked')),
                     )
-                    machine_message = str(machine.get("error") or "machine-wide upgrade preflight is blocked")
+                    machine_message = (machine.get("error") or MessageIssue('upgrade.machine-wide-upgrade-preflight-is-blocked'))
                     print(render_json(render_blocked_result(
                         manifest,
                         source_kind,
@@ -1660,7 +1901,7 @@ def run_release_controller(args: argparse.Namespace) -> int:
                     print_preflight_failure(
                         args,
                         machine,
-                        str(machine.get("error") or "machine-wide upgrade preflight is blocked"),
+                        (machine.get("error") or MessageIssue('upgrade.machine-wide-upgrade-preflight-is-blocked')),
                     )
                     print(
                         render_terminal_apply_summary(
@@ -1702,6 +1943,13 @@ def run_release_controller(args: argparse.Namespace) -> int:
             if args.bin_dir is not None:
                 lock_roots.append(args.bin_dir.expanduser().absolute().parent)
             with install_transaction_locks(lock_roots):
+                newer = ensure_release_direction(manifest)
+                if not newer and not args.force and not args.bootstrap_bridge:
+                    if args.json:
+                        print(render_json(render_current_result(manifest, source_kind, args)))
+                    else:
+                        print(render_terminal_current_summary(manifest, source_kind, args, package_acquired=True))
+                    return 0
                 release_root, _changed = stage_release(source_root, machine_home(), manifest)
                 if not args.json:
                     print(
@@ -1726,13 +1974,13 @@ def run_release_controller(args: argparse.Namespace) -> int:
                 return result.returncode
     except (OSError, UpgradeAcquireError, UpgradeContractError, ReleaseStoreError) as exc:
         cache_update_failure(source_override, args.zip_file)
-        message_code = issue_code(redact(str(exc)))
+        message_code = issue_code(exc)
         if args.json:
             print(render_json(render_blocked_result(
                 observed_manifest,
                 observed_source_kind,
                 "acquisition-or-contract-failed",
-                message=redact(str(exc)),
+                message=exc,
                 message_code=message_code,
             )))
         else:
@@ -1772,6 +2020,9 @@ def render_check(payload: dict[str, object]) -> str:
     issues = payload.get("issues")
     if isinstance(issues, list) and issues:
         lines.append("问题：" if use_chinese() else "Issues:")
+        details = payload.get('issue_details')
+        if isinstance(details, list) and len(details) == len(issues):
+            issues = [detail if message_issue(detail) is not None else issue for issue, detail in zip(issues, details)]
         lines.extend(f"- {issue_text(issue)}" for issue in issues)
     machine = payload.get("machine")
     if isinstance(machine, dict):
@@ -1858,7 +2109,8 @@ def main(argv: list[str] | None = None) -> int:
         "--channel",
         choices=("stable", "preview"),
         default=None,
-        help="选择 stable 或 preview；默认沿用当前安装渠道。" if use_chinese() else "Select stable or preview; defaults to the installed channel.",
+        help="选择 stable 或 preview；默认预览渠道无在发版本时转 stable，stable 不自动转 preview。" if use_chinese()
+        else "Select stable or preview; an implicit preview selection uses stable when no preview is active. Stable never switches to preview automatically.",
     )
     parser.add_argument("--log-file", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--events-jsonl", type=Path, default=None, help=argparse.SUPPRESS)

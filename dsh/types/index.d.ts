@@ -34,7 +34,7 @@ export interface TenetoraDshConfig {
   maxSectionChars?: number
   /** Ask `tenetora guard` before git commit/push. Default `true`. */
   guardGit?: boolean
-  /** Require fresh covering evidence for verification-impacting staged paths; documentation-only commits pass. Default `false`. */
+  /** Require observed execution receipts covering verification-impacting staged paths; documentation-only commits pass. Default `false`. */
   strictEvidence?: boolean
   /** Protect registered local-environment paths. Default `true`. */
   guardLocalEnv?: boolean

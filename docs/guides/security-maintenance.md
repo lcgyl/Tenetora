@@ -190,6 +190,24 @@ tenetora hooks --install --path .
 
 Existing user hooks are backed up and chained. Declining reminders never removes the explicit install command.
 
+## Installation and Cache Maintenance
+
+The following maintenance improvements are available in unreleased `main`, not stable `0.3.40` or preview `0.3.40.018-preview`. Inspect the first three plans before explicitly applying uninstall.
+
+```bash
+tenetora cleanup --json
+tenetora cleanup --cache --path . --dry-run --json
+tenetora uninstall --path . --purge --json
+
+tenetora uninstall --path . --purge --include-host-integrations --apply --yes
+```
+
+Release cleanup retains the active release and the newest stable and preview. Cache inventory reports bounded sizes, registered Git worktrees, dirty work, known references and reasons to preserve resources. Incomplete measurements are lower bounds. Candidates require review; `cleanup --cache` never deletes them, and combining it with `--apply` is rejected.
+
+Machine uninstall authenticates runtime files, launchers and native payloads, restores original Git hooks for registered projects and the explicit project, and removes byte-exact POSIX PATH blocks. Home-dependent adapters, Codex project fallbacks, skill links and native registrations require `--include-host-integrations`. Third-party hooks, independent skill/plugin copies, project `.tenetora` content and native plugin user data remain intact. Unavailable dependency helpers, unknown root entries, redirected machine objects, modified runtime/plugin payloads, changed plans and unresolved project-scoped native references block removal. `--purge` also removes machine state, logs and backups; omit it to retain audit and recovery data. A ZCode cache placed inside the machine home must be relocated first; ordinary independent ZCode caches remain installed.
+
+Local file edits have rollback with concurrent-change protection. Native host managers and DSH cleanup are separate operations: partial host cleanup can occur before a later failure. Such failures preserve the machine home and report that the host state needs inspection and a retry; they do not claim full rollback. Historical Windows PATH segments are retained when ownership cannot be proven. Native Windows PATH and host-manager behavior require Windows verification.
+
 ## Maintenance Acceptance
 
 ```bash

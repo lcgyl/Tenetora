@@ -258,17 +258,23 @@ def _backup_is_safe(backup: Path, name: str, root: Path, journal: Path) -> bool:
 
 
 @contextmanager
-def runtime_operation_lock(bin_dir: Path) -> Iterator[None]:
+def runtime_operation_lock(bin_dir: Path, *, outside_root: bool = False) -> Iterator[None]:
     root = validate_unredirected_path(bin_dir, label="managed runtime bin directory").parent
     lock_path = root / ".managed-runtime.lock"
+    fallback = Path(tempfile.gettempdir()) / (
+        "tenetora-runtime-" + hashlib.sha256(str(root).encode("utf-8")).hexdigest() + ".lock"
+    )
+    if outside_root:
+        # Moving or removing the managed home with an open lock file inside it
+        # fails on Windows; uninstall therefore locks in the temp directory.
+        with locked_file(fallback):
+            yield
+        return
     primary_stack = ExitStack()
     try:
         primary_stack.enter_context(locked_file(lock_path))
     except OSError:
         primary_stack.close()
-        fallback = Path(tempfile.gettempdir()) / (
-            "tenetora-runtime-" + hashlib.sha256(str(root).encode("utf-8")).hexdigest() + ".lock"
-        )
         with locked_file(fallback):
             yield
     else:
