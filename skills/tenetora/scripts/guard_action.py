@@ -24,10 +24,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from governance_trail import append_event, iter_events  # noqa: E402
+from governance_trail import append_event, iter_events, load_retained_trail, require_writable_history, TrailWriteError  # noqa: E402
 from claim_evidence import (VERIFICATION_COMMAND_HASH_VERSION, CLAIM_PROOF_PATTERN, claim_worktree_freshness,
                             event_verification_scopes, normalize_verification_command,
-                            verification_command_hash)  # noqa: E402
+                            verification_command_hash, superseding_failure, claim_handoff_problem)  # noqa: E402
 import alignment_state  # noqa: E402
 import change_impact  # noqa: E402
 import execution_context  # noqa: E402
@@ -35,21 +35,23 @@ from local_env import load_local_env_paths  # noqa: E402
 import repository_units  # noqa: E402
 import review_subject  # noqa: E402
 import verification_plan  # noqa: E402
+from staged_evidence import staged_subject_check,observed_index_check  # noqa: E402
 from run_all_guardrails import (  # noqa: E402
     LOCAL_PATH_PATTERN,
     check_local_path_scan,
     check_secret_scan,
     run_python_checks,
 )
-from path_security import harness_missing_message, validate_existing_project_path
+from path_security import harness_missing_message, validate_existing_project_path, ensure_unredirected_directory, validate_unredirected_file_path
 from worktree_fingerprint import (  # noqa: E402
     WORKTREE_ENTRIES_VERSION,
     WORKTREE_FINGERPRINT_VERSION,
     git_state_entries,
-    git_state_fingerprint,
     normalize_scopes,
 )
 from security_patterns import HIGH_CONFIDENCE_SECRET_PATTERN
+from completion_protocol import (PROTOCOL as COMPLETION_PROTOCOL, commit as commit_completion,  # noqa: E402
+    prepared_candidate, published as completion_published, resume_candidate, retained_binding)  # noqa: E402
 
 
 ALIGNMENT_PROOF_PATTERN = re.compile(r"^ah-align-[0-9a-f]{32}$")
@@ -114,9 +116,15 @@ class ClaimFields(TypedDict, total=False):
     git_state_fingerprint_version: int | None
     git_state_fingerprint: str | None
     git_state_entries_version: int | None
-    git_state_entries: list[dict[str, Any]] | None
+    git_state_entries: dict[str, str] | None
     attribution: str
     attribution_warning: str | None
+    execution_assurance: str
+    execution_receipt: str
+    execution_receipt_sha256: str
+    execution_run_id: str
+    execution_origin_event_id: str
+    execution_origin_sequence: int
 
 
 def existing_project_path(raw: str) -> Path:
@@ -222,6 +230,8 @@ def parser() -> argparse.ArgumentParser:
         help="Git worktree to inspect for --action commit. Defaults to --path; linked worktrees may share governance, while independent nested repositories require their own .tenetora.",
     )
     command_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    command_parser.add_argument('--resume-completion', action='store_true',
+        help='Recover the same explicitly identified completion candidate; never create a new proof for a closed goal.')
     command_parser.add_argument("--text", action="append", default=[], help="Untrusted text for --action external-input.")
     command_parser.add_argument("--file", action="append", type=existing_file, default=[], help="Untrusted file for --action external-input.")
     command_parser.add_argument("--stdin", action="store_true", help="Read untrusted text from stdin for --action external-input.")
@@ -252,12 +262,13 @@ def parser() -> argparse.ArgumentParser:
             "documentation/release-metadata-only commits pass with the targeted checks."
         ),
     )
+    command_parser.add_argument("--execution-receipt", help="Observed verify-run or feature-check receipt; immutable execution evidence is validated before use.")
     command_parser.add_argument("--verification-command", help="Verification command that was run before making a claim.")
     command_parser.add_argument(
         "--verification-status",
         choices=("passed", "failed", "skipped"),
-        default="passed",
-        help="Observed verification result for --action claim.",
+        default=None,
+        help="Explicit declared verification result; observed receipts provide their actual result.",
     )
     command_parser.add_argument(
         "--claim-kind",
@@ -545,7 +556,7 @@ def staged_changes_check(root: Path) -> tuple[dict[str, Any], list[str]]:
 
 
 def staged_diff_check(root: Path) -> dict[str, Any]:
-    result = run_git(root, "diff", "--cached", "--check")
+    result = run_git(root, "-c", "core.whitespace=cr-at-eol", "diff", "--cached", "--check")
     passed = result.returncode == 0
     detail = (result.stdout or result.stderr).strip()
     return check_result(
@@ -558,11 +569,14 @@ def staged_diff_check(root: Path) -> dict[str, Any]:
 
 
 def is_sensitive_staged_path(raw: str, protected_paths: set[str] | None = None) -> bool:
-    path = Path(raw)
+    normalized = raw.replace('\\', '/')
+    while normalized.startswith('./'):
+        normalized = normalized[2:]
+    path = Path(normalized)
     name = path.name.lower()
     if name in ALLOWED_ENV_FILE_NAMES:
         return False
-    normalized = path.as_posix().lstrip("./")
+    normalized = path.as_posix()
     if (
         any(normalized == directory or normalized.startswith(directory + "/") for directory in DEFAULT_LOCAL_ENV_DIRS)
         or name in DEFAULT_LOCAL_ENV_NAMES
@@ -1012,6 +1026,13 @@ def claim_event_problem(root: Path, event: dict[str, Any]) -> tuple[str | None, 
     claim_proof = str(event.get("claim_proof") or "")
     if not CLAIM_PROOF_PATTERN.fullmatch(claim_proof):
         return "evidence-proof-missing", {"message": "A covering passed claim has no valid claim proof."}
+    history = load_retained_trail(root)
+    if history.get('invalid') or history.get('conflicts'):
+        return 'evidence-history-invalid', {'message':'The verification history is invalid or conflicting.'}
+    if superseding_failure(history['events'],event):
+        return 'evidence-superseded', {'message':'A newer overlapping failed or blocked execution invalidates this evidence.'}
+    if claim_handoff_problem(root,event):
+        return 'evidence-authorization-invalid', {'message':'The claim no longer has valid retained or durable authorization.'}
     comparison = claim_worktree_freshness(root, event)
     if comparison["status"] != "pass":
         code = "evidence-unavailable" if comparison["status"] == "unavailable" else "evidence-stale"
@@ -1033,6 +1054,7 @@ def evidence_freshness_check(
     git_root: Path,
     staged: list[str] | None,
     plan: dict[str, Any] | None = None,
+    *, require_observed: bool = False,
 ) -> dict[str, Any]:
     events = latest_project_claim_events(root)
     if not events:
@@ -1077,8 +1099,27 @@ def evidence_freshness_check(
             "uncovered_paths": uncovered,
         }
     evidence: list[dict[str, Any]] = []
+    observed_subjects = []
     for event in selected:
+        from execution_receipts import claim_execution_problem
+        execution_problem = claim_execution_problem(root, event, required=require_observed)
+        if execution_problem:
+            return {'name':'evidence-freshness','status':'warn','code':execution_problem,
+                'message':'Strict evidence requires a valid actual execution receipt covering this source.'}
         problem, details = claim_event_problem(root, event)
+        if problem is None and require_observed:
+            from execution_receipts import read_execution
+            try:observed=read_execution(root,event['execution_receipt'],event['execution_receipt_sha256'])['receipt']
+            except (OSError,RuntimeError,ValueError,TypeError):
+                return {'name':'evidence-freshness','status':'warn','code':'execution-receipt-invalid',
+                    'message':'The observed execution evidence changed during verification.'}
+            selected_paths=[path for path in staged_paths_for_project
+                if (scopes := event_verification_scopes(event)) is not None and scope_covers_path(scopes,path)]
+            if any(path not in observed['source_entries'] for path in selected_paths):
+                return {'name':'evidence-freshness','status':'warn','code':'observed-source-scope-uncovered',
+                    'message':'The actual observed source inventory does not cover the staged paths.'}
+            details['observed_index_modes']={path:observed['index_modes'].get(path,'100644') for path in selected_paths}
+            observed_subjects.append(observed)
         if problem is not None:
             if (
                 plan is not None
@@ -1112,6 +1153,7 @@ def evidence_freshness_check(
         "message": "Every staged path is covered by a fresh verification claim.",
         "claim_proofs": [item["claim_proof"] for item in evidence],
         "evidence": evidence,
+        "_observed_subjects": observed_subjects,
         "git_state_fingerprint_version": WORKTREE_FINGERPRINT_VERSION,
     }
 
@@ -1197,14 +1239,25 @@ def guard_commit(args: argparse.Namespace) -> dict[str, Any]:
                     "code": "strict-evidence-plan-unavailable",
                     "message": "Strict evidence mode requires a readable verification plan.",
                 }
-            elif paths and not project_paths:
+            elif paths and (not project_paths or any(value is None for value in project_paths.values())):
                 strict_failure = {
                     "code": "strict-evidence-scope-unavailable",
                     "message": "Strict evidence mode cannot classify the staged paths against the governed project.",
                 }
             elif impact_paths:
-                impact_check = evidence_freshness_check(root, git_root, impact_paths, plan)
-                if impact_check.get("status") != "pass":
+                impact_check = evidence_freshness_check(root, git_root, impact_paths, plan, require_observed=True)
+                modes={}
+                for item in impact_check.get('evidence',[]):modes.update(item.get('observed_index_modes',{}))
+                modes={git_path:modes[project_paths[git_path]] for git_path in impact_paths if project_paths.get(git_path) in modes}
+                subject_check = staged_subject_check(git_root, impact_paths, verified_index_modes=modes)
+                checks.append({'name': 'staged-verification-subject', **subject_check})
+                snapshot_check=observed_index_check(git_root,impact_check.get('_observed_subjects',[]))
+                checks.append({'name':'staged-observed-snapshot',**snapshot_check})
+                if subject_check['status']=='pass' and snapshot_check['status']!='pass':subject_check=snapshot_check
+                if subject_check['status'] != 'pass':
+                    strict_failure = {'code': 'strict-evidence-index-mismatch',
+                        'message': subject_check['message'], 'blocking_paths': subject_check['mismatched_paths']}
+                elif impact_check.get("status") != "pass":
                     strict_failure = {
                         "code": "strict-evidence-required",
                         "message": (
@@ -1586,6 +1639,18 @@ def claim_session_binding(
         handoff = alignment_state.load_handoff(args.path, session_id)
         binding = handoff or session
         binding_kind = "handoff" if handoff is not None else "session"
+        if binding is None and allow_closed:
+            retained = retained_binding(args.path, session_id)
+            if retained is not None:
+                requested_conversation = alignment_state.requested_conversation_id(args)
+                requested_tool = alignment_state.requested_tool(args)
+                requested_continuity = alignment_state.requested_conversation_continuity_id(args)
+                if (retained['owner_id'] != owner_id
+                    or requested_conversation and retained['conversation_id'] != requested_conversation
+                    or requested_tool != 'unknown' and retained['tool'] != requested_tool
+                    or requested_continuity and retained['conversation_continuity_id'] != requested_continuity):
+                    raise alignment_state.AlignmentStateError('Durable completion identity mismatch.')
+                return retained, None
         if binding is None:
             requested_conversation = alignment_state.requested_conversation_id(args, owner_id)
             requested_tool = alignment_state.requested_tool(args)
@@ -1642,7 +1707,7 @@ def claim_session_binding(
             raise alignment_state.AlignmentStateError("alignment session has no valid goal fingerprint")
         if not allow_closed and lifecycle is not None and lifecycle.get("status") == "open":
             alignment_state.touch_lifecycle(args.path, session_id, owner_id)
-    except alignment_state.AlignmentStateError as exc:
+    except (alignment_state.AlignmentStateError, OSError, RuntimeError, ValueError) as exc:
         return None, {
             "name": "claim-identity",
             "status": "fail",
@@ -1794,6 +1859,22 @@ def guard_claim(args: argparse.Namespace) -> dict[str, Any]:
     prepare_guard_identity(args)
     if args.check_proof_only:
         return guard_claim_proof_check(args)
+    observed = None
+    if getattr(args, 'execution_receipt', None):
+        from execution_receipts import read_execution
+        try:
+            observed = read_execution(args.path, args.execution_receipt)
+            receipt = observed['receipt']
+            if args.verification_command and verification_command_hash(args.verification_command) != receipt['command_hash']:
+                return claim_failure('execution-command-mismatch', 'The observed receipt does not cover the declared command.')
+            if args.verification_scope and list(normalize_scopes(args.verification_scope)) != receipt['verification_scope']:
+                return claim_failure('execution-scope-mismatch', 'The observed receipt does not cover the requested scope.')
+            args.verification_scope = receipt['verification_scope']
+            if args.verification_status not in (None, 'passed'):
+                return claim_failure('execution-status-mismatch', 'Declared status conflicts with the actual observed result.')
+            args.verification_status = 'passed'
+        except (OSError, RuntimeError, ValueError, TypeError) as exc:
+            return claim_failure('execution-receipt-invalid', str(exc))
     try:
         verification_scope = list(normalize_scopes(args.verification_scope))
     except ValueError as exc:
@@ -1806,13 +1887,15 @@ def guard_claim(args: argparse.Namespace) -> dict[str, Any]:
             "claim-identity-incomplete",
             "Claim identity requires both --session-id and --owner-id, or neither.",
         )
-    if not args.verification_command:
+    if not args.verification_command and observed is None:
         return claim_failure(
             "verification-evidence-missing",
             "A verification claim needs the command that was actually run.",
             recommendation="Pass --verification-command '<command>' and --verification-status passed after the command completes.",
         )
 
+    if args.verification_status is None:
+        return claim_failure('verification-status-required', 'Declare the result explicitly or provide an observed execution receipt.')
     claim_kind = args.claim_kind or default_claim_kind(args.verification_status)
     if claim_kind == "completion":
         resolution_failure = identity_resolution_failure(args)
@@ -1843,7 +1926,7 @@ def guard_claim(args: argparse.Namespace) -> dict[str, Any]:
         args,
         session_id,
         owner_id,
-        allow_closed=claim_kind != "completion",
+        allow_closed=claim_kind != "completion" or getattr(args, "resume_completion", False),
     )
     if binding_error is not None:
         return {
@@ -1900,8 +1983,10 @@ def guard_claim(args: argparse.Namespace) -> dict[str, Any]:
     completion_failure = completion_gate(binding, claim_kind, check_name="verification-claim")
     if completion_failure is not None:
         return {"version": 1, "action": "claim", "status": "fail", "checks": [completion_failure]}
-    state_fingerprint = git_state_fingerprint(args.path, verification_scope)
-    state_entries = git_state_entries(args.path, verification_scope) if state_fingerprint is not None else None
+    state_entries = git_state_entries(args.path, verification_scope,
+        known_paths=observed['receipt']['source_entries'] if observed else ())
+    from worktree_fingerprint import snapshot_fingerprint
+    state_fingerprint = snapshot_fingerprint(state_entries,verification_scope) if state_entries is not None else None
     if claim_kind == "completion" and state_fingerprint is None:
         return claim_failure(
             "claim-git-state-unavailable",
@@ -1921,7 +2006,7 @@ def guard_claim(args: argparse.Namespace) -> dict[str, Any]:
         provider = provider or str(execution_attempt.get("provider") or "")
         model = model or str(execution_attempt.get("model") or "")
         tool = str(execution_attempt.get("tool") or tool)
-    command_hash = verification_command_hash(args.verification_command)
+    command_hash = observed['receipt']['command_hash'] if observed else verification_command_hash(args.verification_command)
     claim_proof = (
         f"ah-claim-{secrets.token_hex(16)}"
         if args.verification_status == "passed" and claim_kind in {"completion", "partial-verification"}
@@ -1944,7 +2029,7 @@ def guard_claim(args: argparse.Namespace) -> dict[str, Any]:
         "verification_status": args.verification_status,
         "verification_command_hash": command_hash,
         "verification_command_hash_version": VERIFICATION_COMMAND_HASH_VERSION,
-        "verification_command_length": len(normalize_verification_command(args.verification_command)),
+        "verification_command_length": len(normalize_verification_command(args.verification_command)) if args.verification_command else 0,
         "verification_scope": verification_scope,
         "claim_proof": claim_proof,
         "session_id": session_id,
@@ -1967,7 +2052,26 @@ def guard_claim(args: argparse.Namespace) -> dict[str, Any]:
         "attribution": attribution,
         "attribution_warning": attribution_warning["code"] if attribution_warning else None,
     }
-    return build_claim_payload(status=status, fields=fields, attribution_check=attribution_warning)
+    if observed:
+        fields.update({key:value for key,value in observed.items() if key != 'receipt'})
+    else:
+        fields['execution_assurance'] = 'declaration'
+    payload = build_claim_payload(status=status, fields=fields, attribution_check=attribution_warning)
+    if observed:
+        history = load_retained_trail(args.path)
+        origin = next((event for event in history['events'] if event.get('event_id') == observed['execution_origin_event_id']), None)
+        if origin is None or superseding_failure(history['events'], origin):
+            return claim_failure('execution-superseded', 'A newer verification invalidated this observed run; execute a fresh check.')
+    if claim_kind == 'completion':
+        candidate, problem = resume_candidate(args.path, payload, explicit=getattr(args, "resume_completion", False))
+        if problem:
+            return claim_failure('claim-completion-recovery-invalid', problem)
+        if candidate:
+            payload['claim_proof'] = candidate
+            payload['checks'][0]['claim_proof'] = candidate
+            payload['completion_recovered'] = True
+        payload['completion_protocol'] = COMPLETION_PROTOCOL
+    return payload
 
 
 def latest_claim_event(
@@ -1982,7 +2086,10 @@ def latest_claim_event(
     handoff_hash: str = "",
     verification_scope: tuple[str, ...] = (),
 ) -> dict[str, Any] | None:
-    for event in reversed(list(iter_events(root))):
+    history = load_retained_trail(root)
+    if history.get('invalid') or history.get('conflicts'):
+        return None
+    for event in reversed(history['events']):
         if not isinstance(event, dict) or event.get("type") != "verification-claim":
             continue
         event_scope = event_verification_scopes(event)
@@ -2014,6 +2121,17 @@ def latest_claim_event(
 
 
 def guard_claim_proof_check(args: argparse.Namespace) -> dict[str, Any]:
+    expected_execution=None
+    if getattr(args,'execution_receipt',None):
+        from execution_receipts import read_execution
+        try:
+            expected_execution=read_execution(args.path,args.execution_receipt)
+            scopes=expected_execution['receipt']['verification_scope']
+            if args.verification_scope and list(normalize_scopes(args.verification_scope))!=scopes:
+                return claim_failure('execution-scope-mismatch','The observed run does not cover the requested proof scope.')
+            args.verification_scope=scopes
+        except (OSError,RuntimeError,ValueError,TypeError) as exc:
+            return claim_failure('execution-receipt-invalid',str(exc))
     try:
         verification_scope = normalize_scopes(args.verification_scope)
     except ValueError as exc:
@@ -2040,7 +2158,7 @@ def guard_claim_proof_check(args: argparse.Namespace) -> dict[str, Any]:
             "checks": [check],
         }
     expected_command = args.expected_verification_command or args.verification_command
-    if args.claim_kind == "completion" and not expected_command:
+    if args.claim_kind == "completion" and not expected_command and expected_execution is None:
         return {
             "version": 1,
             "action": "claim",
@@ -2163,7 +2281,12 @@ def guard_claim_proof_check(args: argparse.Namespace) -> dict[str, Any]:
             "status": "fail",
             "checks": [kind_failure] if kind_failure else [],
         }
-    expected_hash = verification_command_hash(expected_command) if expected_command else None
+    if event and expected_execution:
+        from execution_receipts import same_execution
+        if not same_execution(event,expected_execution):
+            return claim_failure('execution-reference-mismatch','The latest claim is bound to a different observed run.')
+    expected_hash = verification_command_hash(expected_command) if expected_command else (
+        expected_execution['receipt']['command_hash'] if expected_execution else None)
     if event and expected_hash and event.get("verification_command_hash") != expected_hash:
         return {
             "version": 1,
@@ -2196,6 +2319,11 @@ def guard_claim_proof_check(args: argparse.Namespace) -> dict[str, Any]:
                 }
             ],
         }
+    history = load_retained_trail(args.path)
+    if event and (history.get('invalid') or history.get('conflicts') or superseding_failure(history['events'], event)):
+        return claim_failure('claim-superseded', 'A newer overlapping failed verification or invalid history prevents proof reuse.')
+    if event and claim_handoff_problem(args.path, event):
+        return claim_failure('claim-handoff-invalid', 'The claim has no valid retained handoff or durable completion authorization.')
     freshness = claim_worktree_freshness(args.path, event) if event else None
     if freshness and freshness["status"] == "fail":
         return {
@@ -2221,6 +2349,8 @@ def guard_claim_proof_check(args: argparse.Namespace) -> dict[str, Any]:
             "message": "Latest verification claim has a valid Tenetora claim proof.",
             "claim_proof": claim_proof,
             "claim_kind": event_kind,
+            "execution_assurance": event.get("execution_assurance", "declaration"),
+            **{key:event[key] for key in ("execution_receipt","execution_receipt_sha256","execution_run_id","execution_origin_event_id","execution_origin_sequence") if key in event},
             "verification_command_hash": event.get("verification_command_hash"),
         "verification_command_hash_version": event.get("verification_command_hash_version"),
             "verification_scope": list(verification_scope),
@@ -2233,6 +2363,8 @@ def guard_claim_proof_check(args: argparse.Namespace) -> dict[str, Any]:
             "checks": [check],
             "claim_proof": claim_proof,
             "claim_kind": event_kind,
+            "execution_assurance": event.get("execution_assurance", "declaration"),
+            **{key:event[key] for key in ("execution_receipt","execution_receipt_sha256","execution_run_id","execution_origin_event_id","execution_origin_sequence") if key in event},
             "verification_command_hash": event.get("verification_command_hash"),
         "verification_command_hash_version": event.get("verification_command_hash_version"),
             "verification_scope": list(verification_scope),
@@ -2573,11 +2705,11 @@ def guard_external_input(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def record(root: Path, payload: dict[str, Any]) -> None:
+def record(root: Path, payload: dict[str, Any]) -> list[dict[str, str]]:
     action = str(payload.get("action", "unknown"))
     status = str(payload.get("status", "unknown"))
     if action == "claim" and (payload.get("mode") == "check-proof-only" or not payload.get("claim_kind")):
-        return
+        return []
     if action == "alignment":
         event = {
             "type": "alignment-guard",
@@ -2599,6 +2731,7 @@ def record(root: Path, payload: dict[str, Any]) -> None:
             "action": "claim",
             "status": status,
             "claim_kind": payload.get("claim_kind"),
+            **{key: payload[key] for key in ('completion_protocol', 'pending_claim_proof', 'completion_legacy_source_sha256', 'execution_assurance', 'execution_receipt', 'execution_receipt_sha256', 'execution_run_id', 'execution_origin_event_id', 'execution_origin_sequence') if key in payload},
             "verification_status": payload.get("verification_status"),
             "verification_command_hash": payload.get("verification_command_hash"),
             "verification_command_hash_version": payload.get("verification_command_hash_version"),
@@ -2663,7 +2796,12 @@ def record(root: Path, payload: dict[str, Any]) -> None:
                     "git_identity": payload.get("git_identity"),
                 }
             )
-    append_event(root, event)
+    if event.get('completion_protocol') == COMPLETION_PROTOCOL and event.get('status') == 'pass':
+        # Older readers ignore unknown fields. Keep the wire status pending
+        # so they cannot accept an uncommitted candidate as legacy evidence.
+        event.update(status='pending', verification_status='pending')
+    recorded = append_event(root, event)
+    return recorded.get('_write_warnings', [])
 
 
 def print_text(payload: dict[str, Any]) -> None:
@@ -2695,8 +2833,7 @@ def print_text(payload: dict[str, Any]) -> None:
         )
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = parser().parse_args(argv)
+def run_action(args: argparse.Namespace) -> dict[str, Any]:
     root: Path = args.path
     if args.action == "commit" and not (root / ".tenetora").is_dir():
         resolved = resolve_worktree_governance_root(root, args.git_path or root)
@@ -2710,11 +2847,13 @@ def main(argv: list[str] | None = None) -> int:
             "status": "error",
             "message": harness_missing_message(root),
         }
-        if args.json:
-            print(json.dumps(payload, ensure_ascii=False, indent=2))
-        else:
-            print(payload["message"], file=sys.stderr)
-        return 2
+        return payload
+    if not args.check_proof_only:
+        try:
+            require_writable_history(root)
+        except TrailWriteError as exc:
+            payload = {**exc.payload(), 'action': args.action}
+            return payload
     if args.action == "commit":
         payload = guard_commit(args)
     elif args.action == "rules":
@@ -2731,37 +2870,92 @@ def main(argv: list[str] | None = None) -> int:
     # as well as in the composite commit/rules builders.
     if isinstance(payload.get("checks"), list):
         add_check_severity(payload["checks"])
-    if (
-        args.action == "claim"
-        and payload.get("mode") != "check-proof-only"
-        and payload.get("status") == "pass"
-        and payload.get("claim_kind") == "completion"
-        and payload.get("claim_proof")
-        and payload.get("session_id")
-        and payload.get("owner_id")
-    ):
-        try:
-            closed = alignment_state.mark_completed(
-                root,
-                str(payload["session_id"]),
-                str(payload["owner_id"]),
-                str(payload["claim_proof"]),
-            )
-            if closed is None:
-                raise alignment_state.AlignmentStateError("no open lifecycle record exists for this handoff")
-            payload["alignment_lifecycle_status"] = "completed"
-        except alignment_state.AlignmentStateError as exc:
-            payload = claim_failure(
-                "claim-alignment-close-failed",
-                f"Verification passed, but the alignment goal could not be closed: {exc}",
-                recommendation="Keep the verification evidence and explicitly inspect the alignment lifecycle before retrying.",
-            )
-    record(root, payload)
+    completion = (args.action == 'claim' and payload.get('mode') != 'check-proof-only'
+        and payload.get('status') == 'pass' and payload.get('claim_kind') == 'completion'
+        and payload.get('claim_proof') and payload.get('session_id') and payload.get('owner_id'))
+    if completion:
+        return finalize_completion(root, payload)
+    try:
+        add_write_warnings(payload, record(root, payload))
+    except TrailWriteError as exc:
+        return {**exc.payload(), 'action': args.action}
+    except OSError as exc:
+        return claim_failure('claim-record-failed', f'Verification evidence could not be recorded: {exc}')
+    return payload
+
+
+def add_write_warnings(payload: dict[str, Any], warnings: list[dict[str, str]] | None) -> None:
+    if warnings:
+        payload.setdefault('write_warnings', []).extend(warnings)
+        payload.setdefault('checks', []).extend({'name': 'evidence-write-cleanup', 'status': 'warn',
+            'severity': 'advisory', **warning} for warning in warnings)
+
+
+def finalize_completion(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    proof = payload['claim_proof']
+    try:
+        if prepared_candidate(root, payload) is None:
+            pending = {**payload, 'status': 'pending', 'verification_status': 'pending',
+                'claim_proof': None, 'pending_claim_proof': proof}
+            add_write_warnings(payload, record(root, pending))
+            add_write_warnings(payload, record(root, payload))
+    except TrailWriteError as exc:
+        return {**exc.payload(), 'action': 'claim', 'pending_claim_proof': proof,
+            'completion_recovery_required': True}
+    except (ValueError, RuntimeError) as exc:
+        return {**claim_failure('governance-history-not-writable', str(exc)),
+            'code': 'governance-history-not-writable', 'pending_claim_proof': proof,
+            'completion_recovery_required': True}
+    except OSError as exc:
+        return {**claim_failure('claim-record-failed', f'Completion candidate could not be published: {exc}'),
+            'pending_claim_proof': proof, 'completion_recovery_required': True}
+    try:
+        add_write_warnings(payload, commit_completion(root, payload))
+    except (alignment_state.AlignmentStateError, OSError, RuntimeError, ValueError) as exc:
+        return {**claim_failure('claim-completion-commit-failed', f'Completion remains pending: {exc}'),
+            'pending_claim_proof': proof, 'completion_recovery_required': True}
+    if not completion_published(root, payload):
+        return claim_failure('claim-superseded', 'Completion was recorded, but its evidence is no longer valid for reuse.')
+    return {**payload, 'alignment_lifecycle_status': 'completed', 'completion_phase': 'committed'}
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    is_completion = args.action == 'claim' and args.claim_kind == 'completion' and not args.check_proof_only
+    payload = None
+    try:
+        if args.resume_completion and not is_completion:
+            payload = claim_failure('claim-completion-recovery-invalid', '--resume-completion requires a completion claim.')
+        elif is_completion and (args.path / '.tenetora').is_dir():
+            if args.resume_completion and not explicit_guard_identity(args)['session_id']:
+                payload = claim_failure('claim-completion-recovery-invalid', 'Recovery requires the original explicit session and owner.')
+            else:
+                prepare_guard_identity(args)
+                session = alignment_state.requested_session_id(args)
+                if session:
+                    alignment_state.validate_identity(session, 'session_id', alignment_state.SESSION_ID_RE)
+                    directory = args.path / '.tenetora/state/completion-locks'
+                    ensure_unredirected_directory(directory, label='completion transaction locks')
+                    lock = validate_unredirected_file_path(directory / (session + '.json'), label='completion transaction')
+                    with alignment_state.state_lock(lock):
+                        payload = run_action(args)
+                else:
+                    payload = run_action(args)
+        else:
+            payload = run_action(args)
+    except (OSError, alignment_state.AlignmentStateError, RuntimeError) as exc:
+        if payload and payload.get('status') == 'pass' and completion_published(args.path, payload):
+            add_write_warnings(payload, [{'code': 'completion-committed-cleanup-incomplete',
+                'message': 'Completion committed; transaction lock cleanup reported an error.'}])
+        else:
+            payload = claim_failure('claim-completion-transaction-failed', f'Completion transaction failed: {exc}')
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         print_text(payload)
-    return 0 if payload.get("status") == "pass" else 1
+        if payload.get('message') and not payload.get('checks'):
+            print(payload['message'], file=sys.stderr)
+    return 0 if payload.get('status') == 'pass' else 2 if payload.get('status') == 'error' else 1
 
 
 if __name__ == "__main__":

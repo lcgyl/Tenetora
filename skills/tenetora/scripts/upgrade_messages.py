@@ -12,10 +12,22 @@ class MessageTemplate:
     chinese: str
 
 
-@dataclass(frozen=True)
-class MessageIssue:
-    code: str
-    fallback: str = ""
+class MessageIssue(str):
+    """A string-compatible producer message carrying a stable identity."""
+
+    def __new__(cls, code: str, fallback: str = '', *, parameters: dict[str, object] | None = None):
+        values = dict(parameters or {})
+        template = MESSAGE_TEMPLATES.get(code)
+        source = template.english if template else fallback or code
+        try:
+            text = source.format_map(values)
+        except (KeyError, ValueError):
+            text = fallback or source
+        result = super().__new__(cls, text)
+        result.code = code
+        result.fallback = fallback
+        result.parameters = values
+        return result
 
 
 MESSAGE_TEMPLATES = {
@@ -97,12 +109,44 @@ MESSAGE_TEMPLATES = {
     'upgrade.shell-profile-is-not-owned-by-the-current-user': MessageTemplate('upgrade.shell-profile-is-not-owned-by-the-current-user', 'shell profile is not owned by the current user', 'Shell profile 不属于当前用户'),
     'upgrade.shell-profile-is-writable-by-group-or-others': MessageTemplate('upgrade.shell-profile-is-writable-by-group-or-others', 'shell profile is writable by group or others', 'Shell profile 可被用户组或其他用户写入'),
 }
-MESSAGE_TEMPLATES_BY_ENGLISH = {item.english: item for item in MESSAGE_TEMPLATES.values()}
+_LEGACY_MESSAGE_TEMPLATES_BY_ENGLISH = {item.english: item for item in MESSAGE_TEMPLATES.values()}
+MESSAGE_TEMPLATES.update({
+    code: MessageTemplate(code, english, chinese)
+    for code, english, chinese in (
+        ('upgrade.release-manifest-missing-required-fields', 'release manifest is missing required fields: {fields}', '发布清单缺少必需字段：{fields}'),
+        ('upgrade.release-manifest-invalid', 'release manifest is invalid: {detail}', '发布清单无效：{detail}'),
+        ('upgrade.embedded-release-manifest-invalid', 'embedded release manifest is invalid: {detail}', 'ZIP 内嵌发布清单无效：{detail}'),
+        ('upgrade.managed-release-manifest-invalid', 'managed release manifest is invalid: {detail}', '受管 release 清单无效：{detail}'),
+        ('upgrade.release-source-environment-options-are-mutually-exclusive', 'release source environment options are mutually exclusive: {detail}', '发布源环境选项互斥：{detail}'),
+        ('upgrade.bridge-minimum-not-met', 'installed Tenetora {installed} is older than the direct bridge minimum {minimum}', '已安装的 Tenetora {installed} 低于直接升级最低版本 {minimum}'),
+        ('upgrade.managed-pointer-unowned', 'refusing to replace unowned pointer: {name}', '拒绝替换无归属指针：{name}'),
+        ('upgrade.managed-pointer-restore-failed', 'managed pointer replacement failed and its backup could not be restored: {name}', '受管指针替换失败且备份无法恢复：{name}'),
+        ('upgrade.cannot-create-the-managed-windows-release-junction', 'cannot create the managed Windows release junction{detail}', '无法创建受管 Windows release 目录联接{detail}'),
+        ('upgrade.worker-stage-failed', 'upgrade stage failed: {stage}', '升级阶段失败：{stage}'),
+    )
+})
+MESSAGE_TEMPLATES_BY_ENGLISH = {**_LEGACY_MESSAGE_TEMPLATES_BY_ENGLISH,
+    **{item.english: item for item in MESSAGE_TEMPLATES.values()}}
+
+
+def message_issue(value: object) -> MessageIssue | None:
+    if isinstance(value, MessageIssue):
+        return value
+    if isinstance(value, BaseException) and value.args and isinstance(value.args[0], MessageIssue):
+        return value.args[0]
+    if isinstance(value, dict):
+        code = value.get('code', value.get('message_code'))
+        fallback = value.get('message', '')
+        parameters = value.get('parameters', value.get('message_parameters', {}))
+        if isinstance(code, str) and code.startswith('upgrade.') and isinstance(fallback, str) and isinstance(parameters, dict):
+            return MessageIssue(code, fallback, parameters=parameters)
+    return None
 
 
 def issue_code(issue: object) -> str:
-    if isinstance(issue, MessageIssue):
-        return issue.code
+    coded = message_issue(issue)
+    if coded is not None:
+        return coded.code
     template = MESSAGE_TEMPLATES_BY_ENGLISH.get(str(issue))
     if template:
         return template.code

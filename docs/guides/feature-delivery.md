@@ -43,7 +43,7 @@ the task and requires a new check, report and claim without deleting history.
 
 Run `feature check` explicitly with the feature/task, repeatable `--file`,
 `--verification-command`, `--evidence-level` and `--evidence-mode` arguments.
-The CLI runs argv without an implicit shell and retains raw stdout/stderr,
+The CLI runs argv without an implicit shell and retains bounded, redacted stdout/stderr,
 the actual exit code, duration and source fingerprint. Use an explicit shell
 command when the check needs pipes or other shell syntax.
 
@@ -70,5 +70,71 @@ Markdown records the last mutation's snapshot; use `status` for live validity.
 Task completion never grants plan approval (`plan_approval` remains `unrecorded`).
 The compatibility `--duration-ms` argument cannot
 override the measured check duration.
+
+## Criterion coverage and prompt diagnostics
+
+Newly frozen contracts assign `A01`, `A02`, ... to the ordered acceptance criteria.
+A single criterion reuses the main check by default. With multiple criteria,
+declare each mapping explicitly using repeatable `--criterion-check A01`
+(reuse the main command), `--criterion-check 'A02=python3 check_rollback.py'`,
+or `--criterion-review A02`. These options belong to `feature task-contract`.
+Unmapped criteria remain `unverified`; a passing task command cannot complete them.
+The check runner executes the declared commands without an implicit shell and
+binds each exit code and redacted log to the frozen contract and source. Reusing a
+command is declared coverage, not proof that its assertions cover the criterion.
+
+Record an explicitly declared review after the current check succeeds:
+
+```sh
+tenetora feature criterion-review --feature example --task T01 --criterion A02 \
+  --file evidence/rollback-review.md --outcome accepted --reviewer-kind human
+```
+
+Use `agent` or `unknown` when appropriate; reviewer kind is a declaration, not
+authenticated identity or proof of independent review. The report must be an
+unchanged project file. Missing, rejected, stale or altered review evidence blocks
+completion. A new execution or contract reset requires a new review. `feature status`
+exposes `criterion_coverage`, and the acceptance projection uses `T01/A01` rows
+alongside the unchanged task summary. Legacy contracts remain readable as
+`legacy-task-level`; they do not acquire invented per-criterion evidence.
+
+Both frontend and backend prompts retain frozen text and return `warnings` for
+explicit instructions to re-plan or widen scope. Negations and quoted examples
+are excluded by the diagnostic. It is a bounded phrase check, not semantic proof
+that a task is well planned; resolve an actual conflict with the planner before
+execution. It does not rewrite the contract or grant commit/push permission.
+
+## Observed checks and strict commit evidence
+
+This section describes unreleased main-branch behavior. Published preview `.018`
+does not provide `verify run` or the observed-receipt strict policy.
+
+For a check outside a feature, explicitly execute argv after `--`:
+
+```sh
+tenetora verify run --timeout 600 --json -- python3 -m unittest tests.test_example
+tenetora guard --action claim --claim-kind partial-verification \
+  --execution-receipt '<execution_receipt from verify run>'
+```
+
+Use repeatable `--scope <project-relative-path>` on `verify run` for a scoped
+check. `--command` instead parses command text as argv; it does not enable shell
+syntax. Prefer argv for paths/quoting, especially on Windows. A feature check
+also returns an observed execution reference. Importing that reference validates
+the receipt, source, command, logs and canonical run facts without rerunning it.
+Nonzero exit, timeout, changed source, incomplete runs and later overlapping
+failures prevent reuse. Logs retain at most 2 MiB per stream plus a truncation
+notice, redact known secrets, and record the observed byte count.
+
+Claims without an execution receipt require an explicit `--verification-status`
+and are marked `declaration`. They remain available for ordinary workflows;
+`guard --action commit --strict-evidence` requires observed evidence and checks
+the staged content, type and executable bit against the actual verified source.
+Staging identical content after a check preserves reuse. Evidence proves the
+controlled process observation, not assertion quality or cryptographic identity
+against a host with equal filesystem access. A claim grants no Git permission.
+Source fingerprint revision 5 separates verified missing paths from actual
+content, so committing a checked deletion or rename preserves reuse. Claims
+from older fingerprint revisions require a fresh check; they are not rewritten.
 
 Return to [governance](governance.md) or the [lifecycle entry map](entry-map.md).

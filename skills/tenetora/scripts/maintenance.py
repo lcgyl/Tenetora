@@ -8,6 +8,8 @@ import importlib.util
 import json
 import os
 import sys
+import tempfile
+import subprocess
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -52,22 +54,35 @@ def dsh_cleanup_plan(home: Path) -> list[dict[str, object]]:
     if installer is None:
         return []
     profiles_root = Path(os.environ.get("DSH_HOME", Path.home() / ".dsh")).expanduser() / "profiles"
+    validate_unredirected_path(profiles_root,label='DSH profiles')
     if not profiles_root.is_dir():
         return []
     plans: list[dict[str, object]] = []
     for profile in sorted(profiles_root.iterdir()):
-        if not profile.is_dir():
+        if not profile.is_dir() and not is_redirected_path(profile):
             continue
         try:
+            validate_unredirected_path(profile,label='DSH profile')
+            from path_security import validate_unredirected_file_path
+            patch=installer.dsh_patch_path(profile)
+            for path in (profile/'package.json',patch):
+                if path.exists() or is_redirected_path(path):
+                    validate_unredirected_file_path(path,label='DSH profile configuration')
             if not installer.dsh_profile_references_home(profile, home):
                 continue
+            if patch.is_file():
+                validate_unredirected_path(patch.parent,label='DSH patch parent')
+                validate_unredirected_file_path(patch,label='DSH patch')
+                content=patch.read_text(encoding='utf-8')
+                if installer.DSH_PATCH_START in content and installer.remove_dsh_patch_block(content) is None:
+                    plans.append({'profile':str(profile),'status':'conflict','actions':[], 'warnings':['Managed DSH patch is incomplete; profile and machine files were preserved.']});continue
             plans.append(installer.remove_cordis_bundle(profile.name, dry_run=True))
         except (OSError, RuntimeError, ValueError) as exc:
             plans.append({"profile": str(profile), "status": "error", "actions": [], "warnings": [str(exc)]})
     return plans
 
 
-def apply_dsh_cleanup(plans: list[dict[str, object]]) -> list[dict[str, object]]:
+def apply_dsh_cleanup(plans: list[dict[str, object]], home: Path | None = None) -> list[dict[str, object]]:
     installer = load_installer_module()
     if installer is None:
         return plans
@@ -78,7 +93,10 @@ def apply_dsh_cleanup(plans: list[dict[str, object]]) -> list[dict[str, object]]
             applied.append(plan)
             continue
         try:
-            applied.append(installer.remove_cordis_bundle(profile.name, dry_run=False))
+            result=installer.remove_cordis_bundle(profile.name, dry_run=False)
+            if home is not None and result.get('status') in {'removed','absent','profile-missing'} and installer.dsh_profile_references_home(profile,home):
+                result={**result,'status':'conflict','warnings':['DSH profile still references this machine home after cleanup.']}
+            applied.append(result)
         except (OSError, RuntimeError, ValueError) as exc:
             applied.append({"profile": str(profile), "status": "error", "actions": [], "warnings": [str(exc)]})
     return applied
@@ -159,40 +177,75 @@ def apply_cleanup(plan: dict[str, object]) -> list[str]:
     return removed
 
 
-def uninstall_plan(home: Path, *, purge: bool) -> dict[str, object]:
-    cleanup = cleanup_plan(home)
-    targets: list[Path] = []
-    for name in ("current", "source", "bin", "releases"):
-        path = home / name
-        if path.exists() or is_redirected_path(path):
-            targets.append(path)
-    registry = home / "state" / "installations.json"
-    if registry.exists():
-        targets.append(registry)
-    if purge:
-        allowed = {"current", "source", "bin", "releases", "state", "logs", "backups"}
-        unexpected = [entry.name for entry in home.iterdir() if entry.name not in allowed]
-        if unexpected:
-            raise ReleaseStoreError(f"refusing purge with unrecognized home entries: {', '.join(sorted(unexpected))}")
-        targets = [home]
-    return {
-        "home": str(home),
-        "purge": purge,
-        "remove": sorted(str(path) for path in targets),
-        "cleanup": cleanup,
-        "dsh": dsh_cleanup_plan(home),
-    }
+def uninstall_plan(home: Path, *, purge: bool, project: Path | None = None, include_host_integrations: bool = False) -> dict[str, object]:
+    from installation_registry import load_registry
+    import maintenance_objects
+    import maintenance_hooks
+    registry=load_registry(home)
+    projects=[Path(str(item['path'])) for item in registry['projects']]
+    if project is not None and (project/'.tenetora').is_dir():projects.append(project)
+    installer=load_installer_module()
+    if installer is None and (home.exists() or is_redirected_path(home)):
+        raise ReleaseStoreError('Installer helper is unavailable; host dependencies cannot be inspected. Machine files were preserved. Repair the Tenetora package and retry.')
+    objects=maintenance_objects.plan(home,purge=purge,installer=installer)
+    import maintenance_native
+    native=maintenance_native.plan(home,objects['native_payloads'],installer,project or Path.cwd(),owned_roots=maintenance_objects.releases(home),contexts=projects) if installer is not None else {'actions':[],'preserved':[]}
+    hook_plan=maintenance_hooks.plan(projects,home,installer)
+    dsh=dsh_cleanup_plan(home)
+    if any(item.get('status') not in {'planned','absent','profile-missing'} for item in dsh):
+        raise ReleaseStoreError('A DSH profile could not be inspected; machine files were preserved.')
+    return {'home':str(home),'purge':purge,**objects,'hook_plan':hook_plan,
+        'dsh':dsh,'native':native,'include_host_integrations':include_host_integrations,'project_discovery':'registered projects plus explicit project context; no user-home scan'}
 
 
-def apply_uninstall(plan: dict[str, object]) -> list[str]:
-    removed: list[str] = []
-    plan["dsh"] = apply_dsh_cleanup(list(plan.get("dsh") or []))
-    for raw in plan.get("remove", []):
-        path = Path(str(raw))
-        if path.exists() or is_redirected_path(path):
-            remove_unredirected_entry(path, label="Tenetora uninstall")
-            removed.append(str(path))
-    return removed
+def apply_uninstall(plan: dict[str, object]) -> dict[str, object]:
+    from tenetora.install_lock import install_transaction_lock
+    from runtime_transaction import runtime_operation_lock
+    import maintenance_objects
+    import maintenance_hooks
+    home=Path(str(plan['home']));staged=[];quarantine=None
+    installer=load_installer_module()
+    if installer is None and (home.exists() or is_redirected_path(home)):
+        raise ReleaseStoreError('Installer helper is unavailable; uninstall was blocked before any host or machine changes.')
+    with install_transaction_lock(home),runtime_operation_lock(home/'bin',outside_root=True):
+        maintenance_objects.validate(plan)
+        maintenance_hooks.validate(plan['hook_plan'])
+        import maintenance_native
+        if (plan.get('native',{}).get('actions') or plan['hook_plan'].get('integrations')) and not plan.get('include_host_integrations'):
+            raise ReleaseStoreError('Host integrations still reference this home. Review the plan and explicitly use --include-host-integrations to detach them.')
+        native_removed=maintenance_native.apply(plan['native'],installer) if plan.get('native',{}).get('actions') else []
+        dsh=apply_dsh_cleanup(list(plan.get('dsh') or []),home)
+        if any(item.get('status') not in {'removed','absent','profile-missing'} for item in dsh):
+            raise ReleaseStoreError('DSH cleanup failed; the machine home was preserved.')
+        if not plan['remove']:return {'removed':[],'hooks':{'restored_hooks':[]},'warnings':[]}
+        quarantine=Path(tempfile.mkdtemp(prefix='.'+home.name+'.uninstall-',dir=home.parent))
+        try:
+            for index,raw in enumerate(plan['remove']):
+                source=Path(str(raw));expected=plan['snapshots'][str(source)]
+                if maintenance_objects.snapshot(source)!=expected:raise ReleaseStoreError('Machine object changed before removal.')
+                destination=quarantine/str(index);staged.append((source,destination,expected));os.replace(source,destination)
+            for source,destination,expected in staged:
+                if source.exists() or is_redirected_path(source) or maintenance_objects.snapshot(destination)!=expected:
+                    raise ReleaseStoreError('An uninstall object changed or was recreated during staging.')
+            hooks=maintenance_hooks.apply(plan['hook_plan'])
+        except (OSError,RuntimeError,ValueError):
+            conflicts=[]
+            for source,destination,expected in reversed(staged):
+                try:
+                    if (source.exists() or is_redirected_path(source)) and not destination.exists() and not is_redirected_path(destination):
+                        if maintenance_objects.snapshot(source)==expected:continue
+                    elif not source.exists() and not is_redirected_path(source) and maintenance_objects.snapshot(destination)==expected:
+                        os.replace(destination,source);continue
+                    conflicts.append(str(source))
+                except (OSError,RuntimeError,ValueError):conflicts.append(str(source))
+            if conflicts:raise ReleaseStoreError('Uninstall rollback preserved concurrent edits; recovery objects remain at '+str(quarantine))
+            if quarantine.exists():quarantine.rmdir()
+            raise
+    warnings=[]
+    try:remove_unredirected_entry(quarantine,label='committed uninstall quarantine')
+    except (OSError,RuntimeError):
+        warnings.append({'code':'uninstall-committed-cleanup-incomplete','recovery_path':str(quarantine)})
+    return {'removed':[str(source) for source,_,_ in staged],'hooks':hooks,'warnings':warnings,'dsh':dsh,'native':native_removed}
 
 
 def parser() -> argparse.ArgumentParser:
@@ -201,6 +254,10 @@ def parser() -> argparse.ArgumentParser:
     for name in ("cleanup", "uninstall"):
         command = sub.add_parser(name)
         command.add_argument("--home", type=Path, default=None)
+        if name=='uninstall':command.add_argument('--include-host-integrations',action='store_true',help='Detach ownership-proven native host references before removing this machine home')
+        command.add_argument('--cache',action='store_true',help='cleanup: read-only project cache inventory and removal preview')
+        command.add_argument('--path',type=Path,default=Path.cwd(),help='Project context for cache inventory or explicitly registered hooks')
+        command.add_argument('--dry-run',action='store_true',help='Display the plan without changing files')
         command.add_argument("--apply", action="store_true", help="apply the displayed plan")
         command.add_argument("--yes", action="store_true", help="confirm destructive changes")
         command.add_argument("--purge", action="store_true", help="uninstall: remove the whole managed home")
@@ -211,14 +268,28 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
+        if args.dry_run and args.apply:raise ReleaseStoreError('--dry-run cannot be combined with --apply')
+        if args.cache:
+            if args.operation!='cleanup' or args.home is not None or args.apply or args.purge:
+                raise ReleaseStoreError('Project cache supports read-only cleanup planning; do not combine it with machine-home, purge or apply options.')
+            from cache_inventory import inventory
+            payload=inventory(args.path)
+            if args.json:print(json.dumps(payload,ensure_ascii=False,sort_keys=True))
+            else:
+                print(text('Project cache inventory (read-only)','项目缓存盘点（只读）'))
+                for item in payload['entries']:print(item['path']+': '+str(item['logical_bytes'])+' bytes; '+'; '.join(item['keep_reasons']))
+                for item in payload['candidates']:print(text('Review candidate: ','待复核候选：')+item['path'])
+            return 0
         home = validate_unredirected_path(args.home or configured_home(), label="Tenetora home")
-        plan = cleanup_plan(home) if args.operation == "cleanup" else uninstall_plan(home, purge=args.purge)
+        plan = cleanup_plan(home) if args.operation == "cleanup" else uninstall_plan(home, purge=args.purge, project=args.path, include_host_integrations=getattr(args,'include_host_integrations',False))
         if args.apply and not args.yes:
             raise ReleaseStoreError("destructive maintenance requires --yes")
         removed: list[str] = []
         if args.apply:
-            removed = apply_cleanup(plan) if args.operation == "cleanup" else apply_uninstall(plan)
-    except (OSError, RuntimeError, ReleaseStoreError, ValueError) as exc:
+            if args.operation=='cleanup':removed=apply_cleanup(plan)
+            else:
+                removal=apply_uninstall(plan);removed=removal['removed'];plan['hook_result']=removal['hooks'];plan['warnings']=removal['warnings'];plan['dsh']=removal.get('dsh',[])
+    except (OSError, RuntimeError, ReleaseStoreError, ValueError, subprocess.SubprocessError) as exc:
         if getattr(args, "json", False):
             print(json.dumps({"status": "blocked", "error": str(exc)}, ensure_ascii=False))
         else:

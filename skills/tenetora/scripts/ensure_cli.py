@@ -36,7 +36,7 @@ from tenetora.brand import (  # noqa: E402
 from runtime_transaction import run_runtime_update  # noqa: E402
 from path_manager import configure_user_path  # noqa: E402
 from path_security import (  # noqa: E402
-    ensure_unredirected_directory,
+    ensure_unredirected_directory as original_ensure_directory,
     is_redirected_path,
     remove_unredirected_entry,
     validate_unredirected_file_path,
@@ -51,10 +51,11 @@ HOOK_SOURCE_FILES = (
     "run-hook",
     "run-hook.cmd",
     "tenetora_hook.py",
+    "hook_timing.py",
     "platform-contracts.json",
 )
 HOOK_RUNTIME_FILES = (*HOOK_SOURCE_FILES, "VERSION")
-RUNTIME_CLI_FILES = ("__init__.py", "__main__.py", "cli.py")
+RUNTIME_CLI_FILES = ("__init__.py", "__main__.py", "cli.py", "file_transaction.py")
 RUNTIME_SKILL_FILES = (
     "SKILL.md",
     "VERSION",
@@ -73,6 +74,7 @@ RUNTIME_SKILL_FILES = (
     "scripts/path_manager.py",
     "scripts/release_store.py",
     "scripts/upgrade_transaction.py",
+    "scripts/installation_transaction.py",
     "scripts/onboarding_state.py",
 )
 LANGUAGE = "zh" if os.environ.get("TENETORA_LANG", "").strip().lower() in {
@@ -82,6 +84,13 @@ LANGUAGE = "zh" if os.environ.get("TENETORA_LANG", "").strip().lower() in {
     "chinese",
     "中文",
 } else "en"
+
+
+def ensure_unredirected_directory(path, *, label):
+    if os.environ.get('TENETORA_SURFACE_JOURNAL'):
+        from installation_transaction import ensure_directory
+        return ensure_directory(path, label=label)
+    return original_ensure_directory(path, label=label)
 
 
 def human_text(english: str, chinese: str) -> str:
@@ -380,8 +389,8 @@ def ensure_installable() -> None:
         raise FileNotFoundError(f"Embedded CLI package is missing: {CLI_PATH}")
 
 
-def isolated_cli_code() -> str:
-    encoded_cli_path = base64.b64encode(os.fsencode(CLI_PATH)).decode("ascii")
+def isolated_cli_code(cli_path: Path | None = None) -> str:
+    encoded_cli_path = base64.b64encode(os.fsencode(cli_path or CLI_PATH)).decode("ascii")
     return (
         "import base64,os,runpy,sys;"
         f"sys.path.insert(0,os.fsdecode(base64.b64decode({encoded_cli_path!r})));"
@@ -389,9 +398,9 @@ def isolated_cli_code() -> str:
     )
 
 
-def posix_shim(bin_dir: Path, command_name: str = COMMAND_NAME) -> str:
-    python = shlex.quote(sys.executable)
-    cli_code = shlex.quote(isolated_cli_code())
+def posix_shim(bin_dir: Path, command_name: str = COMMAND_NAME, *, python_path: str | None = None, cli_path: Path | None = None) -> str:
+    python = shlex.quote(python_path or sys.executable)
+    cli_code = shlex.quote(isolated_cli_code(cli_path))
     harness_home = shlex.quote(str(bin_dir.parent))
     return f"""#!/bin/sh
 if [ -z "${{TENETORA_HOME:-}}" ]; then
@@ -404,9 +413,9 @@ exec {python} -B -I -c {cli_code} "$@"
 """
 
 
-def windows_shim(bin_dir: Path, command_name: str = COMMAND_NAME) -> str:
-    python = str(Path(sys.executable)).replace("%", "%%")
-    cli_code = isolated_cli_code()
+def windows_shim(bin_dir: Path, command_name: str = COMMAND_NAME, *, python_path: str | None = None, cli_path: Path | None = None) -> str:
+    python = str(Path(python_path or sys.executable)).replace("%", "%%")
+    cli_code = isolated_cli_code(cli_path)
     harness_home = str(bin_dir.parent)
     return f"""@echo off
 if not defined TENETORA_HOME set "TENETORA_HOME={harness_home}"
@@ -485,7 +494,11 @@ def write_shim(bin_dir: Path, force: bool, command_name: str = COMMAND_NAME) -> 
             mode = temporary.stat().st_mode
             temporary.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         validate_unredirected_replace_target(dest, label="Tenetora CLI shim")
-        os.replace(temporary, dest)
+        if os.environ.get('TENETORA_SURFACE_JOURNAL'):
+            from installation_transaction import publish
+            publish(temporary, dest)
+        else:
+            os.replace(temporary, dest)
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -516,7 +529,11 @@ def remove_managed_legacy_shim(bin_dir: Path) -> bool:
     )
     if not any(marker in content for marker in ownership_markers) and not legacy_pythonpath_wrapper:
         return False
-    path.unlink()
+    if os.environ.get('TENETORA_SURFACE_JOURNAL'):
+        from installation_transaction import remove
+        remove(path)
+    else:
+        path.unlink()
     return True
 
 
@@ -535,7 +552,11 @@ def write_runtime_python(bin_dir: Path) -> Path:
             handle.write(content)
         temporary.chmod(stat.S_IRUSR | stat.S_IWUSR)
         validate_unredirected_file_path(dest, label="runtime Python path")
-        os.replace(temporary, dest)
+        if os.environ.get('TENETORA_SURFACE_JOURNAL'):
+            from installation_transaction import publish
+            publish(temporary, dest)
+        else:
+            os.replace(temporary, dest)
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -580,6 +601,10 @@ def write_hook_runtime(bin_dir: Path) -> Path | None:
             mode = (staging_hooks / "run-hook").stat().st_mode
             (staging_hooks / "run-hook").chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
+        if os.environ.get('TENETORA_SURFACE_JOURNAL'):
+            from installation_transaction import publish
+            publish(staging, destination_root)
+            return runtime_hook_dir(bin_dir)
         if destination_root.exists():
             validate_unredirected_path(destination_root, label="Tenetora runtime directory")
             os.replace(destination_root, previous)

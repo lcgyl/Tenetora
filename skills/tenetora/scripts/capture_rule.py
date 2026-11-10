@@ -5,16 +5,20 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import re
 import sys
-from pathlib import Path
+import unicodedata
+from pathlib import Path, PureWindowsPath
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from path_security import validate_existing_project_path
+from path_security import validate_existing_project_path, validate_unredirected_file_path, ensure_unredirected_directory
+from harness_io import atomic_write_text
+from alignment_state import state_lock
 
 SEARCH_DIRS = [
     ".tenetora/rules",
@@ -78,8 +82,8 @@ def find_existing_coverage(root: Path, rule_text: str) -> str | None:
 
 
 def choose_destination(rule_text: str, explicit: str | None = None) -> str:
-    if explicit:
-        return explicit.lstrip("/")
+    if explicit is not None:
+        return explicit
     text = normalize(rule_text)
     if re.search(r"\b(commit|push|branch|merge|rebase|git)\b", text):
         return ".tenetora/rules/git.md"
@@ -99,17 +103,48 @@ def title_from_destination(destination: str) -> str:
     return f"# {stem} Rules\n"
 
 
-def append_rule(root: Path, destination: str, rule_text: str, source: str) -> None:
-    target = root / destination
-    target.parent.mkdir(parents=True, exist_ok=True)
-    current = target.read_text(encoding="utf-8") if target.exists() else title_from_destination(destination)
-    if current and not current.endswith("\n"):
-        current += "\n"
-    if "## Captured Rules" not in current:
-        current += "\n## Captured Rules\n"
-    today = dt.date.today().isoformat()
-    block = f"\n- {clean_rule_text(rule_text)}\n  Source: {source}\n  Captured: {today}\n"
-    target.write_text(current + block, encoding="utf-8")
+def validate_destination(root: Path, destination: str) -> str:
+    if not destination or any(ord(char) < 32 for char in destination) or PureWindowsPath(destination).drive:
+        raise ValueError('Rule destination must be a project-relative governance path.')
+    normalized = destination.replace('\\', '/')
+    path = Path(normalized)
+    if (path.is_absolute() or '..' in path.parts or len(path.parts) < 3
+        or path.parts[:2] not in {('.tenetora', 'rules'), ('.tenetora', 'workflows'), ('.tenetora', 'agents')}
+        or any(part.startswith('.') for part in path.parts[2:])
+        or path.suffix.lower() not in {'', '.md', '.mdc'}):
+        raise ValueError('Rule destination must stay inside .tenetora/rules, workflows or agents.')
+    validate_unredirected_file_path(root / path, label='rule destination')
+    return path.as_posix()
+
+
+def validate_source(source: str) -> str:
+    if not source.strip() or len(source) > 200 or not source.isprintable():
+        raise ValueError('Rule source must be a non-empty single line of at most 200 characters.')
+    return source.strip()
+
+
+def append_rule(root: Path, destination: str, rule_text: str, source: str) -> bool:
+    destination = validate_destination(root, destination)
+    source = validate_source(source)
+    lock_directory = root / '.tenetora/.cache/rule-capture-locks'
+    ensure_unredirected_directory(lock_directory, label='rule capture locks')
+    # Conservative normalization may serialize distinct POSIX files, but never
+    # lets case/Unicode aliases of the same Windows/macOS target use two locks.
+    lock_key = unicodedata.normalize('NFKC', destination).casefold()
+    lock = lock_directory / (hashlib.sha256(lock_key.encode('utf-8')).hexdigest() + '.json')
+    validate_unredirected_file_path(lock.with_name('.' + lock.name + '.lock'), label='rule capture lock')
+    with state_lock(lock):
+        target = root / validate_destination(root, destination)
+        current = target.read_text(encoding='utf-8') if target.exists() else title_from_destination(destination)
+        if normalize(rule_text) and normalize(rule_text) in normalize(current):
+            return False
+        if current and not current.endswith('\n'):
+            current += '\n'
+        if '## Captured Rules' not in current:
+            current += '\n## Captured Rules\n'
+        block = f'\n- {clean_rule_text(rule_text)}\n  Source: {source}\n  Captured: {dt.date.today().isoformat()}\n'
+        atomic_write_text(target, current + block)
+    return True
 
 
 def result_payload(status: str, rule_text: str, target: str | None, matched_path: str | None) -> dict[str, object]:
@@ -133,6 +168,8 @@ def print_markdown(payload: dict[str, object]) -> None:
     if "target" in payload:
         print(f"Target: `{payload['target']}`")
     print(f"Rule: {payload['rule']}")
+    if payload.get('message'):
+        print(f"ERROR: {payload['message']}")
 
 
 def main() -> int:
@@ -157,22 +194,25 @@ def main() -> int:
     if not rule_text:
         parser.error("--text must contain a non-empty rule")
 
-    matched_path = find_existing_coverage(args.path, rule_text)
-    if matched_path:
-        payload = result_payload("covered", rule_text, None, matched_path)
-    else:
-        destination = choose_destination(rule_text, args.destination)
-        if args.apply:
-            append_rule(args.path, destination, rule_text, args.source)
-            payload = result_payload("written", rule_text, destination, None)
+    try:
+        destination = validate_destination(args.path, choose_destination(rule_text, args.destination))
+        source = validate_source(args.source)
+        matched_path = find_existing_coverage(args.path, rule_text)
+        if matched_path:
+            payload = result_payload('covered', rule_text, None, matched_path)
+        elif args.apply:
+            written = append_rule(args.path, destination, rule_text, source)
+            payload = result_payload('written' if written else 'covered', rule_text, destination, None)
         else:
-            payload = result_payload("new", rule_text, destination, None)
+            payload = result_payload('new', rule_text, destination, None)
+    except (OSError, RuntimeError, ValueError) as exc:
+        payload = {**result_payload('fail', rule_text, None, None), 'code': 'capture-rule-rejected', 'message': str(exc)}
 
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         print_markdown(payload)
-    return 0
+    return 1 if payload['status'] == 'fail' else 0
 
 
 if __name__ == "__main__":

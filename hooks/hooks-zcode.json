@@ -9,6 +9,8 @@
             "type": "process",
             "command": "python3",
             "args": [
+              "-I",
+              "-B",
               "${ZCODE_PLUGIN_ROOT}/hooks/tenetora_hook.py",
               "session-start",
               "--platform",
@@ -27,6 +29,8 @@
             "type": "process",
             "command": "python3",
             "args": [
+              "-I",
+              "-B",
               "${ZCODE_PLUGIN_ROOT}/hooks/tenetora_hook.py",
               "user-prompt-submit",
               "--platform",
@@ -46,6 +50,8 @@
             "type": "process",
             "command": "python3",
             "args": [
+              "-I",
+              "-B",
               "${ZCODE_PLUGIN_ROOT}/hooks/tenetora_hook.py",
               "pre-tool-commit",
               "--platform",
@@ -63,6 +69,8 @@
             "type": "process",
             "command": "python3",
             "args": [
+              "-I",
+              "-B",
               "${ZCODE_PLUGIN_ROOT}/hooks/tenetora_hook.py",
               "pre-tool-external-input",
               "--platform",
@@ -82,6 +90,8 @@
             "type": "process",
             "command": "python3",
             "args": [
+              "-I",
+              "-B",
               "${ZCODE_PLUGIN_ROOT}/hooks/tenetora_hook.py",
               "post-tool-external-input",
               "--platform",
@@ -100,6 +110,8 @@
             "type": "process",
             "command": "python3",
             "args": [
+              "-I",
+              "-B",
               "${ZCODE_PLUGIN_ROOT}/hooks/tenetora_hook.py",
               "subagent-start",
               "--platform",
@@ -118,6 +130,8 @@
             "type": "process",
             "command": "python3",
             "args": [
+              "-I",
+              "-B",
               "${ZCODE_PLUGIN_ROOT}/hooks/tenetora_hook.py",
               "subagent-stop",
               "--platform",
@@ -136,6 +150,8 @@
             "type": "process",
             "command": "python3",
             "args": [
+              "-I",
+              "-B",
               "${ZCODE_PLUGIN_ROOT}/hooks/tenetora_hook.py",
               "stop",
               "--platform",

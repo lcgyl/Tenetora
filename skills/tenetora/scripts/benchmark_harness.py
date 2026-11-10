@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import datetime as dt
 import json
 import os
@@ -20,7 +21,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import alignment_state  # noqa: E402
 from harness_io import atomic_write_text  # noqa: E402
-from path_security import harness_missing_message, validate_existing_project_path  # noqa: E402
+from path_security import harness_missing_message, validate_existing_project_path, validate_unredirected_path, validate_unredirected_file_path  # noqa: E402
 
 BENCHMARK_HISTORY_REL = ".tenetora/state/benchmark-history.json"
 
@@ -78,10 +79,20 @@ def benchmark_hooks(root: Path, args: argparse.Namespace) -> dict[str, object]:
     governance = root / '.tenetora'
     if governance.is_symlink() or not (governance / 'README.md').is_file():
         raise ValueError('Hook benchmark requires an existing unredirected .tenetora/README.md.')
-    hooks = SCRIPT_DIR.parents[2] / 'hooks'
-    if str(hooks) not in sys.path:
-        sys.path.insert(0, str(hooks))
-    from hook_timing import run_hook_measurement, timing_summary
+    import ensure_cli
+    hooks = ensure_cli.hook_source_dir()
+    if hooks is None:
+        bin_dir = ensure_cli.default_bin_dir()
+        if not ensure_cli.hook_runtime_ready(bin_dir):
+            raise ValueError('Managed Hook timing files are unavailable; upgrade Tenetora and retry.')
+        hooks = ensure_cli.runtime_hook_dir(bin_dir)
+    validate_unredirected_path(hooks, label='Hook timing directory')
+    helper = validate_unredirected_file_path(hooks / 'hook_timing.py', label='Hook timing helper')
+    spec = importlib.util.spec_from_file_location('tenetora_benchmark_hook_timing', helper)
+    if spec is None or spec.loader is None:
+        raise ValueError('Managed Hook timing helper could not be loaded.')
+    timing = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(timing)
 
     samples = []
     for mode, event_name in (('session-start', 'SessionStart'), ('user-prompt-submit', 'UserPromptSubmit'), ('stop', 'Stop')):
@@ -102,14 +113,14 @@ def benchmark_hooks(root: Path, args: argparse.Namespace) -> dict[str, object]:
                 payload = json.dumps({'hook_event_name': event_name, 'cwd': str(snapshot),
                     'session_id': 'latency-observation', 'prompt': 'Explain the existing project'}).encode()
                 for phase in ('cold', 'warm'):
-                    sample, _, _ = run_hook_measurement(snapshot, mode, payload, platform=args.hook_platform,
+                    sample, _, _ = timing.run_hook_measurement(snapshot, mode, payload, platform=args.hook_platform,
                         cache_state=phase, origin='replay', budget_ms=args.soft_budget_ms, environment=environment)
                     samples.append(sample)
     return {'version': 1, 'status': 'pass' if all(sample['returncode'] == 0 for sample in samples) else 'fail',
         'boundary': 'launcher-subprocess-wall-time', 'origin': 'replay',
         'cache_definition': 'cold: first event in fresh governance snapshot; warm: consecutive event in same snapshot. Both use fresh processes; OS disk caches are uncontrolled.',
         'limitations': 'Replay exercises the real launcher/handler; it does not prove native host dispatch, host queue latency, or model latency. Quantiles include all outcomes.',
-        'samples': samples, 'summary': timing_summary(samples)}
+        'samples': samples, 'summary': timing.timing_summary(samples)}
 
 
 def benchmark_steps(root: Path, include_refresh: bool) -> list[tuple[str, list[str]]]:

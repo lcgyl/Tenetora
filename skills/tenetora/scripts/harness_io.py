@@ -13,7 +13,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from path_security import ensure_unredirected_directory, validate_unredirected_file_path  # noqa: E402
+from path_security import ensure_unredirected_directory as original_ensure_directory, validate_unredirected_file_path  # noqa: E402
+
+
+def ensure_unredirected_directory(path, *, label):
+    if os.environ.get('TENETORA_SURFACE_JOURNAL'):
+        from installation_transaction import ensure_directory
+        return ensure_directory(path, label=label)
+    return original_ensure_directory(path, label=label)
 
 
 def _safe_path(path: Path, label: str) -> Path:
@@ -39,7 +46,11 @@ def atomic_write_bytes(path: Path, content: bytes, mode: int | None = None) -> N
             os.fsync(handle.fileno())
         if existing_mode is not None:
             os.chmod(tmp_name, existing_mode)
-        os.replace(tmp_name, path)
+        if os.environ.get('TENETORA_SURFACE_JOURNAL'):
+            from installation_transaction import publish
+            publish(tmp_name, path)
+        else:
+            os.replace(tmp_name, path)
     except Exception:
         try:
             os.unlink(tmp_name)

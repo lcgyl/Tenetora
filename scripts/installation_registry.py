@@ -517,7 +517,11 @@ def write_registry(payload: object, *, home: Path | None = None) -> Path:
         os.fsync(handle.fileno())
     try:
         secure_chmod(temporary, 0o600, label="temporary installation registry")
-        os.replace(temporary, path)
+        if os.environ.get('TENETORA_SURFACE_JOURNAL'):
+            from installation_transaction import publish
+            publish(temporary, path)
+        else:
+            os.replace(temporary, path)
         secure_chmod(path, 0o600, label="installation registry")
     finally:
         temporary.unlink(missing_ok=True)

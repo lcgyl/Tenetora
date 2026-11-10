@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -29,16 +30,16 @@ from path_security import is_redirected_path, validate_existing_project_path
 
 
 DEFAULT_MANIFEST_URL = (
-    "https://r2.lcgylfamily.cn/stable/0.3.40/manifest.json"
+    "https://r2.lcgylfamily.cn/stable/0.4.3/manifest.json"
 )
 DEFAULT_ZIP_URL = (
-    "https://r2.lcgylfamily.cn/stable/0.3.40/tenetora-0.3.40.zip"
+    "https://r2.lcgylfamily.cn/stable/0.4.3/tenetora-0.4.3.zip"
 )
 PREVIEW_MANIFEST_URL = (
-    "https://r2.lcgylfamily.cn/preview/0.3.40.018-preview/manifest.json"
+    "https://github.com/lcgyl/Tenetora/releases"
 )
 PREVIEW_ZIP_URL = (
-    "https://r2.lcgylfamily.cn/preview/0.3.40.018-preview/tenetora-0.3.40.018-preview.zip"
+    "https://github.com/lcgyl/Tenetora/releases"
 )
 RELEASE_MIRROR_ENV = "TENETORA_RELEASE_MIRROR"
 RELEASE_MANIFEST_ENV = "TENETORA_RELEASE_MANIFEST_URL"
@@ -52,7 +53,12 @@ MAX_EXTRACTED_FILES = 4096
 MAX_EXTRACTED_BYTES = 256 * 1024 * 1024
 EXTERNAL_DOWNLOAD_TIMEOUT = 90
 EXTERNAL_OUTPUT_PLACEHOLDER = "<tenetora-download-output>"
+EXTERNAL_OUTPUT_ENV = "TENETORA_DOWNLOAD_OUTPUT"
+POWERSHELL_HTTP_STATUS_PREFIX = "TENETORA_HTTP_STATUS:"
 IS_WINDOWS = os.name == "nt"
+
+
+from upgrade_messages import MessageIssue, message_issue  # noqa: E402
 
 
 class UpgradeAcquireError(RuntimeError):
@@ -63,7 +69,7 @@ class ReleaseDownloadError(UpgradeAcquireError):
     """A failed transfer with an HTTP status only when it was observed."""
 
     def __init__(self, http_status: int | None = None):
-        super().__init__("release download failed")
+        super().__init__(MessageIssue('upgrade.release-download-failed'))
         self.http_status = http_status
 
 
@@ -79,24 +85,27 @@ def _configured_value(environment: Mapping[str, str], name: str) -> str | None:
     return value or None
 
 
-def _validate_release_url(value: str, *, label: str) -> str:
+def _validate_release_url(value: str, *, label: str, code_prefix: str = 'upgrade.release-url') -> str:
+    def failure(suffix: str, detail: str) -> UpgradeAcquireError:
+        return UpgradeAcquireError(MessageIssue(code_prefix + suffix, fallback=f'{label} {detail}'))
+
     if not isinstance(value, str):
-        raise UpgradeAcquireError(f"{label} must be a string")
+        raise failure('-must-be-a-string', 'must be a string')
     value = value.strip()
     if not value or len(value) > MAX_RELEASE_URL_LENGTH or any(char.isspace() for char in value):
-        raise UpgradeAcquireError(f"{label} is invalid")
+        raise failure('-is-invalid', 'is invalid')
     try:
         parsed = urllib.parse.urlsplit(value)
         hostname = parsed.hostname
         _ = parsed.port
     except ValueError as exc:
-        raise UpgradeAcquireError(f"{label} is invalid") from exc
+        raise failure('-is-invalid', 'is invalid') from exc
     if parsed.scheme.lower() != "https" or not hostname:
-        raise UpgradeAcquireError(f"{label} must use an HTTPS URL")
+        raise failure('-must-use-an-https-url', 'must use an HTTPS URL')
     if parsed.username is not None or parsed.password is not None:
-        raise UpgradeAcquireError(f"{label} must not contain credentials")
+        raise failure('-must-not-contain-credentials', 'must not contain credentials')
     if parsed.query or parsed.fragment:
-        raise UpgradeAcquireError(f"{label} must not contain a query or fragment")
+        raise failure('-must-not-contain-a-query-or-fragment', 'must not contain a query or fragment')
     return value
 
 
@@ -122,19 +131,19 @@ def resolve_release_urls(
     explicit_values = (manifest_url, zip_url, mirror_url)
     if any(value is not None for value in explicit_values):
         if mirror_url is not None and (manifest_url is not None or zip_url is not None):
-            raise UpgradeAcquireError("release source options are mutually exclusive")
+            raise UpgradeAcquireError(MessageIssue('upgrade.release-source-options-are-mutually-exclusive'))
         if mirror_url is not None:
-            base = _validate_release_url(mirror_url, label="release mirror URL")
+            base = _validate_release_url(mirror_url, label="release mirror URL", code_prefix='upgrade.release-mirror-url')
             base = base.rstrip("/") + "/"
             return (
                 urllib.parse.urljoin(base, "manifest.json"),
                 urllib.parse.urljoin(base, alias_name),
             )
         if manifest_url is None or zip_url is None:
-            raise UpgradeAcquireError("release manifest and ZIP URLs must be supplied together")
+            raise UpgradeAcquireError(MessageIssue('upgrade.release-manifest-and-zip-urls-must-be-supplied-together'))
         return (
-            _validate_release_url(manifest_url, label="release manifest URL"),
-            _validate_release_url(zip_url, label="release ZIP URL"),
+            _validate_release_url(manifest_url, label="release manifest URL", code_prefix='upgrade.release-manifest-url'),
+            _validate_release_url(zip_url, label="release ZIP URL", code_prefix='upgrade.release-zip-url'),
         )
 
     configured_mirror = _configured_value(environment, RELEASE_MIRROR_ENV)
@@ -142,8 +151,8 @@ def resolve_release_urls(
     configured_zip = _configured_value(environment, RELEASE_ZIP_ENV)
     if configured_mirror is not None and (configured_manifest is not None or configured_zip is not None):
         raise UpgradeAcquireError(
-            "release source environment options are mutually exclusive: "
-            f"{RELEASE_MIRROR_ENV} cannot be combined with {RELEASE_MANIFEST_ENV} or {RELEASE_ZIP_ENV}"
+            MessageIssue('upgrade.release-source-environment-options-are-mutually-exclusive', parameters={
+                'detail': f'{RELEASE_MIRROR_ENV} cannot be combined with {RELEASE_MANIFEST_ENV} or {RELEASE_ZIP_ENV}'})
         )
     if configured_manifest is not None or configured_zip is not None:
         if configured_manifest is None or configured_zip is None:
@@ -151,11 +160,11 @@ def resolve_release_urls(
                 f"{RELEASE_MANIFEST_ENV} and {RELEASE_ZIP_ENV} must be configured together"
             )
         return (
-            _validate_release_url(configured_manifest, label="release manifest URL"),
-            _validate_release_url(configured_zip, label="release ZIP URL"),
+            _validate_release_url(configured_manifest, label="release manifest URL", code_prefix='upgrade.release-manifest-url'),
+            _validate_release_url(configured_zip, label="release ZIP URL", code_prefix='upgrade.release-zip-url'),
         )
     if configured_mirror is not None:
-        base = _validate_release_url(configured_mirror, label="release mirror URL")
+        base = _validate_release_url(configured_mirror, label="release mirror URL", code_prefix='upgrade.release-mirror-url')
         base = base.rstrip("/") + "/"
         return (
             urllib.parse.urljoin(base, "manifest.json"),
@@ -200,14 +209,14 @@ def _release_pointer_urls(
         return first, second, None
     if any(_configured_value(environment, name) for name in (RELEASE_MIRROR_ENV, RELEASE_MANIFEST_ENV, RELEASE_ZIP_ENV)):
         raise UpgradeAcquireError("release index base conflicts with another release source")
-    base = _validate_release_url(base, label="release index base URL").rstrip("/") + "/"
+    base = _validate_release_url(base, label="release index base URL", code_prefix='upgrade.release-index-base-url').rstrip("/") + "/"
     pointer_path = workdir / "release-pointer.json"
     if not pointer_path.is_file():
         try:
             _download(urllib.parse.urljoin(base, f"{channel}/latest.json"), pointer_path, 4096)
         except ReleaseDownloadError as exc:
             if channel == "preview" and exc.http_status in {404, 410}:
-                raise PreviewUnavailableError("preview channel pointer is unavailable") from exc
+                raise PreviewUnavailableError(MessageIssue('upgrade.preview-channel-unavailable')) from exc
             raise
     try:
         pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
@@ -259,8 +268,10 @@ def _download_with_command(command: list[str], destination: Path, maximum: int) 
     """Download to a private temporary file and atomically publish on success."""
 
     destination.parent.mkdir(parents=True, exist_ok=True)
+    # PowerShell provider paths treat [ ] as wildcards; keep the scratch name
+    # ASCII-safe even when the destination contains CJK or bracketed text.
     descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.",
+        prefix=".tenetora-download-",
         suffix=".part",
         dir=destination.parent,
     )
@@ -278,19 +289,26 @@ def _download_with_command(command: list[str], destination: Path, maximum: int) 
                 stderr=subprocess.DEVNULL,
                 check=False,
                 timeout=EXTERNAL_DOWNLOAD_TIMEOUT,
+                env={**os.environ, EXTERNAL_OUTPUT_ENV: str(temporary)},
             )
         except (OSError, subprocess.TimeoutExpired):
             return False
         if result.returncode != 0:
-            if result.returncode == 22 and "--write-out" in command:
+            # Some curl builds report receive/HTTP2 errors (56/92) after
+            # receiving a real HTTP error. The final --write-out status is
+            # still authoritative; an exit-code whitelist loses that evidence.
+            if "--write-out" in command or "-Command" in command:
                 status = getattr(result, "stdout", b"") or b""
                 if isinstance(status, bytes):
                     try:
                         status = status.decode("ascii")
                     except UnicodeDecodeError:
                         return False
-                if isinstance(status, str) and re.fullmatch(r"[45][0-9]{2}", status.strip()):
-                    raise ReleaseDownloadError(int(status.strip()))
+                if isinstance(status, str):
+                    prefix = POWERSHELL_HTTP_STATUS_PREFIX if "-Command" in command else ""
+                    match = re.fullmatch(re.escape(prefix) + r"([45][0-9]{2})", status.strip())
+                    if match:
+                        raise ReleaseDownloadError(int(match.group(1)))
             return False
         if not temporary.is_file():
             return False
@@ -342,6 +360,20 @@ def _external_download_commands(url: str, destination: Path) -> list[list[str]]:
     if IS_WINDOWS:
         powershell = shutil.which("pwsh") or shutil.which("powershell")
         if powershell:
+            # -Command's trailing argv is parsed as PowerShell source, not a
+            # reliable $args array. Only a base64 literal enters the script;
+            # pass the temporary output path in this child's environment.
+            encoded_url = base64.b64encode(url.encode("utf-8")).decode("ascii")
+            script = (
+                "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; "
+                "$uri = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('"
+                + encoded_url + "')); "
+                "try { Invoke-WebRequest -UseBasicParsing -Uri $uri "
+                f"-OutFile $env:{EXTERNAL_OUTPUT_ENV}; exit 0 }} "
+                "catch { if ($null -ne $_.Exception.Response) { "
+                f"[Console]::Out.Write('{POWERSHELL_HTTP_STATUS_PREFIX}' + "
+                "[int]$_.Exception.Response.StatusCode) }; exit 1 }"
+            )
             commands.append(
                 [
                     powershell,
@@ -349,9 +381,7 @@ def _external_download_commands(url: str, destination: Path) -> list[list[str]]:
                     "-NoProfile",
                     "-NonInteractive",
                     "-Command",
-                    "$ErrorActionPreference = 'Stop'; Invoke-WebRequest -Uri $args[0] -OutFile $args[1]",
-                    url,
-                    EXTERNAL_OUTPUT_PLACEHOLDER,
+                    script,
                 ]
             )
     return commands
@@ -412,13 +442,13 @@ def _download(url: str, destination: Path, maximum: int) -> None:
 def read_manifest(path: Path, *, require_artifact: bool) -> dict[str, Any]:
     try:
         if path.stat().st_size > MAX_MANIFEST_BYTES:
-            raise UpgradeAcquireError("release manifest exceeds the bounded size limit")
+            raise UpgradeAcquireError(MessageIssue('upgrade.release-manifest-exceeds-the-bounded-size-limit'))
         payload = json.loads(path.read_text(encoding="utf-8"))
         return normalize_manifest(payload, require_artifact=require_artifact)
     except (OSError, json.JSONDecodeError, UpgradeContractError) as exc:
         if isinstance(exc, UpgradeAcquireError):
             raise
-        raise UpgradeAcquireError(f"release manifest is invalid: {exc}") from exc
+        raise UpgradeAcquireError(MessageIssue('upgrade.release-manifest-invalid', parameters={'detail': message_issue(exc) or str(exc)})) from exc
 
 
 def _validate_acquisition_options(
@@ -432,7 +462,7 @@ def _validate_acquisition_options(
     source_options = (zip_file is not None, source_dir is not None)
     remote_options = (manifest_url is not None, zip_url is not None, mirror_url is not None)
     if sum(source_options) > 1 or any(remote_options) and any(source_options):
-        raise UpgradeAcquireError("release source options are mutually exclusive")
+        raise UpgradeAcquireError(MessageIssue('upgrade.release-source-options-are-mutually-exclusive'))
 
 
 def inspect_release_manifest(
@@ -477,15 +507,15 @@ def inspect_release_manifest(
     source_path = zip_file.expanduser().resolve(strict=True)
     try:
         if source_path.stat().st_size > MAX_ARCHIVE_BYTES:
-            raise UpgradeAcquireError("release ZIP exceeds the bounded size limit")
+            raise UpgradeAcquireError(MessageIssue('upgrade.release-zip-exceeds-the-bounded-size-limit'))
     except OSError as exc:
         raise UpgradeAcquireError("release ZIP is unreadable") from exc
     expected = expected_sha256.strip().lower() or companion_sha256(source_path) or ""
     if not expected:
-        raise UpgradeAcquireError("offline release ZIP requires --sha256 or a sibling .sha256 file")
+        raise UpgradeAcquireError(MessageIssue('upgrade.offline-release-zip-requires-sha256-or-a-sibling-sha256-file'))
     actual = file_sha256(source_path)
     if actual != expected:
-        raise UpgradeAcquireError("release ZIP SHA256 mismatch")
+        raise UpgradeAcquireError(MessageIssue('upgrade.release-zip-sha256-mismatch'))
     manifest = embedded_manifest(source_path)
     manifest["sha256"] = actual
     return manifest, "offline"
@@ -507,11 +537,11 @@ def embedded_manifest(archive_path: Path) -> dict[str, Any]:
         with zipfile.ZipFile(archive_path) as archive:
             payload = json.loads(archive.read("tenetora/manifest.json"))
     except (OSError, KeyError, RuntimeError, json.JSONDecodeError, zipfile.BadZipFile) as exc:
-        raise UpgradeAcquireError("release ZIP has no valid embedded manifest") from exc
+        raise UpgradeAcquireError(MessageIssue('upgrade.release-zip-has-no-valid-embedded-manifest')) from exc
     try:
         return normalize_manifest(payload, require_artifact=False)
     except UpgradeContractError as exc:
-        raise UpgradeAcquireError(f"embedded release manifest is invalid: {exc}") from exc
+        raise UpgradeAcquireError(MessageIssue('upgrade.embedded-release-manifest-invalid', parameters={'detail': message_issue(exc) or str(exc)})) from exc
 
 
 def safe_extract(archive_path: Path, destination: Path) -> Path:
@@ -521,7 +551,7 @@ def safe_extract(archive_path: Path, destination: Path) -> Path:
         with zipfile.ZipFile(archive_path) as archive:
             infos = archive.infolist()
             if not infos or len(infos) > MAX_EXTRACTED_FILES:
-                raise UpgradeAcquireError("release ZIP file count is invalid")
+                raise UpgradeAcquireError(MessageIssue('upgrade.release-zip-file-count-is-invalid'))
             seen: set[str] = set()
             portable_seen: set[str] = set()
             file_names: set[str] = set()
@@ -529,18 +559,18 @@ def safe_extract(archive_path: Path, destination: Path) -> Path:
             for info in infos:
                 path = PurePosixPath(info.filename)
                 if path.is_absolute() or "\x00" in info.filename or "\\" in info.filename or not path.parts or path.parts[0] != "tenetora" or ".." in path.parts:
-                    raise UpgradeAcquireError("release ZIP contains an unsafe path")
+                    raise UpgradeAcquireError(MessageIssue('upgrade.release-zip-contains-an-unsafe-path'))
                 normalized = path.as_posix().rstrip("/")
                 if normalized in seen:
-                    raise UpgradeAcquireError("release ZIP contains duplicate entries")
+                    raise UpgradeAcquireError(MessageIssue('upgrade.release-zip-contains-duplicate-entries'))
                 seen.add(normalized)
                 portable_name = unicodedata.normalize("NFC", normalized).casefold()
                 if portable_name in portable_seen:
-                    raise UpgradeAcquireError("release ZIP contains portable path collisions")
+                    raise UpgradeAcquireError(MessageIssue('upgrade.release-zip-contains-portable-path-collisions'))
                 portable_seen.add(portable_name)
                 mode = (info.external_attr >> 16) & 0o170000
                 if stat.S_ISLNK(mode):
-                    raise UpgradeAcquireError("release ZIP contains a symbolic link")
+                    raise UpgradeAcquireError(MessageIssue('upgrade.release-zip-contains-a-symbolic-link'))
                 if info.is_dir():
                     directory_names.add(normalized)
                 else:
@@ -549,10 +579,10 @@ def safe_extract(archive_path: Path, destination: Path) -> Path:
                 any(parent in file_names for parent in PurePosixPath(name).parents)
                 for name in file_names
             ):
-                raise UpgradeAcquireError("release ZIP contains a file and directory path collision")
+                raise UpgradeAcquireError(MessageIssue('upgrade.release-zip-contains-a-file-and-directory-path-collision'))
             total = sum(int(info.file_size) for info in infos)
             if total > MAX_EXTRACTED_BYTES:
-                raise UpgradeAcquireError("release ZIP expands beyond the bounded size limit")
+                raise UpgradeAcquireError(MessageIssue('upgrade.release-zip-expands-beyond-the-bounded-size-limit'))
             archive.extractall(destination)
             if os.name != "nt":
                 for info in infos:
@@ -564,10 +594,10 @@ def safe_extract(archive_path: Path, destination: Path) -> Path:
     except UpgradeAcquireError:
         raise
     except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
-        raise UpgradeAcquireError("release ZIP extraction failed") from exc
+        raise UpgradeAcquireError(MessageIssue('upgrade.release-zip-extraction-failed')) from exc
     root = destination / "tenetora"
     if not root.is_dir() or is_redirected_path(root):
-        raise UpgradeAcquireError("release ZIP root is invalid")
+        raise UpgradeAcquireError(MessageIssue('upgrade.release-zip-root-is-invalid-2'))
     return root
 
 
@@ -600,9 +630,9 @@ def acquire_release(
                 label="developer source",
             )
         except RuntimeError as exc:
-            raise UpgradeAcquireError(str(exc)) from exc
+            raise UpgradeAcquireError(message_issue(exc) or str(exc)) from exc
         if is_redirected_path(requested_source):
-            raise UpgradeAcquireError("developer source must not be a symbolic link")
+            raise UpgradeAcquireError(MessageIssue('upgrade.developer-source-must-not-be-a-symbolic-link'))
         original = requested_source.resolve(strict=True)
         root = workdir / "developer-source" / "tenetora"
         shutil.copytree(
@@ -615,7 +645,7 @@ def acquire_release(
         )
         entries = list(root.rglob("*"))
         if any(is_redirected_path(path) or (not path.is_file() and not path.is_dir()) for path in entries):
-            raise UpgradeAcquireError("developer source contains a symbolic link or special file")
+            raise UpgradeAcquireError(MessageIssue('upgrade.developer-source-contains-a-symbolic-link-or-special-file'))
         version = (root / "skills" / "tenetora" / "VERSION").read_text(encoding="utf-8").strip()
         commit_result = subprocess.run(
             ["git", "-C", str(original), "rev-parse", "--short", "HEAD"],
@@ -674,15 +704,15 @@ def acquire_release(
     else:
         source_path = zip_file.expanduser().resolve(strict=True)
         if source_path.stat().st_size > MAX_ARCHIVE_BYTES:
-            raise UpgradeAcquireError("release ZIP exceeds the bounded size limit")
+            raise UpgradeAcquireError(MessageIssue('upgrade.release-zip-exceeds-the-bounded-size-limit'))
         archive.write_bytes(source_path.read_bytes())
         expected = expected_sha256.strip().lower() or companion_sha256(source_path) or ""
         if not expected:
-            raise UpgradeAcquireError("offline release ZIP requires --sha256 or a sibling .sha256 file")
+            raise UpgradeAcquireError(MessageIssue('upgrade.offline-release-zip-requires-sha256-or-a-sibling-sha256-file'))
         source = "offline"
     actual = file_sha256(archive)
     if actual != expected:
-        raise UpgradeAcquireError("release ZIP SHA256 mismatch")
+        raise UpgradeAcquireError(MessageIssue('upgrade.release-zip-sha256-mismatch'))
     embedded = embedded_manifest(archive)
     if external is not None:
         for field in (
@@ -691,7 +721,7 @@ def acquire_release(
             "file_sha256", "channel", "stable_version", "preview_sequence", "adapter_version",
         ):
             if external.get(field) != embedded.get(field):
-                raise UpgradeAcquireError("external and embedded release manifests disagree")
+                raise UpgradeAcquireError(MessageIssue('upgrade.external-and-embedded-release-manifests-disagree'))
     root = safe_extract(archive, workdir / "extract")
     actual_files = sorted(
         path.relative_to(root).as_posix()
@@ -699,13 +729,13 @@ def acquire_release(
         if path.is_file() and not is_redirected_path(path) and path.relative_to(root).as_posix() != "manifest.json"
     )
     if actual_files != embedded["files"]:
-        raise UpgradeAcquireError("release ZIP file inventory does not match its manifest")
+        raise UpgradeAcquireError(MessageIssue('upgrade.release-zip-file-inventory-does-not-match-its-manifest'))
     actual_hashes = {
         relative: file_sha256(root / relative).lower()
         for relative in actual_files
     }
     if actual_hashes != embedded["file_sha256"]:
-        raise UpgradeAcquireError("release ZIP file contents do not match its manifest")
+        raise UpgradeAcquireError(MessageIssue('upgrade.release-zip-file-contents-do-not-match-its-manifest'))
     # The package digest authenticates the archive rather than an individual
     # payload file, so it is intentionally excluded from file_sha256. Persist
     # it only after both the archive and extracted inventory have been verified.

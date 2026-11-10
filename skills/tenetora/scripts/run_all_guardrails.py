@@ -148,10 +148,18 @@ def print_match(path: Path, line_no: int, line: str) -> None:
     print(f"{path}:{line_no}:{line.rstrip()}")
 
 
+def is_owned_check_path(root: Path, path: Path) -> bool:
+    """Exempt only scripts under this project's generated checks directory."""
+    try:
+        return path.relative_to(root).parts[:3] == ('.tenetora', 'guardrails', 'checks')
+    except ValueError:
+        return False
+
+
 def check_secret_scan(root: Path) -> bool:
     failed = False
     for path in iter_shareable_harness_files(root):
-        if "/guardrails/checks/" in path.as_posix():
+        if is_owned_check_path(root, path):
             continue
         for line_no, line in enumerate(read_text(path).splitlines(), start=1):
             if SECRET_PATTERN.search(line):
@@ -172,7 +180,7 @@ def check_secret_scan(root: Path) -> bool:
 def check_local_path_scan(root: Path) -> bool:
     failed = False
     for path in iter_shareable_harness_files(root):
-        if "/guardrails/checks/" in path.as_posix():
+        if is_owned_check_path(root, path):
             continue
         for line_no, line in enumerate(read_text(path).splitlines(), start=1):
             if LOCAL_PATH_PATTERN.search(line):

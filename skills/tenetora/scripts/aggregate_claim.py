@@ -20,15 +20,17 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from harness_io import atomic_write_text  # noqa: E402
 import alignment_state  # noqa: E402
-from governance_trail import load_trail  # noqa: E402
+from governance_trail import load_retained_trail  # noqa: E402
+from claim_evidence import superseding_failure  # noqa: E402
 import repository_units  # noqa: E402
 from path_security import is_redirected_path, validate_existing_project_path  # noqa: E402
 from worktree_fingerprint import (  # noqa: E402
     WORKTREE_FINGERPRINT_VERSION,
     git_head,
     git_state_fingerprint,
+    git_state_entries,
+    snapshot_fingerprint,
     normalize_scopes,
-    verification_scopes_intersect,
 )
 
 
@@ -221,8 +223,8 @@ def proof_event(child: Path, proof: str) -> tuple[dict[str, Any] | None, str | N
     problem = path_problem(child, relative)
     if problem:
         return None, "child-proof-trail-" + problem.removeprefix("child-path-")
-    payload = load_trail(child)
-    if payload.get("invalid"):
+    payload = load_retained_trail(child)
+    if payload.get("invalid") or payload.get('conflicts'):
         return None, "child-proof-trail-invalid"
     events = payload["events"]
     matching_index: int | None = None
@@ -233,27 +235,18 @@ def proof_event(child: Path, proof: str) -> tuple[dict[str, Any] | None, str | N
             matching_event = item
     if matching_event is None or matching_index is None:
         return None, "child-proof-missing"
+    from claim_evidence import claim_handoff_problem
+    if claim_handoff_problem(child, matching_event):
+        return None, 'child-proof-handoff-invalid'
     if matching_event.get("status") != "pass" or matching_event.get("verification_status") != "passed":
         return None, "child-proof-not-passed"
+    from execution_receipts import claim_execution_problem
+    if claim_execution_problem(child,matching_event):
+        return None,'child-proof-execution-invalid'
     if matching_event.get("claim_kind") not in {"completion", "partial-verification"}:
         return None, "child-proof-kind-invalid"
-    matching_scope = matching_event.get("verification_scope", [])
-    if not isinstance(matching_scope, list) or any(not isinstance(item, str) for item in matching_scope):
-        matching_scope = []
-    for item in events[matching_index + 1 :]:
-        if not isinstance(item, dict) or item.get("type") != "verification-claim":
-            continue
-        if item.get("status") == "pass" and item.get("verification_status") == "passed":
-            continue
-        later_scope = item.get("verification_scope", [])
-        if not isinstance(later_scope, list) or any(not isinstance(value, str) for value in later_scope):
-            return None, "child-proof-superseded"
-        try:
-            overlaps = verification_scopes_intersect(matching_scope, later_scope)
-        except ValueError:
-            overlaps = True
-        if overlaps:
-            return None, "child-proof-superseded"
+    if superseding_failure(events, matching_event):
+        return None, 'child-proof-superseded'
     return matching_event, None
 
 
@@ -263,32 +256,9 @@ def proof_evidence_fingerprint(event: dict[str, Any]) -> str:
 
 
 def proof_handoff_problem(child: Path, event: dict[str, Any]) -> str | None:
-    session_id = str(event.get("session_id") or "")
-    owner_id = str(event.get("owner_id") or "")
-    conversation_id = str(event.get("conversation_id") or "")
-    goal_fingerprint = str(event.get("goal_fingerprint") or "")
-    handoff_hash = str(event.get("handoff_hash") or "")
-    if not session_id or not owner_id or not conversation_id or not re.fullmatch(r"[0-9a-f]{64}", goal_fingerprint):
-        return "child-proof-handoff-invalid"
-    if not re.fullmatch(r"[0-9a-f]{64}", handoff_hash):
-        return "child-proof-handoff-invalid"
-    if event.get("confirmation_assurance") != "recorded-user-assertion":
-        return "child-proof-handoff-invalid"
-    try:
-        handoff = alignment_state.load_handoff(child, session_id)
-    except alignment_state.AlignmentStateError:
-        return "child-proof-handoff-invalid"
-    if not isinstance(handoff, dict):
-        return "child-proof-handoff-invalid"
-    if handoff.get("status") not in {"confirmed", "accepted-with-risks"}:
-        return "child-proof-handoff-invalid"
-    if handoff.get("owner_id") != owner_id or handoff.get("conversation_id") != conversation_id:
-        return "child-proof-handoff-invalid"
-    if handoff.get("goal_fingerprint") != goal_fingerprint:
-        return "child-proof-handoff-invalid"
-    if alignment_state.handoff_hash(handoff) != handoff_hash:
-        return "child-proof-handoff-invalid"
-    return None
+    from claim_evidence import claim_handoff_problem
+
+    return 'child-proof-handoff-invalid' if claim_handoff_problem(child, event, required=True) else None
 
 
 def indexed_gitlink_snapshot(parent: Path) -> tuple[list[dict[str, Any]], list[str]]:
@@ -326,7 +296,7 @@ def child_summary(parent: Path, path: str, proof: str) -> tuple[dict[str, Any], 
     except ValueError:
         verification_scope = []
         problems.append("child-proof-verification-scope-invalid")
-    current_fingerprint = git_state_fingerprint(child, verification_scope)
+    current_fingerprint = git_state_fingerprint(child, verification_scope,known_paths=event.get('git_state_entries') or () if event else ())
     if event and event.get("project_root_fingerprint") != project_root_fingerprint(child):
         problems.append("child-proof-project-mismatch")
     if event:
@@ -354,10 +324,11 @@ def child_summary(parent: Path, path: str, proof: str) -> tuple[dict[str, Any], 
     return summary, sorted(set(problems))
 
 
-def collect_snapshot(parent: Path, proofs: dict[str, str]) -> tuple[dict[str, Any], list[str]]:
+def collect_snapshot(parent: Path, proofs: dict[str, str], *, known_paths=()) -> tuple[dict[str, Any], list[str]]:
     problems: list[str] = []
     parent_head = git_head(parent)
-    parent_fingerprint = git_state_fingerprint(parent)
+    parent_entries=git_state_entries(parent,known_paths=known_paths)
+    parent_fingerprint = snapshot_fingerprint(parent_entries) if parent_entries is not None else None
     if parent_head is None:
         problems.append("parent-git-head-unavailable")
     if parent_fingerprint is None:
@@ -397,6 +368,7 @@ def collect_snapshot(parent: Path, proofs: dict[str, str]) -> tuple[dict[str, An
         "worktree_fingerprint_version": WORKTREE_FINGERPRINT_VERSION,
         "parent_head": parent_head,
         "parent_git_state_fingerprint": parent_fingerprint,
+        "parent_git_state_entries": parent_entries,
         "gitlinks": gitlinks,
         "children": sorted(children, key=lambda item: str(item["path"])),
     }, sorted(set(problems))
@@ -472,7 +444,7 @@ def check_aggregate(parent: Path) -> dict[str, Any]:
         proofs[path] = proof
     if child_state_problems:
         return failure_payload(child_state_problems)
-    snapshot, problems = collect_snapshot(parent, proofs)
+    snapshot, problems = collect_snapshot(parent, proofs,known_paths=state.get('parent_git_state_entries') or ())
     if state.get("aggregate_proof") != aggregate_proof_for(snapshot):
         problems.append("aggregate-proof-mismatch")
     if snapshot.get("parent_git_state_fingerprint") != state.get("parent_git_state_fingerprint"):

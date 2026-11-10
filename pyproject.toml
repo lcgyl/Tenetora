@@ -6,6 +6,11 @@ build-backend = "setuptools.build_meta"
 # 锁定 3.9，避免 formatter/lint 写回项目最低版本无法解析的语法。
 target-version = "py39"
 
+[tool.ruff.lint]
+# High-signal errors and risky exception/closure patterns. Historical debt is
+# individually fingerprinted by scripts/check-lint-baseline.py, never ignored.
+select = ["E9", "F", "B023", "BLE"]
+
 [project]
 name = "tenetora"
 dynamic = ["version"]

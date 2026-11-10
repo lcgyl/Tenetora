@@ -40,7 +40,7 @@ from governance_paths import (  # noqa: E402
     write_json_atomic,
 )
 from harness_io import atomic_write_bytes, atomic_write_text  # noqa: E402
-from tenetora.path_security import validate_unredirected_path  # noqa: E402
+from tenetora.path_security import is_redirected_path, validate_unredirected_path  # noqa: E402
 
 
 FAMILY_WEIGHTS = {
@@ -82,6 +82,7 @@ KNOWN_TOP_LEVEL = {
     "workflows",
 }
 MIXED_COPY_TOP_LEVEL = KNOWN_TOP_LEVEL - {".cache", "tmp"}
+CANONICAL_EPHEMERAL_DIRS = frozenset({".cache", "tmp"})
 TEXT_SUFFIXES = {
     "",
     ".json",
@@ -157,9 +158,9 @@ def relative(path: Path, root: Path) -> str:
         return path.as_posix()
 
 
-def unsafe_governance_entries(directory: Path) -> list[Path]:
+def unsafe_governance_entries(directory: Path, *, exclude_ephemeral: bool = False) -> list[Path]:
     """Find links or unreadable entries before any governance tree is consumed."""
-    if directory.is_symlink():
+    if is_redirected_path(directory):
         return [directory]
     if not directory.is_dir():
         return []
@@ -173,11 +174,19 @@ def unsafe_governance_entries(directory: Path) -> list[Path]:
             unsafe.append(current)
             continue
         for child in children:
-            if child.is_symlink():
+            if is_redirected_path(child):
                 unsafe.append(child)
             elif child.is_dir():
+                if exclude_ephemeral and current == directory and child.name in CANONICAL_EPHEMERAL_DIRS:
+                    continue
                 pending.append(child)
     return unsafe
+
+
+def governance_entry_label(directory: Path, entry: Path) -> str:
+    """Keep the actionable lexical entry visible without resolving its target."""
+    relative_entry = entry.relative_to(directory)
+    return directory.name if relative_entry == Path('.') else (Path(directory.name) / relative_entry).as_posix()
 
 
 def signal(signals: list[Signal], family: str, code: str, path: Path, root: Path, detail: str) -> None:
@@ -193,10 +202,29 @@ def safe_read(path: Path, limit: int = 512_000) -> str:
         return ""
 
 
-def iter_files(directory: Path) -> Iterable[Path]:
+def iter_files(directory: Path, *, exclude_ephemeral: bool = False) -> Iterable[Path]:
+    if exclude_ephemeral and is_redirected_path(directory):
+        raise RuntimeError(f"operational governance directory is redirected: {directory.name}")
     if not directory.is_dir():
         return []
-    return (path for path in directory.rglob("*") if path.is_file() and not path.is_symlink())
+    if not exclude_ephemeral:
+        return (path for path in directory.rglob("*") if path.is_file() and not path.is_symlink())
+
+    def operational_files() -> Iterable[Path]:
+        def unreadable(error: OSError) -> None:
+            raise error
+
+        for parent, directories, filenames in os.walk(directory, followlinks=False, onerror=unreadable):
+            current = Path(parent)
+            directories[:] = [name for name in directories
+                              if not is_redirected_path(current / name)
+                              and not (current == directory and name in CANONICAL_EPHEMERAL_DIRS)]
+            for name in filenames:
+                path = current / name
+                if not is_redirected_path(path) and path.is_file():
+                    yield path
+
+    return operational_files()
 
 
 def hash_file(path: Path) -> str:
@@ -458,7 +486,7 @@ def classify_legacy(root: Path, legacy: Path, canonical: Path) -> Classification
             confidence=0,
             source=str(legacy),
             destination=str(canonical),
-            message=f"legacy governance directory contains an unsafe symbolic link or unreadable entry: {unsafe[0]}",
+            message=f"legacy governance directory contains an unsafe symbolic link or unreadable entry: {governance_entry_label(legacy, unsafe[0])}",
         )
     if not legacy.is_dir():
         return Classification(
@@ -534,14 +562,14 @@ def classify_project(root: Path) -> Classification:
     root = raw_root
     canonical = canonical_dir(root)
     legacy = legacy_dir(root)
-    unsafe_canonical = unsafe_governance_entries(canonical)
+    unsafe_canonical = unsafe_governance_entries(canonical, exclude_ephemeral=True)
     if unsafe_canonical:
         return Classification(
             status="canonical-invalid",
             confidence=0,
             source=str(canonical),
             destination=str(canonical),
-            message=f"canonical governance directory contains an unsafe symbolic link or unreadable entry: {unsafe_canonical[0]}",
+            message=f"canonical governance directory contains an unsafe symbolic link or unreadable entry: {governance_entry_label(canonical, unsafe_canonical[0])}",
         )
     if canonical.exists():
         errors = manifest_errors(canonical)
@@ -789,6 +817,8 @@ PRESERVED_PROVENANCE_STATE = {
     "state/benchmark-history.json",
     "state/change-impact.json",
     "state/current-alignment.json",
+    "state/completion-commits/",
+    "state/verification-runs/",
     "state/delegation-state.json",
     "state/governance-trail.json",
     "state/loop-state.json",
@@ -849,12 +879,12 @@ def preserves_historical_semantics(relative_path: Path) -> bool:
     return relative_path.suffix.lower() == ".md" or "migration-plan" in relative_path.name
 
 
-def rewrite_tree(directory: Path, rewrite_report: list[dict[str, Any]] | None = None) -> list[str]:
-    unsafe = unsafe_governance_entries(directory)
+def rewrite_tree(directory: Path, rewrite_report: list[dict[str, Any]] | None = None, *, exclude_ephemeral: bool = False) -> list[str]:
+    unsafe = unsafe_governance_entries(directory, exclude_ephemeral=exclude_ephemeral)
     if unsafe:
-        raise RuntimeError(f"governance tree contains an unsafe symbolic link or unreadable entry: {unsafe[0]}")
+        raise RuntimeError(f"governance tree contains an unsafe symbolic link or unreadable entry: {governance_entry_label(directory, unsafe[0])}")
     changed: list[str] = []
-    for path in iter_files(directory):
+    for path in iter_files(directory, exclude_ephemeral=exclude_ephemeral):
         relative_path = path.relative_to(directory)
         if relative_path.as_posix() == "state/current-alignment.json":
             if rewrite_alignment_handoff_locator(path):
@@ -878,7 +908,11 @@ def rewrite_tree(directory: Path, rewrite_report: list[dict[str, Any]] | None = 
         for path in sorted(skills_dir.glob("agent-harness*.md")):
             target = path.with_name(path.name.replace("agent-harness", "tenetora", 1))
             if not target.exists():
-                path.rename(target)
+                if os.environ.get('TENETORA_SURFACE_JOURNAL'):
+                    from installation_transaction import environment_journal
+                    environment_journal().move(path, target)
+                else:
+                    path.rename(target)
                 changed.append(target.relative_to(directory).as_posix())
     return changed
 
@@ -1041,7 +1075,7 @@ def apply_migration(root: Path, classification: Classification, *, allow_mixed: 
         return MigrationResult("blocked", classification, message=str(exc))
     if classification.status in {"canonical", "canonical-with-foreign", "canonical-with-preserved-legacy"}:
         rewrite_report: list[dict[str, Any]] = []
-        changed = rewrite_tree(canonical_dir(root), rewrite_report)
+        changed = rewrite_tree(canonical_dir(root), rewrite_report, exclude_ephemeral=True)
         if changed:
             return MigrationResult(
                 "repaired",
@@ -1101,7 +1135,11 @@ def apply_migration(root: Path, classification: Classification, *, allow_mixed: 
         errors = validate_staging(staging)
         if errors:
             raise RuntimeError("; ".join(errors))
-        os.replace(staging, destination)
+        if os.environ.get('TENETORA_SURFACE_JOURNAL'):
+            from installation_transaction import publish
+            publish(staging, destination)
+        else:
+            os.replace(staging, destination)
         published = True
         preserved = classification.status != "legacy-owned"
         changed_adapters, _ = rewrite_adapters(root, backup, backups=adapters, rewrite_report=rewrite_report)
@@ -1114,7 +1152,11 @@ def apply_migration(root: Path, classification: Classification, *, allow_mixed: 
         )
         changed_adapters.extend(ignore_changes)
         if not preserved:
-            shutil.rmtree(source)
+            if os.environ.get('TENETORA_SURFACE_JOURNAL'):
+                from installation_transaction import remove
+                remove(source)
+            else:
+                shutil.rmtree(source)
         entry = {
             "project_id": read_manifest(destination).get("project_id") if read_manifest(destination) else "",
             "status": "completed",
@@ -1145,7 +1187,11 @@ def apply_migration(root: Path, classification: Classification, *, allow_mixed: 
     except Exception as exc:
         restore_adapters(adapters)
         if published and destination.exists() and source.exists():
-            shutil.rmtree(destination)
+            if os.environ.get('TENETORA_SURFACE_JOURNAL'):
+                from installation_transaction import remove
+                remove(destination)
+            else:
+                shutil.rmtree(destination)
         if staging.exists():
             shutil.rmtree(staging)
         try:

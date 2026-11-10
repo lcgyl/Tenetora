@@ -43,7 +43,7 @@ from tenetora.brand import (  # noqa: E402
     validate_managed_home_path,
 )
 from tenetora.path_security import (  # noqa: E402
-    ensure_unredirected_directory,
+    ensure_unredirected_directory as original_ensure_directory,
     is_allowed_system_redirect,
     is_redirected_path,
     remove_unredirected_entry,
@@ -87,8 +87,38 @@ from installation_registry import (  # noqa: E402
     upsert_global_surfaces,
     upsert_project,
 )
-from install_progress import InstallProgress, redact, redact_value, write_failure_artifacts  # noqa: E402
-from tool_installers import definitions_for_installer, tool_definition, tool_installer, tool_names  # noqa: E402
+from install_progress import InstallProgress, is_expected_skills_only_payload, redact, redact_value, write_failure_artifacts  # noqa: E402
+from tool_installers import ToolDefinition, definitions_for_installer, tool_definition, tool_installer, tool_names  # noqa: E402
+from installation_transaction import (  # noqa: E402
+    environment_journal, journaled, operation as surface_operation, private_staging,
+    backup_and_remove as _copy_installation_backup,
+    publish as publish_installation_entry, remove as remove_installation_entry,
+    snapshot as snapshot_installation, fingerprint as installation_fingerprint,
+)
+
+
+def ensure_unredirected_directory(path: Path, *, label: str) -> Path:
+    journal = environment_journal()
+    if journal is None:
+        return original_ensure_directory(path, label=label)
+    path = Path(path)
+    if path.exists() or path_is_redirected(path):
+        return original_ensure_directory(path, label=label)
+    if not path.parent.exists():
+        ensure_unredirected_directory(path.parent, label=label)
+    staging = Path(tempfile.mkdtemp(prefix='.tenetora-directory-', dir=path.parent))
+    staging.rmdir()
+    try:
+        with private_staging(staging):
+            original_ensure_directory(staging, label=label)
+            journal.mkdir(path, staging)
+            return path
+    finally:
+        if staging.exists():
+            staging.rmdir()
+
+upsert_project = journaled(lambda _bound: [registry_path()])(upsert_project)
+upsert_global_surfaces = journaled(lambda _bound: [registry_path()])(upsert_global_surfaces)
 
 
 @contextmanager
@@ -1019,7 +1049,7 @@ def parse_tools(raw: str) -> list[str]:
 
 
 def remove_existing(path: Path) -> None:
-    remove_unredirected_entry(path, label="managed install entry")
+    remove_installation_entry(path)
 
 
 def write_text_atomic(path: Path, text: str) -> None:
@@ -1038,7 +1068,7 @@ def write_text_atomic(path: Path, text: str) -> None:
             os.fsync(handle.fileno())
         try:
             backup_temporary.chmod(target_mode)
-            os.replace(backup_temporary, backup)
+            publish_installation_entry(backup_temporary, backup)
         finally:
             backup_temporary.unlink(missing_ok=True)
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="", dir=path.parent, delete=False) as handle:
@@ -1048,7 +1078,7 @@ def write_text_atomic(path: Path, text: str) -> None:
         os.fsync(handle.fileno())
     try:
         temporary.chmod(target_mode)
-        os.replace(temporary, path)
+        publish_installation_entry(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -1083,7 +1113,7 @@ def write_json_atomic(path: Path, payload: dict[str, object]) -> None:
             os.fsync(handle.fileno())
         try:
             backup_temporary.chmod(target_mode)
-            os.replace(backup_temporary, backup)
+            publish_installation_entry(backup_temporary, backup)
         finally:
             backup_temporary.unlink(missing_ok=True)
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
@@ -1095,7 +1125,7 @@ def write_json_atomic(path: Path, payload: dict[str, object]) -> None:
         os.fsync(handle.fileno())
     try:
         temporary.chmod(target_mode)
-        os.replace(temporary, path)
+        publish_installation_entry(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -1319,6 +1349,35 @@ def native_plugin_source_path(version: str, target: str | None = None) -> Path:
     return path / target if target else path
 
 
+def windows_claude_hook_bytes(data: bytes) -> bytes:
+    """Render the managed Claude hook template without filesystem side effects."""
+    payload = json.loads(data)
+    if not isinstance(payload, dict) or not isinstance(payload.get("hooks"), dict):
+        raise ValueError("Claude Hook template must contain a hooks object")
+    for groups in payload["hooks"].values():
+        if not isinstance(groups, list):
+            continue
+        for group in groups:
+            entries = group.get("hooks") if isinstance(group, dict) else None
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if isinstance(entry, dict) and isinstance(entry.get("command"), str):
+                    entry["command"] = entry["command"].replace(
+                        "${CLAUDE_PLUGIN_ROOT}/hooks/run-hook",
+                        "${CLAUDE_PLUGIN_ROOT}\\hooks\\run-hook.cmd",
+                    )
+    return (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def copy_native_plugin_payload(source: Path, dest: Path, target: str) -> None:
+    """Render one native payload without publishing it to a machine home."""
+    plugin_copy(source, dest, target=target)
+    if target == "claude" and os.name == "nt":
+        hooks_path = dest / "hooks" / "hooks-claude.json"
+        hooks_path.write_bytes(windows_claude_hook_bytes(hooks_path.read_bytes()))
+
+
 def materialize_native_plugin_source(source: Path, version: str, target: str) -> Path:
     """Build a persistent native-plugin payload that exposes canonical skills only."""
     dest = ensure_safe_directory_chain(
@@ -1328,24 +1387,7 @@ def materialize_native_plugin_source(source: Path, version: str, target: str) ->
     ensure_unredirected_directory(dest.parent, label="native plugin source parent")
     temporary = dest.__class__(tempfile.mkdtemp(prefix=f".{dest.name}.", dir=str(dest.parent)))
     try:
-        plugin_copy(source, temporary, target=target)
-        if target == "claude" and os.name == "nt":
-            hooks_path = temporary / "hooks" / "hooks-claude.json"
-            payload = json.loads(hooks_path.read_text(encoding="utf-8"))
-            for groups in payload.get("hooks", {}).values():
-                if not isinstance(groups, list):
-                    continue
-                for group in groups:
-                    entries = group.get("hooks") if isinstance(group, dict) else None
-                    if not isinstance(entries, list):
-                        continue
-                    for entry in entries:
-                        if isinstance(entry, dict) and isinstance(entry.get("command"), str):
-                            entry["command"] = entry["command"].replace(
-                                "${CLAUDE_PLUGIN_ROOT}/hooks/run-hook",
-                                "${CLAUDE_PLUGIN_ROOT}\\hooks\\run-hook.cmd",
-                            )
-            hooks_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        copy_native_plugin_payload(source, temporary, target)
         if dest.exists() or path_is_redirected(dest):
             remove_existing(dest)
         os.replace(temporary, dest)
@@ -1371,6 +1413,10 @@ def materialize_zcode_hooks(source: Path, dest: Path) -> None:
             for entry in entries:
                 if isinstance(entry, dict) and entry.get("type") == "process" and entry.get("command") == "python3":
                     entry["command"] = sys.executable
+                    if isinstance(entry.get("args"), list) and entry["args"][:1] != ["-I"]:
+                        entry["args"].insert(0, "-I")
+                    if isinstance(entry.get("args"), list) and entry["args"][:2] != ["-I", "-B"]:
+                        entry["args"].insert(1, "-B")
     output = ensure_safe_file_path(dest / "hooks" / "hooks.json", label="ZCode hooks output")
     ensure_unredirected_directory(output.parent, label="ZCode hooks directory")
     write_json_atomic(output, payload)
@@ -1381,8 +1427,20 @@ def create_plugin_install(source: Path, dest: Path, actual_mode: str) -> str:
     ensure_safe_directory_chain(dest, label="ZCode plugin cache")
     if actual_mode != "copy":
         raise ValueError("ZCode native plugin cache requires copy mode")
-    plugin_copy(source, dest)
-    materialize_zcode_hooks(source, dest)
+    if environment_journal() is None:
+        plugin_copy(source, dest)
+        materialize_zcode_hooks(source, dest)
+    else:
+        staging = Path(tempfile.mkdtemp(prefix='.tenetora-plugin-', dir=dest.parent))
+        staging.rmdir()
+        try:
+            with private_staging(staging):
+                plugin_copy(source, staging)
+                materialize_zcode_hooks(source, staging)
+                publish_installation_entry(staging, dest)
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging)
     return f"copy {dest}"
 
 
@@ -1684,7 +1742,7 @@ def clean_legacy_zcode_plugin(
             transaction.stage_archive(legacy, backup)
         else:
             ensure_unredirected_directory(backup.parent, label="ZCode legacy plugin backup parent")
-            shutil.move(str(legacy), str(backup))
+            _copy_installation_backup(legacy, backup)
         report.lines.append(status_line("MIGRATE", "zcode", legacy_scope, "plugin", f"moved legacy plugin {legacy} to {backup}"))
         if legacy_scope == "project":
             prune_empty_project_zcode_plugin_root(project_root, legacy, report, dry_run)
@@ -1753,7 +1811,7 @@ def clean_legacy_zcode_install(
                 transaction.stage_archive(dest, backup)
             else:
                 ensure_unredirected_directory(backup.parent, label="ZCode legacy skill backup parent")
-                shutil.move(str(dest), str(backup))
+                _copy_installation_backup(dest, backup)
             report.lines.append(status_line("MIGRATE", "zcode", scope, skill_name, f"moved managed fallback symlink {dest} to {backup}"))
             continue
         backup_root = backup_root or next_legacy_backup_root(scope, project_root)
@@ -1765,7 +1823,7 @@ def clean_legacy_zcode_install(
             transaction.stage_archive(dest, backup)
         else:
             ensure_unredirected_directory(backup.parent, label="ZCode legacy skill backup parent")
-            shutil.move(str(dest), str(backup))
+            _copy_installation_backup(dest, backup)
         report.lines.append(status_line("MIGRATE", "zcode", scope, skill_name, f"moved legacy skill copy {dest} to {backup}"))
 
 
@@ -1872,6 +1930,10 @@ class ZCodeInstallTransaction:
         source/destination in the diagnostic message once the budget is
         exhausted. Non-Windows behaviour is a plain replace.
         """
+        journal = environment_journal()
+        if journal is not None:
+            journal.move(source, destination)
+            return
         if os.name != "nt":
             source.replace(destination)
             return
@@ -1936,7 +1998,7 @@ class ZCodeInstallTransaction:
     @staticmethod
     def restore_file(path: Path, content: bytes | None) -> None:
         if content is None:
-            remove_unredirected_entry(path, label="ZCode transaction file")
+            remove_installation_entry(path)
             return
         path = ensure_safe_file_path(path, label="ZCode transaction file")
         ensure_unredirected_directory(path.parent, label="ZCode transaction file parent")
@@ -1948,7 +2010,7 @@ class ZCodeInstallTransaction:
             os.fsync(handle.fileno())
         try:
             temporary.chmod(mode)
-            os.replace(temporary, path)
+            publish_installation_entry(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -2038,6 +2100,11 @@ class ZCodeInstallTransaction:
             self.rollback_conflicts.append(f"ZCode config concurrent change was preserved: {exc}")
 
     def rollback(self) -> None:
+        if environment_journal() is not None:
+            # The enclosing upgrade owns the complete filesystem snapshot.
+            # Legacy local renames must never run ahead of its conditional
+            # recovery or overwrite a path another writer just created.
+            return
         for original, moved, _preserve in reversed(self.path_moves):
             if not (moved.exists() or path_is_redirected(moved)):
                 continue
@@ -2728,7 +2795,7 @@ def clean_legacy_native_skills(target: str, project_root: Path, report: InstallR
                 report.lines.append(status_line("MIGRATE", target, "global", skill_name, f"would move managed fallback symlink {dest} to {backup}"))
             else:
                 ensure_unredirected_directory(backup.parent, label="legacy native skill backup parent")
-                shutil.move(str(dest), str(backup))
+                _copy_installation_backup(dest, backup)
                 report.lines.append(status_line("MIGRATE", target, "global", skill_name, f"moved managed fallback symlink {dest} to {backup}"))
             continue
         if backup_root is None:
@@ -2739,8 +2806,162 @@ def clean_legacy_native_skills(target: str, project_root: Path, report: InstallR
             report.lines.append(status_line("MIGRATE", target, "global", skill_name, f"would move legacy skill copy {dest} to {backup}"))
         else:
             ensure_unredirected_directory(backup.parent, label="legacy native skill backup parent")
-            shutil.move(str(dest), str(backup))
+            _copy_installation_backup(dest, backup)
             report.lines.append(status_line("MIGRATE", target, "global", skill_name, f"moved legacy skill copy {dest} to {backup}"))
+
+
+def native_metadata_signature(raw: bytes | None, kind: str, *, current: bool,
+                              source: Path, install_path: Path, version: str):
+    """Retain every field outside the native manager's exact product entries."""
+    owned = {NATIVE_PLUGIN_ID, LEGACY_NATIVE_PLUGIN_ID}
+    markets = {NATIVE_MARKETPLACE_ID, LEGACY_NATIVE_MARKETPLACE_ID}
+    if kind == 'config.toml':
+        from tenetora import codex_legacy_recovery as recovery
+        text = (raw or b'').decode('utf-8')
+        sections = recovery.parse_sections(text)
+        preamble = text[:sections[0].start] if sections else text
+        foreign = []
+        for section in sections:
+            product = len(section.key) == 2 and (
+                section.key[0] == 'plugins' and section.key[1] in owned
+                or section.key[0] == 'marketplaces' and section.key[1] in markets)
+            if not product:
+                foreign.append((section.key, section.array, section.text.rstrip()))
+                continue
+            kept = []
+            for line in section.text.splitlines()[1:]:
+                if section.key[0] == 'plugins' and re.fullmatch(r'\s*enabled\s*=\s*(true|false)\s*', line):
+                    if current and section.key[1] == NATIVE_PLUGIN_ID and line.strip().endswith('false'):
+                        raise ValueError('native plugin remains disabled')
+                    continue
+                if section.key[0] == 'marketplaces' and re.match(r'\s*source\s*=', line):
+                    value = recovery._marketplace_source(section)
+                    if current and section.key[1] == NATIVE_MARKETPLACE_ID and value != str(source):
+                        raise ValueError('native marketplace source does not match the requested payload')
+                    continue
+                if line.strip():
+                    kept.append(line)
+            if kept:
+                foreign.append((section.key, section.array, '\n'.join(kept)))
+        return preamble.rstrip(), foreign
+
+    payload = json.loads(raw) if raw else {}
+    if not isinstance(payload, dict):
+        raise ValueError('unknown native metadata shape')
+    if kind == 'settings.json':
+        for container in (payload, payload.get('plugins')):
+            if not isinstance(container, dict):
+                continue
+            values = container.get('enabledPlugins')
+            if not isinstance(values, dict):
+                continue
+            for name in owned & values.keys():
+                if not isinstance(values[name], bool):
+                    raise ValueError('unknown plugin activation shape')
+                if current and name == NATIVE_PLUGIN_ID and not values[name]:
+                    raise ValueError('native plugin remains disabled')
+                del values[name]
+            if not values:
+                del container['enabledPlugins']
+        if payload.get('plugins') == {}:
+            del payload['plugins']
+        return payload
+
+    def plugin_row(value):
+        if isinstance(value, list):
+            return [foreign for row in value if (foreign := plugin_row(row))]
+        if not isinstance(value, dict) or value.get('scope') not in (None, 'user', 'global'):
+            return value
+        if current:
+            if ('enabled' in value and not isinstance(value['enabled'], bool)):
+                raise ValueError('unknown plugin activation shape')
+            if value.get('version', version) != version or value.get('enabled') is False:
+                raise ValueError('native registration does not match the requested version')
+            recorded_path = value.get('installPath', value.get('install_path'))
+            if recorded_path is not None and Path(recorded_path).resolve() != install_path.resolve():
+                raise ValueError('native registration does not match the requested path')
+        fields = {'id', 'name', 'marketplace', 'scope', 'version', 'enabled', 'installPath', 'install_path',
+                  'installedAt', 'lastUpdated', 'installed_at', 'updated_at'}
+        return {key: item for key, item in value.items() if key not in fields}
+
+    if kind == 'installed_plugins.json':
+        for name in ('plugins', 'installed'):
+            values = payload.get(name)
+            if isinstance(values, dict):
+                for identity in owned & values.keys():
+                    foreign = plugin_row(values[identity])
+                    if foreign:
+                        values[identity] = foreign
+                    else:
+                        del values[identity]
+            elif isinstance(values, list):
+                remaining = []
+                for entry in values:
+                    managed = isinstance(entry, dict) and (
+                        entry.get('id') in owned or (entry.get('name'), entry.get('marketplace')) in {
+                            (PLUGIN_REGISTRATION_NAME, NATIVE_MARKETPLACE_ID),
+                            (LEGACY_PLUGIN_REGISTRATION_NAME, LEGACY_NATIVE_MARKETPLACE_ID)})
+                    foreign = plugin_row(entry) if managed else entry
+                    if foreign:
+                        remaining.append(foreign)
+                payload[name] = remaining
+            elif values is not None:
+                raise ValueError('unknown native plugin registry shape')
+            if payload.get(name) in ({}, []):
+                del payload[name]
+        if type(payload.get('version')) is int and payload['version'] in (1, 2):
+            del payload['version']
+        return payload
+
+    if kind == 'known_marketplaces.json':
+        values = payload.get('marketplaces', payload)
+        if not isinstance(values, dict):
+            raise ValueError('unknown native marketplace registry shape')
+        for name in markets & values.keys():
+            row = values[name]
+            if not isinstance(row, dict):
+                raise ValueError('unknown native marketplace entry shape')
+            descriptor = row.get('source')
+            if current and name == NATIVE_MARKETPLACE_ID:
+                location = descriptor.get('path') if isinstance(descriptor, dict) else descriptor
+                if location != str(source):
+                    raise ValueError('native marketplace source does not match the requested payload')
+            foreign = {key: item for key, item in row.items()
+                       if key not in {'source', 'installLocation', 'lastUpdated', 'installedAt'}}
+            if isinstance(descriptor, dict):
+                extra = {key: item for key, item in descriptor.items() if key not in {'source', 'path'}}
+                if extra:
+                    foreign['source'] = extra
+            if foreign:
+                values[name] = foreign
+            else:
+                del values[name]
+        if payload.get('marketplaces') == {}:
+            del payload['marketplaces']
+        return payload
+    raise ValueError('unsupported native metadata format')
+
+
+def record_native_installation(target: str, project_root: Path, install_path: Path,
+                               source: Path, version: str) -> None:
+    journal = environment_journal()
+    if journal is None:
+        return
+    journal.accept_verified(install_path, lambda _before, after:
+                            installation_fingerprint(after) == installation_fingerprint(source))
+    home = target_base(target, 'global', project_root).parent
+    for path in (home / 'config.toml', home / 'settings.json', home / 'plugins/installed_plugins.json',
+                 home / 'plugins/known_marketplaces.json'):
+        def verify(before, after, item=path):
+            try:
+                original = native_metadata_signature(before.read_bytes() if before is not None else None,
+                    item.name, current=False, source=source, install_path=install_path, version=version)
+                updated = native_metadata_signature(after.read_bytes() if after.is_file() else None,
+                    item.name, current=True, source=source, install_path=install_path, version=version)
+                return original == updated
+            except (OSError, UnicodeError, ValueError, TypeError):
+                return False
+        journal.accept_verified(path, verify)
 
 
 def _install_native_cli_plugin(
@@ -2922,6 +3143,8 @@ def _install_native_cli_plugin(
                 "restart Claude Code, then verify runtime state with tenetora doctor --tools claude",
             )
         )
+    record_native_installation(target, project_root, install_path,
+                               native_plugin_source_path(source_version, target), source_version)
     return report
 
 
@@ -3593,7 +3816,7 @@ def ensure_project_runtime_git_exclude(
     try:
         temporary.write_bytes(prefix + encoded_pattern + b"\n")
         temporary.chmod(target_mode)
-        os.replace(temporary, write_path)
+        publish_installation_entry(temporary, write_path)
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -3707,7 +3930,7 @@ def ensure_project_skill_compat_git_exclude(
             rendered += canonical_pattern_bytes + b"\n"
         temporary.write_bytes(rendered)
         temporary.chmod(target_mode)
-        os.replace(temporary, write_path)
+        publish_installation_entry(temporary, write_path)
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -4215,18 +4438,18 @@ def install_runtime_adapter(
         if path.exists() and state == "conflict":
             backup = path.with_name(f"tenetora.js.backup-{datetime.now().strftime('%Y%m%d%H%M%S')}")
             shutil.copy2(path, backup)
-        path.write_text(materialized_opencode_plugin(source), encoding="utf-8")
+        write_text_atomic(path, materialized_opencode_plugin(source))
         legacy_path = path.with_name("agent-harness.js")
         if legacy_path.is_file():
             historical_state, _ = historical_opencode_runtime_state(legacy_path)
             if historical_state == "legacy-ok":
-                legacy_path.unlink()
+                remove_installation_entry(legacy_path)
         message = "installed native OpenCode plugin; context and pre-tool git guard active"
     else:
         if path.exists() and state == "conflict":
             backup = path.with_name(f"tenetora.ts.backup-{datetime.now().strftime('%Y%m%d%H%M%S')}")
             shutil.copy2(path, backup)
-        path.write_text(materialized_pi_extension(source), encoding="utf-8")
+        write_text_atomic(path, materialized_pi_extension(source))
         message = "installed native Pi extension; context and pre-tool git guard active-partial"
     report.lines.append(status_line(status, target, scope, "runtime", f"{message}: {path}"))
     report.installed += int(state == "missing")
@@ -4234,6 +4457,7 @@ def install_runtime_adapter(
     return report
 
 
+@journaled(lambda bound: runtime_transaction_paths(bound['target'], bound['scope'], bound['project_root']))
 def remove_runtime_adapter(
     target: str,
     scope: str,
@@ -4266,13 +4490,13 @@ def remove_runtime_adapter(
         report.updated += 1
         return report
     if target in {"opencode", "pi"}:
-        path.unlink()
+        remove_installation_entry(path)
         if target == "opencode":
             legacy_path = path.with_name("agent-harness.js")
             if legacy_path.is_file():
                 historical_state, _ = historical_opencode_runtime_state(legacy_path)
                 if historical_state == "legacy-ok":
-                    legacy_path.unlink()
+                    remove_installation_entry(legacy_path)
     else:
         payload = json.loads(path.read_text(encoding="utf-8"))
         hooks = payload.get("hooks") if isinstance(payload, dict) else None
@@ -4292,7 +4516,7 @@ def remove_runtime_adapter(
         if remaining_hooks or other_fields:
             write_json_atomic(path, remaining_payload)
         else:
-            path.unlink()
+            remove_installation_entry(path)
     owner_detail = f"; effective runtime remains in {owner_scope} scope" if owner_scope else ""
     report.lines.append(
         status_line(
@@ -4410,7 +4634,7 @@ def clean_legacy_skill_aliases(
             report.updated += 1
             continue
         ensure_unredirected_directory(backup.parent, label="legacy skill alias backup parent")
-        shutil.move(str(dest), str(backup))
+        _copy_installation_backup(dest, backup)
         report.lines.append(
             status_line(
                 "MIGRATE",
@@ -4433,7 +4657,21 @@ def copy_skill(source: Path, dest: Path) -> None:
 
 
 def create_install(base: Path, dest: Path, source: Path, actual_mode: str) -> str:
-    base.mkdir(parents=True, exist_ok=True)
+    ensure_unredirected_directory(base, label='skill installation base')
+    if environment_journal() is not None:
+        staging = Path(tempfile.mkdtemp(prefix='.tenetora-skill-', dir=base))
+        staging.rmdir()
+        try:
+            with private_staging(staging):
+                if actual_mode == 'copy':
+                    copy_skill(source, staging)
+                else:
+                    staging.symlink_to(source, target_is_directory=True)
+                publish_installation_entry(staging, dest)
+        finally:
+            if staging.exists() or path_is_redirected(staging):
+                remove_unredirected_entry(staging, label='private skill staging')
+        return f'{actual_mode} {dest}'
     if actual_mode == "copy":
         copy_skill(source, dest)
         return f"copy {dest}"
@@ -4762,6 +5000,137 @@ def tree_matches_source(dest: Path, source: Path) -> bool:
     return bool(expected) and installed == expected
 
 
+def surface_transaction_paths(
+    target: str, scope: str, project_root: Path, *, native: bool = True, runtime: bool = True,
+) -> list[Path]:
+    """The exact installer-owned surfaces, excluding unrelated tool trees."""
+    base = target_base(target, scope, project_root)
+    paths = [base / name for name in RECOGNIZED_SKILL_NAMES]
+    home = runtime_home(target, scope, project_root)
+    if scope == 'project':
+        exclude = project_git_exclude_target(project_root, base / ROUTER_SKILL_NAME)
+        if exclude is not None:
+            paths.append(exclude[0])
+    if runtime:
+        paths.extend(runtime_transaction_paths(target, scope, project_root))
+    if native and scope == 'global' and target in NATIVE_PLUGIN_TARGETS:
+        paths.extend((home / 'config.toml', home / 'settings.json',
+                      home / 'plugins/installed_plugins.json', home / 'plugins/known_marketplaces.json',
+                      *cache_transaction_paths(native_plugin_cache_root(target, project_root)),
+                      *cache_transaction_paths(legacy_native_plugin_cache_root(target, project_root))))
+        paths.extend(home / 'plugins/marketplaces' / name
+                     for name in (NATIVE_MARKETPLACE_ID, LEGACY_NATIVE_MARKETPLACE_ID))
+    if native and scope == 'global' and target == 'zcode':
+        paths.extend((*cache_transaction_paths(zcode_plugin_base(scope, project_root)),
+                      *cache_transaction_paths(legacy_zcode_plugin_base(scope, project_root)),
+                      zcode_registry_path(project_root), zcode_config_path(project_root),
+                      legacy_zcode_plugin_path(project_root), legacy_project_zcode_plugin_path(project_root)))
+    if native and scope == 'global' and target == 'dsh':
+        profile = dsh_profile_path()
+        paths.extend(profile / name for name in ('package.json', 'cordis.patch.yml', 'package-lock.json',
+                                                'pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb'))
+        paths.extend((profile / 'node_modules/.modules.yaml', profile / 'node_modules' / DSH_BUNDLE_PACKAGE))
+    return paths
+
+
+def cache_transaction_paths(root: Path) -> list[Path]:
+    current = list(root.iterdir()) if root.is_dir() else []
+    version = package_adapter_version(PACKAGE_ROOT) if PACKAGE_ROOT is not None else None
+    return [*current, *([root / version] if version else [])]
+
+
+def runtime_transaction_paths(target: str, scope: str, project_root: Path) -> list[Path]:
+    home = runtime_home(target, scope, project_root)
+    if target == 'cursor':
+        return [home / 'hooks.json']
+    if target == 'opencode':
+        return [home / 'plugins' / name for name in ('tenetora.js', 'agent-harness.js')]
+    if target == 'pi':
+        return [home / 'extensions/tenetora.ts']
+    if target == 'codex':
+        return [project_root / '.codex/hooks.json',
+                codex_project_hooks_module().project_state_path(project_root, machine_home())]
+    return []
+
+
+def installer_operation_paths(bound) -> list[Path]:
+    target = bound['target']
+    native = not bound.get('skip_native', False)
+    if target in NATIVE_PLUGIN_TARGETS:
+        native = native and native_plugins_enabled() and native_plugin_command(target) is not None
+    return surface_transaction_paths(target, bound['scope'], bound['project_root'],
+                                     native=native, runtime=not bound.get('skip_runtime', False))
+
+
+def governance_transaction_paths(project_root: Path) -> list[Path]:
+    module = project_governance_migration_module()
+    classification = module.classify_project(project_root)
+    if classification.status == 'legacy-owned':
+        paths = [project_root / '.harness', project_root / '.tenetora', project_root / '.gitignore',
+                 *module.adapter_candidates(project_root)]
+        if (project_root / '.git').is_dir():
+            paths.append(project_root / '.git/info/exclude')
+        return paths
+    directory = project_root / '.tenetora'
+    paths = []
+    for path in module.iter_files(directory, exclude_ephemeral=True):
+        relative = path.relative_to(directory)
+        if relative.as_posix() != 'state/current-alignment.json':
+            if module.preserves_historical_semantics(relative) or path.suffix.lower() not in module.TEXT_SUFFIXES:
+                continue
+        paths.append(path)
+    for path in (directory / 'skills').glob('agent-harness*.md'):
+        paths.append(path.with_name(path.name.replace('agent-harness', 'tenetora', 1)))
+    return paths
+
+
+def snapshot_installation_surfaces(args) -> dict[str, object]:
+    targets = existing_update_targets(args.tools) if args.existing_only else parse_tools(args.tools)
+    scope = args.scope_flag or args.scope
+    governance_only = (args.existing_only and scope in {'project', 'both'}
+                       and not project_scopes_for(targets, args.path)
+                       and project_governance_surface_present(args.path))
+    if args.all_existing or governance_only:
+        discovered = auto_discovered_project_entries(args.path, include_home=True) if args.auto_discover else {}
+        units = machine_existing_plan(targets, scope, args.path, discovered_entries=discovered).units
+    else:
+        scopes = (existing_target_scopes_for(targets, scope, args.path) if args.existing_only
+                  else target_scopes_for(targets, scope))
+        units = [InstallUnit('snapshot', args.path, scopes, 'project')]
+    from runtime_transaction import managed_targets
+    paths = [registry_path(), *managed_targets(args.upgrade_bin_dir or (machine_home() / 'bin'))]
+    if args.upgrade_path_file is not None:
+        paths.append(args.upgrade_path_file)
+    hook_projects = set(registered_project_hook_candidates(args.path, all_existing=args.all_existing))
+    for unit in units:
+        if unit.kind == 'project':
+            hook_projects.add(unit.project_root)
+        for target, scopes in unit.scopes_by_target.items():
+            for selected_scope in scopes:
+                paths.extend(surface_transaction_paths(target, selected_scope, unit.project_root))
+        if unit.scopes_by_target:
+            scopes = list(dict.fromkeys(scope for values in unit.scopes_by_target.values() for scope in values))
+            preflight = build_preflight(list(unit.scopes_by_target), scopes, unit.project_root,
+                                         args.codex_hooks, args.allow_tracked_codex_hooks,
+                                         bool(args.prune_shadowed or not args.no_prune_shadowed),
+                                         unit.scopes_by_target, unit.runtime_owners)
+            for check in preflight.checks:
+                for prune_scope in check.runtime_prune_scopes:
+                    paths.extend(runtime_transaction_paths(check.tool, prune_scope, unit.project_root))
+        if unit.governance_only or any('project' in scopes for scopes in unit.scopes_by_target.values()):
+            if project_governance_surface_present(unit.project_root):
+                paths.extend(governance_transaction_paths(unit.project_root))
+    hook_module = load_commit_hook_module('tenetora_upgrade_hook_inventory')
+    for project in hook_projects:
+        paths.extend((project / '.tenetora/.gitignore', project / '.tenetora/state/commit-hooks.json'))
+        if hook_module.is_git_worktree(project):
+            hooks = hook_module.git_hooks_dir(project)
+            paths.extend(hooks / name for name in hook_module.HOOK_NAMES)
+    digest = snapshot_installation(args.surface_rollback_journal, paths)
+    return {'status': 'snapshotted', 'inventory_sha256': digest}
+
+
+@journaled(installer_operation_paths)
 def install_one(
     target: str,
     scope: str,
@@ -4860,6 +5229,7 @@ def install_one(
     return report
 
 
+@journaled(installer_operation_paths)
 def update_one(
     target: str,
     scope: str,
@@ -5318,8 +5688,11 @@ def ensure_codex_project_hook_runtime() -> Path:
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
     bin_dir = module.default_bin_dir()
-    module.write_runtime_python(bin_dir)
-    destination = module.write_hook_runtime(bin_dir)
+    def update_runtime():
+        module.write_runtime_python(bin_dir)
+        return module.write_hook_runtime(bin_dir)
+    journal = os.environ.get('TENETORA_RUNTIME_ROLLBACK_JOURNAL')
+    destination = module.run_runtime_update(bin_dir, Path(journal) if journal else None, update_runtime)
     if (
         destination is None
         or not module.hook_runtime_ready(bin_dir)
@@ -5329,6 +5702,7 @@ def ensure_codex_project_hook_runtime() -> Path:
     return destination
 
 
+@journaled(lambda bound: surface_transaction_paths('codex', 'project', bound['project_root'], native=False))
 def apply_codex_project_hook_policy(
     project_root: Path,
     *,
@@ -6862,12 +7236,14 @@ def machine_existing_plan(
     )
 
 
+@journaled(lambda _bound: [registry_path()])
 def register_project_surfaces(project_root: Path, targets: list[str]) -> None:
     surfaces = project_scopes_for(targets, project_root)
     if surfaces:
         upsert_project(project_root, surfaces)
 
 
+@journaled(lambda _bound: [registry_path()])
 def register_global_surfaces(targets: list[str]) -> None:
     if targets:
         upsert_global_surfaces(targets)
@@ -6934,6 +7310,7 @@ def project_governance_migration_module() -> object:
     return module
 
 
+@journaled(lambda bound: governance_transaction_paths(bound['project_root']))
 def project_governance_migration(
     project_root: Path,
     *,
@@ -7753,22 +8130,6 @@ def progress_status(result: str, check: CapabilityCheck | None = None) -> str:
     return "blocked"
 
 
-def is_expected_skills_only_payload(check: dict[str, object]) -> bool:
-    if check.get("matches_plan") is False or check.get("version_matches_package") is False:
-        return False
-    status = str(check.get("actual") or check.get("planned") or "")
-    return status == CAPABILITY_SKILLS_ONLY and (
-        check.get("fallback_accepted") is True
-        or str(check.get("maximum") or "") == CAPABILITY_SKILLS_ONLY
-        or str(check.get("runtime_role") or "") == "skills-only-shadow"
-        or (
-            str(check.get("scope") or "") == "project"
-            and str(check.get("plugin_api") or "") == "scope-unsupported"
-            and str(check.get("planned") or "") == CAPABILITY_SKILLS_ONLY
-        )
-    )
-
-
 def machine_payload_checks(payload: dict[str, object]) -> dict[tuple[str, str], dict[str, object]]:
     """Return the newest per-surface check from a machine child payload."""
     checks_by_surface: dict[tuple[str, str], dict[str, object]] = {}
@@ -7948,7 +8309,7 @@ def machine_failure_details(payload: dict[str, object]) -> list[str]:
             remediation = str(check.get("remediation") or "").strip()
             status = str(check.get("actual") or check.get("planned") or "")
             validation_failed = check.get("matches_plan") is False or check.get("version_matches_package") is False
-            if status == CAPABILITY_PENDING_TRUST and not validation_failed:
+            if status == CAPABILITY_PENDING_TRUST and check.get("planned") != CAPABILITY_BLOCKED and not validation_failed:
                 continue
             if (
                 not blocker
@@ -8187,7 +8548,7 @@ def run_machine_plan(
             project_path=str(unit.project_root),
             surface_count=sum(len(scopes) for scopes in unit.scopes_by_target.values()),
         )
-        command = [sys.executable, *machine_child_arguments(unit, args)]
+        command = [sys.executable, "-I", "-B", *machine_child_arguments(unit, args)]
         unit_label = machine_unit_label(unit, project_labels)
         result = run_machine_child(
             command,
@@ -8657,6 +9018,9 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--all-existing", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--auto-discover", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--hook-rollback-journal", type=Path, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--surface-rollback-journal", type=Path, default=None, help=argparse.SUPPRESS)
+    parser.add_argument('--upgrade-bin-dir', type=Path, default=None, help=argparse.SUPPRESS)
+    parser.add_argument('--upgrade-path-file', type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--single-project", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--governance-only", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
@@ -8676,6 +9040,8 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--events-jsonl", type=Path, default=None, help="Append structured installer events as JSON Lines.")
     parser.add_argument("--log-file", type=Path, default=None, help="Write redacted detailed installer diagnostics to this file.")
     action_group = parser.add_mutually_exclusive_group()
+    action_group.add_argument('--snapshot-surfaces', dest='action', action='store_const',
+                              const='snapshot-surfaces', help=argparse.SUPPRESS)
     action_group.add_argument(
         "--update",
         dest="action",
@@ -8741,10 +9107,11 @@ def _main(argv: list[str] | None = None) -> int:
     def finalize_codex_marketplace_repair(commit: bool) -> None:
         if codex_marketplace_repair is None or not codex_marketplace_repair.active:
             return
-        if commit:
-            codex_marketplace_repair.commit()
-        else:
-            codex_marketplace_repair.rollback()
+        with surface_operation([target_base('codex', 'global', args.path).parent / 'config.toml']):
+            if commit:
+                codex_marketplace_repair.commit()
+            else:
+                codex_marketplace_repair.rollback()
 
     try:
         active_home = validate_managed_home_path(machine_home(), label="Tenetora canonical home")
@@ -8783,6 +9150,11 @@ def _main(argv: list[str] | None = None) -> int:
         configure_package_root(args.package_root)
         explicit_scope = args.scope_flag or args.scope
         project_root = args.path
+        if args.action == 'snapshot-surfaces':
+            if args.surface_rollback_journal is None:
+                raise ValueError('--snapshot-surfaces requires --surface-rollback-journal')
+            print(json.dumps(snapshot_installation_surfaces(args)))
+            return 0
         if args.action == "restore-hooks":
             if args.hook_rollback_journal is None:
                 raise ValueError("--restore-hooks requires --hook-rollback-journal")
@@ -9058,9 +9430,10 @@ def _main(argv: list[str] | None = None) -> int:
         ):
             marketplace_repair_assessment = assess_codex_marketplace_path_repair()
             if marketplace_repair_assessment.repairable:
-                codex_marketplace_repair = begin_codex_marketplace_path_repair(
-                    marketplace_repair_assessment
-                )
+                with surface_operation([target_base('codex', 'global', project_root).parent / 'config.toml']):
+                    codex_marketplace_repair = begin_codex_marketplace_path_repair(
+                        marketplace_repair_assessment
+                    )
                 combined.lines.append(
                     status_line(
                         "MIGRATE",

@@ -8,15 +8,16 @@ import os
 import re
 import stat
 import subprocess
-from pathlib import Path
-from typing import Any, Sequence
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any, Iterable, Sequence
 
 
-# Version 4 normalizes CRLF to LF for text files before hashing. Existing
-# claims intentionally expire once this changes so they can be re-recorded with
-# the Git-semantic content contract.
-WORKTREE_FINGERPRINT_VERSION = 4
-WORKTREE_ENTRIES_VERSION = 2
+# Version 5 retains CRLF normalization and hashes actual content independently
+# of deletion tombstones in Git's HEAD/index catalogs. The per-path inventory
+# still records verified absence for staged-subject checks. Older claims expire
+# explicitly rather than silently changing their content contract.
+WORKTREE_FINGERPRINT_VERSION = 5
+WORKTREE_ENTRIES_VERSION = 3
 VOLATILE_WORKTREE_PATHS = frozenset(
     {
         ".tenetora/state/aggregate-claim.json",
@@ -36,7 +37,8 @@ def _is_volatile_path(relative: str) -> bool:
         and path.parts[:2] == (".tenetora", "state")
         and path.name.startswith(".")
         and path.name.endswith(".lock")
-    ) or (len(path.parts) >= 3 and path.parts[:3] == (".tenetora", "state", "trail"))
+    ) or (len(path.parts) >= 3 and path.parts[:2] == (".tenetora", "state")
+        and path.parts[2] in {"trail", "completion-commits", "verification-runs"})
 
 
 def git_repository_env() -> dict[str, str]:
@@ -98,6 +100,21 @@ def _tracked_and_untracked_paths(root: Path) -> list[str] | None:
         if not candidate.parts:
             continue
         paths.append(relative)
+    # A tracked deletion remains an explicit missing subject before and after
+    # staging. Stage/index housekeeping must not erase verified absence.
+    head = run_git(root, "ls-tree", "-r", "--name-only", "-z", "HEAD", text=False)
+    if head.returncode != 0:
+        return None
+    for raw in head.stdout.split(b"\0"):
+        if raw:
+            relative = os.fsdecode(raw)
+            candidate = Path(relative)
+            if candidate.is_absolute() or candidate.drive or '..' in candidate.parts:
+                return None
+            if not candidate.parts:
+                continue
+            if not _is_volatile_path(relative):
+                paths.append(relative)
     return sorted(set(paths))
 
 
@@ -208,7 +225,7 @@ def _safe_lstat(root: Path, relative: str) -> tuple[os.stat_result | None, bool]
     return metadata, True
 
 
-def _worktree_entry(root: Path, relative: str) -> str | None:
+def _worktree_entry(root: Path, relative: str, *, missing_paths: list[str] | None = None) -> str | None:
     path = root / relative
     metadata, safe = _safe_lstat(root, relative)
     if not safe:
@@ -236,14 +253,27 @@ def _worktree_entry(root: Path, relative: str) -> str | None:
             return None
         return f"{relative}\0file\0{mode:o}\0{digest}"
     if stat.S_ISDIR(metadata.st_mode):
-        nested = git_state_fingerprint(path)
-        if nested is None:
+        nested_entries = git_state_entries(path)
+        if nested_entries is None:
             return None
+        nested = snapshot_fingerprint(nested_entries)
+        if missing_paths is not None:
+            missing_paths.extend(relative+'/'+name for name,entry in nested_entries.items()
+                if entry == name+'\0missing')
         return f"{relative}\0repository\0{mode:o}\0{nested}"
     return None
 
 
-def git_state_fingerprint(root: Path, scopes: Sequence[str] | None = None) -> str | None:
+def snapshot_fingerprint(entries: dict[str,str], scopes: Sequence[str] | None = None) -> str:
+    """Hash one captured inventory; missing paths remain separate obligations."""
+    normalized_scopes=normalize_scopes(scopes)
+    scope_tag = "\0".join(normalized_scopes) if normalized_scopes else "<all>"
+    content = [entry for name,entry in sorted(entries.items()) if entry != name+'\0missing']
+    state = "\0".join([str(WORKTREE_FINGERPRINT_VERSION), "scope", scope_tag, *content])
+    return hashlib.sha256(state.encode("utf-8", errors="surrogatepass")).hexdigest()
+
+
+def git_state_fingerprint(root: Path, scopes: Sequence[str] | None = None, *, known_paths: Iterable[str] = ()) -> str | None:
     """Return a content fingerprint independent of Git index state and HEAD."""
 
     try:
@@ -251,21 +281,32 @@ def git_state_fingerprint(root: Path, scopes: Sequence[str] | None = None) -> st
     except ValueError:
         return None
 
-    entries = git_state_entries(root, normalized_scopes)
+    entries = git_state_entries(root, normalized_scopes,known_paths=known_paths)
     if entries is None:
         return None
-    scope_tag = "\0".join(normalized_scopes) if normalized_scopes else "<all>"
-    state = "\0".join([str(WORKTREE_FINGERPRINT_VERSION), "scope", scope_tag, *entries.values()])
-    return hashlib.sha256(state.encode("utf-8", errors="surrogatepass")).hexdigest()
+    return snapshot_fingerprint(entries,normalized_scopes)
 
 
-def git_state_entries(root: Path, scopes: Sequence[str] | None = None) -> dict[str, str] | None:
+def git_state_entries(root: Path, scopes: Sequence[str] | None = None, *, known_paths: Iterable[str] = ()) -> dict[str, str] | None:
     """Return stable per-path entries for explaining a later fingerprint change."""
 
     try:
         normalized_scopes = normalize_scopes(scopes)
     except ValueError:
         return None
+    if not isinstance(known_paths,(list,tuple,set,frozenset,dict)):
+        return None
+    retained=set()
+    for relative in known_paths:
+        if not isinstance(relative,str) or not relative or '\0' in relative:
+            return None
+        candidate=Path(relative)
+        if (not candidate.parts or candidate.is_absolute() or PurePosixPath(relative).is_absolute()
+            or PureWindowsPath(relative).drive or '\\' in relative
+            or any(part in ('..','.git') for part in candidate.parts)
+            or candidate.as_posix()!=relative or not _matches_scope(relative,normalized_scopes)):
+            return None
+        if not _is_volatile_path(relative):retained.add(relative)
     if git_head(root) is None:
         return None
     for _ in range(2):
@@ -273,12 +314,15 @@ def git_state_entries(root: Path, scopes: Sequence[str] | None = None) -> dict[s
         if paths is None:
             return None
         entries: dict[str, str] = {}
-        selected_paths = [relative for relative in paths if _matches_scope(relative, normalized_scopes)]
+        selected_paths = sorted({relative for relative in paths if _matches_scope(relative, normalized_scopes)}|retained)
+        nested_missing=[]
         for relative in selected_paths:
-            entry = _worktree_entry(root, relative)
+            entry = _worktree_entry(root, relative,missing_paths=nested_missing)
             if entry is None:
                 return None
             entries[relative] = entry
+        for relative in nested_missing:
+            if _matches_scope(relative,normalized_scopes):entries.setdefault(relative,relative+'\0missing')
         if paths == _tracked_and_untracked_paths(root):
             return dict(sorted(entries.items()))
     return None

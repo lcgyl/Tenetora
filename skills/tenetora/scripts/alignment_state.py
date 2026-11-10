@@ -415,7 +415,11 @@ def load_lifecycle(root: Path) -> dict[str, Any]:
     if payload is None:
         return empty_lifecycle()
     validate_lifecycle(payload)
-    return payload
+    try:
+        from completion_protocol import project_lifecycle
+        return {**payload, 'records': project_lifecycle(root, payload['records'])}
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise AlignmentStateError(f'Completion commit cannot be read consistently: {exc}') from exc
 
 
 def _write_lifecycle_locked(path: Path, payload: dict[str, Any], current_revision: int) -> dict[str, Any]:
@@ -434,8 +438,14 @@ def update_lifecycle(root: Path, mutate: Callable[[dict[str, dict[str, Any]]], A
         current = read_json_object(path, "alignment lifecycle") if path.is_file() else None
         payload = current if current is not None else empty_lifecycle()
         validate_lifecycle(payload)
-        records = payload["records"]
+        from completion_protocol import project_lifecycle
+        records = project_lifecycle(root, payload['records'])
         result = mutate(records)
+        projected = project_lifecycle(root, records)
+        if any(record.get('status') != projected[key].get('status') or
+               record.get('completion_claim_proof') != projected[key].get('completion_claim_proof')
+               for key, record in records.items()):
+            raise AlignmentStateError('A durable completion cannot be reopened or replaced by routing updates.')
         _write_lifecycle_locked(path, {"records": records}, int(payload.get("revision", 0)))
         return result
 
@@ -516,6 +526,8 @@ def sweep_lifecycle(root: Path, *, now: dt.datetime | None = None) -> dict[str, 
         validate_lifecycle(payload)
         current_payload = read_json_object(current_path(root), "current-alignment.json")
         current_id = str(current_payload.get("session_id", current_payload.get("alignment_id", ""))) if current_payload else ""
+        from completion_protocol import project_lifecycle
+        payload['records'] = project_lifecycle(root, payload['records'])
         known_ids = set(payload["records"])
         changed = _sweep_lifecycle_records(payload["records"], current_time)
         if changed:
@@ -527,7 +539,14 @@ def sweep_lifecycle(root: Path, *, now: dt.datetime | None = None) -> dict[str, 
 
 def lifecycle_record(root: Path, session_id: str) -> dict[str, Any] | None:
     validate_identity(session_id, "session_id", SESSION_ID_RE)
-    return load_lifecycle(root).get("records", {}).get(session_id)
+    record = load_lifecycle(root).get('records', {}).get(session_id)
+    if record is not None:
+        return record
+    try:
+        from completion_protocol import lifecycle_from_receipt
+        return lifecycle_from_receipt(root, session_id)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise AlignmentStateError(f'Completion commit cannot be read consistently: {exc}') from exc
 
 
 def adopt_current_handoff(root: Path) -> None:

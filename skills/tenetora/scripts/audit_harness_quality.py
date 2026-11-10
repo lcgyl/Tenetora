@@ -1734,11 +1734,25 @@ def is_long_running_command(command: dict[str, object]) -> bool:
     return bool(name_parts.intersection(LONG_RUNNING_SCRIPT_NAMES))
 
 
+def score_model() -> dict[str, object]:
+    return {'id': 'issue-count-v1', 'base': 100, 'blocking_penalty': 35, 'warning_penalty': 10,
+        'range': [0, 100], 'overall': 'unweighted mean of category scores',
+        'interpretation': 'An issue-count heuristic, not a calibrated quality or productivity measurement. A score of 100 means these checks found no counted issues.'}
+
+
+def score_breakdown(category: str, blocking: list[dict[str, str]], warnings: list[dict[str, str]]) -> dict[str, int]:
+    model = score_model()
+    blocking_count = sum(1 for item in blocking if item['category'] == category)
+    warning_count = sum(1 for item in warnings if item['category'] == category)
+    blocking_deduction = int(model['blocking_penalty']) * blocking_count
+    warning_deduction = int(model['warning_penalty']) * warning_count
+    return {'base': 100, 'blocking_count': blocking_count, 'warning_count': warning_count,
+        'blocking_deduction': blocking_deduction, 'warning_deduction': warning_deduction,
+        'score': max(0, min(100, 100 - blocking_deduction - warning_deduction))}
+
+
 def score_category(category: str, blocking: list[dict[str, str]], warnings: list[dict[str, str]]) -> int:
-    score = 100
-    score -= 35 * sum(1 for item in blocking if item["category"] == category)
-    score -= 10 * sum(1 for item in warnings if item["category"] == category)
-    return max(0, min(100, score))
+    return score_breakdown(category, blocking, warnings)['score']
 
 
 def status_from(scores: dict[str, int], blocking: list[dict[str, str]], warnings: list[dict[str, str]]) -> str:
@@ -1799,6 +1813,7 @@ def dimension_report(
         report[category] = {
             "status": status,
             "score": scores[category],
+            "score_breakdown": score_breakdown(category, blocking, warnings),
             "issues": [
                 item["code"]
                 for item in [*blocking, *warnings]
@@ -1847,6 +1862,7 @@ def audit_engineering(root: Path, module: str | None = None) -> dict[str, object
         "profile": "engineering",
         "status": status_from(scores, blocking, warnings),
         "scores": scores,
+        "score_model": score_model(),
         "dimensions": dimension_report(scores, blocking, warnings),
         "blocking_issues": blocking,
         "warnings": warnings,
@@ -1987,6 +2003,8 @@ def print_engineering_report(report: dict[str, object]) -> None:
     print(("状态" if use_chinese() else "Status") + f": `{report['status']}`")
     print()
     print("## 评分" if use_chinese() else "## Scores")
+    print('计数模型：每个阻断扣 35 分、每个警告扣 10 分，限制为 0–100；总分为维度均值。100 只表示当前检查未发现计分问题，不代表实测质量或生产力。'
+        if use_chinese() else str(score_model()['interpretation']) + ' Each blocking issue deducts 35 points and each warning deducts 10; scores are clamped to 0–100 and averaged across categories.')
     scores = report["scores"]
     assert isinstance(scores, dict)
     for category in (*ENGINEERING_CATEGORIES, "overall"):
@@ -2122,6 +2140,10 @@ def render_junit(report: dict[str, object]) -> str:
         },
     )
     properties = ET.SubElement(suite, "properties")
+    model = report.get('score_model')
+    if isinstance(model, dict):
+        ET.SubElement(properties, 'property', {'name': 'score.model', 'value': str(model.get('id', ''))})
+        ET.SubElement(properties, 'property', {'name': 'score.interpretation', 'value': str(model.get('interpretation', ''))})
     scores = report.get("scores", {})
     if isinstance(scores, dict):
         for key, value in sorted(scores.items()):
@@ -2194,6 +2216,7 @@ def append_score_history(root: Path, report: dict[str, object]) -> None:
                 "at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(),
                 "status": report.get("status", "unknown"),
                 "scores": report.get("scores", {}),
+                "score_model": report.get('score_model', {}),
                 "warnings": len(report.get("warnings", [])) if isinstance(report.get("warnings"), list) else 0,
                 "blocking_issues": len(report.get("blocking_issues", []))
                 if isinstance(report.get("blocking_issues"), list)

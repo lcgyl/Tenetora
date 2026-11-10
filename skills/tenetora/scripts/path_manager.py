@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import json
 import hashlib
 import shlex
 import stat
@@ -15,6 +16,8 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CLI_DIR = SCRIPT_DIR.parent / "cli"
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
 if str(CLI_DIR) not in sys.path:
     sys.path.insert(0, str(CLI_DIR))
 
@@ -23,6 +26,9 @@ from tenetora.path_security import validate_unredirected_file_path  # noqa: E402
 
 START_MARKER = "# >>> tenetora managed PATH >>>"
 END_MARKER = "# <<< tenetora managed PATH <<<"
+
+
+from upgrade_messages import MessageIssue, message_issue  # noqa: E402
 
 
 class PathManagerError(RuntimeError):
@@ -56,11 +62,11 @@ def replace_managed_block(content: str, block: str) -> tuple[str, str]:
     start_count = content.count(START_MARKER)
     end_count = content.count(END_MARKER)
     if start_count != end_count or start_count > 1:
-        raise PathManagerError("shell profile contains duplicate or damaged Tenetora PATH markers")
+        raise PathManagerError(MessageIssue('upgrade.shell-profile-contains-duplicate-or-damaged-tenetora-path-markers'))
     start = content.find(START_MARKER)
     end = content.find(END_MARKER)
     if (start < 0) != (end < 0) or (start >= 0 and end < start):
-        raise PathManagerError("shell profile contains a damaged Tenetora PATH marker")
+        raise PathManagerError(MessageIssue('upgrade.shell-profile-contains-a-damaged-tenetora-path-marker'))
     if start >= 0:
         end += len(END_MARKER)
         updated = content[:start].rstrip() + "\n\n" + block + content[end:]
@@ -74,13 +80,13 @@ def _assert_profile_safe(path: Path) -> None:
     try:
         path = validate_unredirected_file_path(path, label="shell profile")
     except RuntimeError as error:
-        raise PathManagerError(str(error)) from error
+        raise PathManagerError(message_issue(error) or str(error)) from error
     if path.exists() and os.name != "nt" and hasattr(os, "getuid"):
         info = path.stat()
         if info.st_uid != os.getuid():
-            raise PathManagerError("shell profile is not owned by the current user")
+            raise PathManagerError(MessageIssue('upgrade.shell-profile-is-not-owned-by-the-current-user'))
         if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-            raise PathManagerError("shell profile is writable by group or others")
+            raise PathManagerError(MessageIssue('upgrade.shell-profile-is-writable-by-group-or-others'))
 
 
 def configure_posix_path(home: Path, bin_dir: Path, shell: str) -> dict[str, Any]:
@@ -100,10 +106,38 @@ def configure_posix_path(home: Path, bin_dir: Path, shell: str) -> dict[str, Any
             handle.flush()
             os.fsync(handle.fileno())
         temporary.chmod(stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600)
-        os.replace(temporary, path)
+        if os.environ.get('TENETORA_SURFACE_JOURNAL'):
+            from installation_transaction import publish
+            publish(temporary, path)
+        else:
+            os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
     return {"status": action, "profile": str(path), "shell": kind, "changed": True}
+
+
+def _write_windows_path_receipt(before: dict[str, Any], after: str, changed: bool) -> None:
+    destination = os.environ.get('TENETORA_PATH_RECEIPT')
+    if not destination:
+        return
+    from installation_transaction import environment_journal, JOURNAL_ENV
+    journal = environment_journal()
+    if journal is None:
+        raise PathManagerError('PATH receipt requires an active upgrade transaction')
+    path = validate_unredirected_file_path(Path(destination), label='PATH transaction receipt')
+    if path != Path(os.environ[JOURNAL_ENV]).parent / 'path-receipt.json':
+        raise PathManagerError('PATH receipt is outside the upgrade transaction')
+    descriptor, name = tempfile.mkstemp(prefix='.path-receipt-', dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, 'w', encoding='utf-8', newline='') as handle:
+            json.dump({'before': before, 'after_sha256': _digest(after), 'changed': changed}, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def configure_windows_path(bin_dir: Path) -> dict[str, Any]:
@@ -117,13 +151,22 @@ def configure_windows_path(bin_dir: Path) -> dict[str, Any]:
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Environment") as key:
         try:
             current, value_type = winreg.QueryValueEx(key, "Path")
+            exists = True
         except FileNotFoundError:
             current, value_type = "", winreg.REG_EXPAND_SZ
+            exists = False
+        before = {'kind': 'windows', 'content': str(current), 'value_type': value_type,
+                  'exists': exists, 'before_sha256': _digest(str(current))}
         entries = [item for item in str(current).split(";") if item]
         normalized = {os.path.normcase(os.path.normpath(item)) for item in entries}
         if os.path.normcase(os.path.normpath(value)) in normalized:
+            _write_windows_path_receipt(before, str(current), False)
             return {"status": "current", "profile": "HKCU\\Environment\\Path", "shell": "windows", "changed": False}
-        winreg.SetValueEx(key, "Path", 0, value_type, ";".join([value, *entries]))
+        after = ";".join([value, *entries])
+        _write_windows_path_receipt(before, after, True)
+        if os.environ.get('TENETORA_PATH_RECEIPT') and snapshot_user_path()['before_sha256'] != before['before_sha256']:
+            raise PathManagerError('Windows PATH changed before configuration; refusing to overwrite it')
+        winreg.SetValueEx(key, "Path", 0, value_type, after)
     broadcast = False
     try:
         import ctypes
